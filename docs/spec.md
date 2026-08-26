@@ -11,7 +11,7 @@ A self-hosted, WhatsApp-first personal finance tracker for one user, solving **v
 1. **AI suggests, user decides.** The AI never moves money or commits to a plan on its own.
 2. **Deterministic core, LLM at the edges.** All numbers come from plain code. The LLM parses input and narrates output — never computes.
 3. **Bounded harness, not an agent.** Fixed small domain tool set. No shell, filesystem, or browsing.
-4. **Strictly reactive.** *(amended — supersedes v1's "proactive where money is at risk")* The bot never messages first, no exceptions. Budget thresholds, due dates, recaps: dashboard badges, calendar, and on-request queries only. System-health alerts (e.g. WhatsApp gateway disconnect) route through a separate ops channel (email/uptime monitor) — that is infrastructure talking, not the finance bot.
+4. **Strictly reactive.** *(amended — supersedes v1's "proactive where money is at risk")* The bot never messages first, no exceptions. Budget thresholds, due dates, recaps: dashboard badges, calendar, and on-request queries only. System-health alerts (e.g. WhatsApp gateway disconnect) route through a separate ops channel (email/uptime monitor) — that is infrastructure talking, not the finance bot. Habit formation is **pull-based**: a daily ritual (`rekap hari ini`) and a weekly review ritual are *user-initiated*, never pushed.
 5. **Nothing destructive is silent or permanent.** Soft-delete with restore window; named confirmations.
 6. **Fact vs label.** Fact Confidence gates writing; Category Confidence is always a fixable best-guess reviewed async.
 7. **Fail-closed capture.** *(new)* When in doubt, hold for confirmation — never guess into the ledger. See ADR-0003.
@@ -22,7 +22,7 @@ A self-hosted, WhatsApp-first personal finance tracker for one user, solving **v
 - Single user, self-hosted on own VPS.
 - Bilingual (Bahasa Indonesia + English), auto-detected.
 - Channels: WhatsApp (self-hosted gateway, dedicated number; transport hidden behind an interface so an official Cloud API swap stays possible) + web dashboard.
-- Bot tone: neutral clerk — terse, factual, identical on both surfaces.
+- Bot tone: neutral clerk by default — terse, factual, identical on both surfaces. An optional "sassy" narration mode is a Later-tier nicety; numbers never change with tone.
 - Dashboard is a **peer capture surface** (ADR-0004): manual create/edit/delete via web forms (`origin=dashboard_manual`, `category_source=user`, no AI gate) alongside the bot path.
 - No real money movement, ever.
 
@@ -57,6 +57,8 @@ Debt = goal with `type=debt_payoff`: principal, interest_rate, minimum_payment, 
 
 **Budget** — `category_id, period, amount, auto_suggested`. Threshold state renders as **dashboard badges only** (Principle 4).
 
+**Income Horizon** — a user-set planning estimate ("next income in ~X days"), used only to divide the daily allowance and scope Reserved. Soft and optional; the engine never infers a payday from balance changes.
+
 **Draft / PendingAction** — staging rows outside the ledger: parsed drafts awaiting the confidence gate; parked Tier 1–3 tool calls awaiting named confirmation.
 
 **AuditLog** — every AI-initiated write: tool_name, params, entity, action, confirmed_by_user, timestamp.
@@ -75,6 +77,8 @@ Money as `bigint` minor units (IDR-first). Timestamps UTC; all day-boundary logi
 - Receipt photo → structured draft via vision-capable LLM through the provider layer (no classic OCR pipeline)
 - Rules → LLM-whitelist → Hold Queue capture gate with provenance stamping
 - Needs-review queue (low Category Confidence, async)
+- Daily pull ritual: `rekap hari ini` → today's spend · current Safe-to-Spend · tomorrow's reserved · uncategorized to fix inline
+- Weekly review ritual (both surfaces): spend recap · unusual days · uncategorized count · top merchants
 - Sources CRUD; two-leg transfers; Adjustment Entries
 - Categories CRUD + hierarchy
 - Minimal Bill entity feeding Safe-to-Spend
@@ -92,20 +96,20 @@ Money as `bigint` minor units (IDR-first). Timestamps UTC; all day-boundary logi
 - Dual dedup enforcement + duplicate warnings
 - Staged low-confidence fallback: 2-question confirm seeded by user's own history
 - Affordability Check command ("cek beli X bisa?") — verdict-first
-- Daily allowance derivation (Safe-to-Spend ÷ fixed 30 days)
+- Daily allowance derivation (Safe-to-Spend ÷ income-horizon days)
 - Due-date calendar + badges (pull-only)
+- Debt exposure board: negative-balance bars per Debt Source + due-date calendar overlay (simulator stays Later); seeded via an onboarding snapshot of current outstanding balances
 - Adaptive budget suggestions (trailing 3-month); rollover option; threshold badges
 - Search/filter; breakdown charts, heatmap, top merchants, MoM deltas, anomaly flags
 
 ### Later — planning layer (after capture habit sticks)
 - Goals engine: conversational creation grounded in trailing surplus; milestones; pace charts
-- Debt payoff simulator (avalanche vs snowball); minimum-payment-trap visualization
-- BNPL combined-exposure board + unified debt calendar; capture-time overload warning when logging new paylater debt
+- Debt payoff simulator (avalanche vs snowball); minimum-payment-trap visualization; capture-time overload warning when logging new paylater debt
 - Lifestyle-creep flag (smoothed spend vs income growth)
 - Social/tagged spend live line
 - Monthly recap page; CSV export; net-worth trend; audit-log viewer
 - Logging-streak gamification; price memory ("kopi biasanya 18rb")
-- Bank-SMS-forwarding capture (forward bank notification messages; per-bank parser registry)
+- Optional "sassy" narration mode (narration-only)
 - Advisor chat in dashboard (same tool layer)
 
 ### Moon — explicitly deferred, not promised
@@ -172,7 +176,13 @@ Overview · Transactions · Sources · Categories · Bills & Calendar · Budgets
 
 ### Charts (Now, ECharts)
 
-Category breakdown · income-vs-expense timeline · Safe-to-Spend + Runway trend · daily heatmap · top merchants · Essential-vs-Lifestyle split.
+1. **Safe-to-Spend reference line** — a horizontal line overlaid on the spend timeline; days above/below the line tell the story. STS itself is a single now-value, not a replayed history.
+2. **Runway curve** — `runway(t) = STS_now ÷ trailing-burn(t)`, extending as burn history moves.
+3. **Income-vs-expense timeline** — weekly buckets (irregular income reads better weekly than monthly).
+4. **Daily heatmap** — intensity = daily outflow (expenses only, transfers excluded); anomaly days carry a badge.
+5. **Category breakdown** — top-level donut with hierarchical drill-down; leaves always sum to parent.
+6. **Essential vs Lifestyle split** — static snapshot from onboarding flags.
+7. **Top merchants** — ranked by outflow, period-scoped.
 
 ### Manual CRUD
 
@@ -188,12 +198,16 @@ Category breakdown · income-vs-expense timeline · Safe-to-Spend + Runway trend
 
 ### Analytics computations (deterministic, in Go)
 
+All numbers computed in Go; Next.js renders only. The Go API returns ready-to-render chart series and pre-aggregated scalars — no math in the frontend.
+
 - **Positions**: source balance = Σ legs · net worth = assets − debt · BNPL exposure = Σ negative debt sources
-- **Safe-to-Spend cluster**: available · reserved (bills + goals) · STS · runway (trailing burn ÷ STS) · daily allowance (÷30) · essential/lifestyle rollup
-- **Periods**: day/week/month/quarter bucketing (Asia/Jakarta) · hierarchical category rollup · income/expense totals · MoM/WoW deltas · trailing N-day smoothing
-- **Signals**: top merchants · daily heatmap · z-score anomaly detection · lifestyle-creep (slope of smoothed spend vs income)
+- **Safe-to-Spend cluster**: available = Σ asset balances · reserved = bills due within income-horizon + active goal commitments · STS = available − reserved · runway = STS ÷ trailing daily burn · daily allowance = STS ÷ income-horizon days · essential/lifestyle rollup (static flags)
+- **Periods**: weekly default bucketing (Asia/Jakarta) · hierarchical category rollup · income/expense totals · MoM/WoW deltas · trailing N-day smoothing
+- **Signals**: top merchants · daily heatmap (outflow intensity) · z-score > 2 anomaly detection (heatmap badge + flagged-days list) · lifestyle-creep = trailing-30d spend slope vs trailing-90d income slope, exponentially smoothed
 - **Budget**: spent ÷ budget per category, threshold state
-- **Search/filter**: date range · source · category (incl. subtree) · tag · merchant · amount range · direction · review status · free text · sort/paginate
+- **Income baseline**: trailing 90-day ÷ 3 (unchanged); the income horizon only divides the daily allowance, never the baseline
+- **Search/filter**: full-text (merchant/note) + structured filters (source · category incl. subtree · tag · amount range · date · direction · review status) · sort/paginate
+- **Freshness**: hero + ritual text always live (recomputed per transaction); charts cached via TanStack Query `staleTime`
 
 ## 8. Security & Backup
 
