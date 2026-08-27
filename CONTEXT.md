@@ -60,6 +60,10 @@ _Avoid_: tagged-by, origin
 Async list of written transactions whose Category Confidence was low. Reviewing never blocks capture.
 _Avoid_: hold queue (different thing)
 
+**PendingAction**:
+A Tier 1–3 tool call parked until the user confirms it by name. Resumes on a plain yes/no reply without a second model call.
+_Avoid_: pending draft, queued action
+
 ### Planning & awareness
 
 **Bill**:
@@ -85,6 +89,10 @@ _Avoid_: wants, fun money
 **Runway**:
 Days until Safe-to-Spend hits zero at the trailing average daily burn rate. No payday assumption.
 _Avoid_: months left
+
+**Daily Allowance** (ID: Jatah harian):
+Safe-to-Spend divided by income-horizon days. A soft planning figure, reset daily; spending reduces Safe-to-Spend.
+_Avoid_: budget-per-day, spend limit
 
 **Affordability Check**:
 An on-demand verdict-first answer to "can I afford X?", computed against Safe-to-Spend. Always pull, never push.
