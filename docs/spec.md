@@ -188,7 +188,7 @@ Overview · Transactions · Sources · Categories · Bills & Calendar · Budgets
 
 | Entity | Create | Edit | Delete | Extra |
 |---|---|---|---|---|
-| Transaction | quick-add + full form | inline (modal) with `edit_history` | soft-delete → restore bin | reversal link, adjustment entry |
+| Transaction | quick-add + full form | quick sheet (amount/date/category/note); "Ubah lengkap" opens full edit route with reversal link, adjustment entry, `edit_history` | soft-delete → restore bin | reversal link, adjustment entry |
 | Source | form | rename/archive | archive | transfer wizard, balance adjust |
 | Category | form + tree | rename/re-parent/merge/split | archive | essential toggle, bulk re-categorize |
 | Tag | form | rename | delete | namespaced `trip:bali` |
