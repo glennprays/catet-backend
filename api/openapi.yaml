@@ -1,0 +1,152 @@
+openapi: 3.1.0
+info:
+  title: catet Backend API
+  version: 0.1.0
+  description: Internal Go API consumed only by the catet Next.js BFF.
+servers:
+  - url: /
+    description: Internal API root
+paths:
+  /api/v1/health:
+    get:
+      summary: Health check endpoint
+      operationId: getHealth
+      tags:
+        - System
+      responses:
+        '200':
+          description: Server is healthy
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/version:
+    get:
+      summary: Build metadata endpoint
+      operationId: getVersion
+      tags:
+        - System
+      responses:
+        '200':
+          description: Build metadata
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+components:
+  headers:
+    TraceId:
+      description: Request trace identifier mirrored in the response envelope.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    ErrorResponse:
+      description: Error envelope
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    HealthEnvelope:
+      type: object
+      required:
+        - data
+        - trace_id
+      properties:
+        data:
+          $ref: '#/components/schemas/HealthResponse'
+        trace_id:
+          type: string
+          format: uuid
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - timestamp
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+        timestamp:
+          type: string
+          format: date-time
+    VersionEnvelope:
+      type: object
+      required:
+        - data
+        - trace_id
+      properties:
+        data:
+          $ref: '#/components/schemas/VersionResponse'
+        trace_id:
+          type: string
+          format: uuid
+    VersionResponse:
+      type: object
+      required:
+        - version
+        - commit
+        - build_time
+      properties:
+        version:
+          type: string
+          example: dev
+        commit:
+          type: string
+          example: unknown
+        build_time:
+          type: string
+          example: unknown
+    ErrorEnvelope:
+      type: object
+      required:
+        - error
+        - trace_id
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+        trace_id:
+          type: string
+          format: uuid
+    ErrorBody:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      required:
+        - field
+        - message
+      properties:
+        field:
+          type: string
+        message:
+          type: string
+tags:
+  - name: System
+    description: Internal system status endpoints
