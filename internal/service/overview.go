@@ -218,6 +218,8 @@ func LedgerItemFromRow(row repository.LedgerRow) response.LedgerItem {
 		SourceID:              row.SourceID,
 		SourceName:            row.SourceName,
 		ReviewStatus:          row.ReviewStatus,
+		CategorySource:        row.CategorySource,
+		CategoryConfidence:    row.CategoryConfidence,
 		Voided:                row.Voided,
 		ReversesTransactionID: row.ReversesTransactionID,
 	}

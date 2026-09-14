@@ -58,6 +58,8 @@ type LedgerItem struct {
 	SourceID              uuid.UUID `json:"source_id"`
 	SourceName            string    `json:"source_name"`
 	ReviewStatus          string    `json:"review_status"`
+	CategorySource        *string   `json:"category_source"`
+	CategoryConfidence    *float64  `json:"category_confidence"`
 	Voided                bool      `json:"voided"`
 	ReversesTransactionID *uuid.UUID `json:"reverses_transaction_id"`
 }

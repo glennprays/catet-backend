@@ -1244,6 +1244,8 @@ components:
         source_id: { type: string, format: uuid }
         source_name: { type: string }
         review_status: { type: string, enum: [clean, needs_review] }
+        category_source: { type: string, enum: [rules, llm, user, import], nullable: true }
+        category_confidence: { type: number, nullable: true }
         voided: { type: boolean }
         reverses_transaction_id: { type: string, format: uuid, nullable: true }
     TransactionListEnvelope:

@@ -47,6 +47,8 @@ type LedgerRow struct {
 	SourceID              uuid.UUID
 	SourceName            string
 	ReviewStatus          string
+	CategorySource        *string
+	CategoryConfidence    *float64
 	Voided                bool
 	ReversesTransactionID *uuid.UUID
 }
@@ -244,7 +246,8 @@ func insertLegs(ctx context.Context, tx pgx.Tx, txID uuid.UUID, legs []entity.Le
 const ledgerSelect = `
 	SELECT t.id, t.occurred_at, t.type, t.merchant, t.note,
 	       p.signed_amount, t.category_id, c.name, p.source_id, ps.name,
-	       t.review_status, t.voided_at IS NOT NULL, t.reverses_transaction_id
+	       t.review_status, t.category_source, t.category_confidence,
+	       t.voided_at IS NOT NULL, t.reverses_transaction_id
 	FROM transactions t
 	JOIN LATERAL (
 		SELECT l.source_id, l.signed_amount FROM legs l
@@ -311,7 +314,8 @@ func (r *TransactionRepository) List(ctx context.Context, f ListFilter) ([]Ledge
 		if err := rows.Scan(
 			&row.TransactionID, &row.OccurredAt, &row.Type, &row.Merchant, &row.Note,
 			&row.AmountMinor, &row.CategoryID, &row.CategoryName, &row.SourceID, &row.SourceName,
-			&row.ReviewStatus, &row.Voided, &row.ReversesTransactionID,
+			&row.ReviewStatus, &row.CategorySource, &row.CategoryConfidence,
+			&row.Voided, &row.ReversesTransactionID,
 		); err != nil {
 			return nil, err
 		}
