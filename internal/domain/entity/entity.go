@@ -71,6 +71,17 @@ type Transaction struct {
 	Legs                  []Leg           `json:"legs"`
 }
 
+// MarshalJSON adds the derived `voided` flag the API contract requires.
+// VoidedAt stays the single source of truth; a boolean column would be
+// a second one that can disagree with it.
+func (t Transaction) MarshalJSON() ([]byte, error) {
+	type alias Transaction
+	return json.Marshal(struct {
+		alias
+		Voided bool `json:"voided"`
+	}{alias(t), t.VoidedAt != nil})
+}
+
 // Bill is a recurring obligation with an estimated amount band.
 type Bill struct {
 	ID               uuid.UUID  `json:"id"`
