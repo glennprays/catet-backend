@@ -7,6 +7,7 @@ import (
 	"github.com/glennprays/catet-backend/internal/httperror"
 	"github.com/glennprays/log"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
 
 // ErrorHandler is the global Fiber error handler. It accepts the logger
@@ -35,6 +36,13 @@ func ErrorHandler(logger *log.Logger) fiber.ErrorHandler {
 
 	return func(c *fiber.Ctx, err error) error {
 		traceID := GetTraceID(c)
+		if traceID == "" {
+			// Requests rejected by the server before the middleware
+			// chain ran (malformed request, body-limit breach) never
+			// got a trace ID. The logger panics on empty IDs, and the
+			// error handler must never take the process down.
+			traceID = uuid.New().String()
+		}
 
 		// 1. Application errors (typed) — map by Kind.
 		if ae := apperror.AsAppError(err); ae != nil {

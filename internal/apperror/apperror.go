@@ -22,13 +22,14 @@ import (
 type Kind string
 
 const (
-	KindBadRequest   Kind = "BAD_REQUEST"
-	KindUnauthorized Kind = "UNAUTHORIZED"
-	KindForbidden    Kind = "FORBIDDEN"
-	KindNotFound     Kind = "NOT_FOUND"
-	KindConflict     Kind = "CONFLICT"
-	KindValidation   Kind = "VALIDATION_FAILED"
-	KindInternal     Kind = "INTERNAL"
+	KindBadRequest      Kind = "BAD_REQUEST"
+	KindUnauthorized    Kind = "UNAUTHORIZED"
+	KindForbidden       Kind = "FORBIDDEN"
+	KindNotFound        Kind = "NOT_FOUND"
+	KindConflict        Kind = "CONFLICT"
+	KindValidation      Kind = "VALIDATION_FAILED"
+	KindTooManyRequests Kind = "TOO_MANY_REQUESTS"
+	KindInternal        Kind = "INTERNAL"
 )
 
 // FieldError describes one failed rule on one field. Used inside
@@ -116,6 +117,8 @@ func (e *Error) HTTPStatus() int {
 		return http.StatusNotFound
 	case KindConflict:
 		return http.StatusConflict
+	case KindTooManyRequests:
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusInternalServerError
 	}
@@ -125,24 +128,26 @@ func (e *Error) HTTPStatus() int {
 // directly — they have no contextual message. Use the constructors
 // below instead.
 var (
-	ErrBadRequest   = &Error{Kind: KindBadRequest, Message: "bad request"}
-	ErrUnauthorized = &Error{Kind: KindUnauthorized, Message: "unauthorized"}
-	ErrForbidden    = &Error{Kind: KindForbidden, Message: "forbidden"}
-	ErrNotFound     = &Error{Kind: KindNotFound, Message: "not found"}
-	ErrConflict     = &Error{Kind: KindConflict, Message: "conflict"}
-	ErrValidation   = &Error{Kind: KindValidation, Message: "validation failed"}
-	ErrInternal     = &Error{Kind: KindInternal, Message: "internal error"}
+	ErrBadRequest      = &Error{Kind: KindBadRequest, Message: "bad request"}
+	ErrUnauthorized    = &Error{Kind: KindUnauthorized, Message: "unauthorized"}
+	ErrForbidden       = &Error{Kind: KindForbidden, Message: "forbidden"}
+	ErrNotFound        = &Error{Kind: KindNotFound, Message: "not found"}
+	ErrConflict        = &Error{Kind: KindConflict, Message: "conflict"}
+	ErrValidation      = &Error{Kind: KindValidation, Message: "validation failed"}
+	ErrTooManyRequests = &Error{Kind: KindTooManyRequests, Message: "too many requests"}
+	ErrInternal        = &Error{Kind: KindInternal, Message: "internal error"}
 )
 
 // Per-kind constructors. One line at the call site.
 
-func BadRequest(msg string) *Error   { return &Error{Kind: KindBadRequest, Message: msg} }
-func Unauthorized(msg string) *Error { return &Error{Kind: KindUnauthorized, Message: msg} }
-func Forbidden(msg string) *Error    { return &Error{Kind: KindForbidden, Message: msg} }
-func NotFound(msg string) *Error     { return &Error{Kind: KindNotFound, Message: msg} }
-func Conflict(msg string) *Error     { return &Error{Kind: KindConflict, Message: msg} }
-func Validation(msg string) *Error   { return &Error{Kind: KindValidation, Message: msg} }
-func Internal(msg string) *Error     { return &Error{Kind: KindInternal, Message: msg} }
+func BadRequest(msg string) *Error      { return &Error{Kind: KindBadRequest, Message: msg} }
+func Unauthorized(msg string) *Error    { return &Error{Kind: KindUnauthorized, Message: msg} }
+func Forbidden(msg string) *Error       { return &Error{Kind: KindForbidden, Message: msg} }
+func NotFound(msg string) *Error        { return &Error{Kind: KindNotFound, Message: msg} }
+func Conflict(msg string) *Error        { return &Error{Kind: KindConflict, Message: msg} }
+func Validation(msg string) *Error      { return &Error{Kind: KindValidation, Message: msg} }
+func TooManyRequests(msg string) *Error { return &Error{Kind: KindTooManyRequests, Message: msg} }
+func Internal(msg string) *Error        { return &Error{Kind: KindInternal, Message: msg} }
 
 // Formatted variants. Save fmt.Sprintf at the call site.
 

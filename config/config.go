@@ -29,6 +29,23 @@ type Config struct {
 	// Comma-separated list of allowed origins for CORS. Development should
 	// enumerate local dashboard origins; production refuses wildcard origins.
 	CorsAllowedOrigins string `mapstructure:"CORS_ALLOWED_ORIGINS" default:"http://localhost:3001" validate:"required"`
+	// Postgres connection string for pgxpool. Compose-based dev also
+	// exposes discrete DB_* vars; the pool consumes the URL form.
+	DatabaseURL string `mapstructure:"DATABASE_URL" default:"postgres://postgres:catet_dev@localhost:5432/catet_dev?sslmode=disable" validate:"required"`
+
+	// Auth: HMAC secret for session JWTs and the single owner phone.
+	// Dev defaults exist so the stack boots without env setup; production
+	// refuses both defaults (see Load).
+	AuthSecret string `mapstructure:"AUTH_SECRET" default:"dev-only-secret" validate:"required"`
+	OwnerPhone string `mapstructure:"OWNER_PHONE" default:"+628000000000" validate:"required"`
+
+	// OTP lifetime in seconds (5 minutes by default).
+	OtpTTLSeconds int `mapstructure:"OTP_TTL_SECONDS" default:"300" validate:"required,min=30,max=3600"`
+
+	// WhatsApp gateway delivery for OTP codes. Empty URL selects the
+	// log sender (codes printed to the API log) — the dev default.
+	WaGatewayURL   string `mapstructure:"WA_GATEWAY_URL"`
+	WaGatewayToken string `mapstructure:"WA_GATEWAY_TOKEN"`
 }
 
 type Environment string
@@ -88,6 +105,17 @@ func Load() (*Config, error) {
 	// missing DB_PASSWORD / DB_NAME at boot rather than at first query.
 	if err := validator.New().Struct(cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	// Production must not run on the dev-only auth defaults: a public
+	// deployment with the shared dev secret or the placeholder owner
+	// phone would be trivially compromisable.
+	if cfg.Env == PROD {
+		if cfg.AuthSecret == "dev-only-secret" {
+			return nil, fmt.Errorf("invalid configuration: AUTH_SECRET must be set in production")
+		}
+		if cfg.OwnerPhone == "+628000000000" {
+			return nil, fmt.Errorf("invalid configuration: OWNER_PHONE must be set in production")
+		}
 	}
 
 	// Production must explicitly enumerate origins — a wildcard there

@@ -1,6 +1,8 @@
 RENAME_MODULE_FROM=github.com/glennprays/catet-backend
 RENAME_MODULE_TO=
 
+DATABASE_URL ?= postgres://postgres:catet_dev@localhost:5432/catet_dev?sslmode=disable
+
 # detect OS
 UNAME_S := $(shell uname -s)
 
@@ -34,6 +36,13 @@ run-dev:
 stop-dev:
 	@echo "Stopping all Docker containers..."
 	@sh docker-dev down
+
+migrate:
+	@echo "Applying migrations to $(DATABASE_URL)..."
+	@migrate -path ./migrations -database "$(DATABASE_URL)" up
+migrate-down:
+	@echo "Rolling back last migration..."
+	@migrate -path ./migrations -database "$(DATABASE_URL)" down 1
 
 swagger:
 	@echo "Restarting Swagger UI..."

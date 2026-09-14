@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/go-playground/validator/v10"
@@ -14,7 +15,8 @@ import (
 // validate is shared across BindAndValidate calls; the library is
 // goroutine-safe. It's configured to report JSON field names (rather
 // than Go struct field names) in validation errors so clients see
-// the same identifiers they sent.
+// the same identifiers they sent. Custom rules cover the date-ish
+// string params the API accepts (Asia/Jakarta calendar dates).
 var validate = func() *validator.Validate {
 	v := validator.New()
 	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
@@ -24,8 +26,29 @@ var validate = func() *validator.Validate {
 		}
 		return name
 	})
+
+	mustRegister(v, "yyyy-mm-date", func(s string) bool {
+		_, err := time.Parse("2006-01-02", s)
+		return err == nil
+	})
+	mustRegister(v, "yyyy-mm", func(s string) bool {
+		_, err := time.Parse("2006-01", s)
+		return err == nil
+	})
+
 	return v
 }()
+
+// mustRegister wires a string-rule validator and panics on a name
+// clash — a programming error caught at package init, not at runtime.
+func mustRegister(v *validator.Validate, tag string, fn func(string) bool) {
+	if err := v.RegisterValidation(tag, func(fl validator.FieldLevel) bool {
+		s, ok := fl.Field().Interface().(string)
+		return ok && fn(s)
+	}); err != nil {
+		panic(fmt.Sprintf("register validator %q: %v", tag, err))
+	}
+}
 
 // BindAndValidate parses the request body into T and validates it
 // against its struct tags. On failure it returns a typed *apperror

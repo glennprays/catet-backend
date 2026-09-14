@@ -1,18 +1,26 @@
 openapi: 3.1.0
 info:
   title: catet Backend API
-  version: 0.1.0
-  description: Internal Go API consumed only by the catet Next.js BFF.
+  version: 0.2.0
+  description: |
+    Internal Go API consumed only by the catet Next.js BFF.
+
+    Conventions:
+    - Every response is an envelope with exactly one of `data`/`error` plus `trace_id`.
+    - Money is int64 minor units (IDR cents = rupiah). Never floats.
+    - Day boundaries and date params are Asia/Jakarta; storage is UTC (timestamptz).
+    - Errors carry a stable machine `code` (apperror.Kind) plus optional FieldError[].
 servers:
   - url: /
     description: Internal API root
+security: []
 paths:
+  # ---------------------------------------------------------------- system
   /api/v1/health:
     get:
       summary: Health check endpoint
       operationId: getHealth
-      tags:
-        - System
+      tags: [System]
       responses:
         '200':
           description: Server is healthy
@@ -29,8 +37,7 @@ paths:
     get:
       summary: Build metadata endpoint
       operationId: getVersion
-      tags:
-        - System
+      tags: [System]
       responses:
         '200':
           description: Build metadata
@@ -43,13 +50,1006 @@ paths:
                 $ref: '#/components/schemas/VersionEnvelope'
         '500':
           $ref: '#/components/responses/ErrorResponse'
+
+  # ------------------------------------------------------------------ auth
+  /api/v1/auth/otp/request:
+    post:
+      summary: Request a WhatsApp OTP code
+      operationId: requestOtp
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  description: E.164 owner phone
+                  example: "+628000000000"
+      responses:
+        '200':
+          description: Code dispatched (log sender in dev)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OtpRequestEnvelope'
+        '400':
+          description: Phone is not the configured owner phone
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          description: An unexpired unconsumed code was requested less than 60s ago
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/auth/otp/verify:
+    post:
+      summary: Verify an OTP code and obtain a session JWT
+      operationId: verifyOtp
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone:
+                  type: string
+                code:
+                  type: string
+                  example: "123456"
+      responses:
+        '200':
+          description: Session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OtpVerifyEnvelope'
+        '400':
+          description: |
+            Wrong/expired code, or `attempts_exceeded` after 5 bad tries
+            (the code is invalidated).
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/auth/me:
+    get:
+      summary: Current session owner
+      operationId: getMe
+      tags: [Auth]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Session phone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # --------------------------------------------------------------- sources
+  /api/v1/sources:
+    get:
+      summary: List sources with ledger-computed balances
+      operationId: listSources
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Sources plus ready-to-render totals
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourcesEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create a source
+      operationId: createSource
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: { type: string, minLength: 1 }
+                type: { type: string, enum: [cash, bank, ewallet, custom] }
+                is_debt: { type: boolean, default: false }
+                currency: { type: string, default: IDR }
+      responses:
+        '200':
+          description: Created source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/sources/{id}:
+    patch:
+      summary: Rename a source or toggle its debt flag
+      operationId: updateSource
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1 }
+                is_debt: { type: boolean }
+      responses:
+        '200':
+          description: Updated source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Soft-archive a source
+      operationId: archiveSource
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArchivedEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Referenced by open (active) bills
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/sources/{id}/adjustments:
+    post:
+      summary: Write an adjustment journal against a source
+      operationId: createAdjustment
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_minor]
+              properties:
+                amount_minor: { type: integer, format: int64, description: signed balance correction }
+                note: { type: string }
+      responses:
+        '200':
+          description: Adjustment transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ---------------------------------------------------------- transactions
+  /api/v1/transactions:
+    get:
+      summary: List ledger items (keyset pagination, occurred_at DESC)
+      operationId: listTransactions
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: source_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: category_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: review_status
+          in: query
+          schema: { type: string, enum: [clean, needs_review] }
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: direction
+          in: query
+          schema: { type: string, enum: [expense, income, transfer, adjustment] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Ledger items page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionListEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create a manual transaction (dashboard peer capture)
+      operationId: createTransaction
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, amount_minor, source_id]
+              properties:
+                type: { type: string, enum: [expense, income, transfer, adjustment] }
+                occurred_at: { type: string, format: date-time }
+                occurred_date: { type: string, format: date, description: used when occurred_at absent (Asia/Jakarta) }
+                amount_minor: { type: integer, format: int64 }
+                source_id: { type: string, format: uuid }
+                destination_source_id: { type: string, format: uuid, description: required for transfer }
+                category_id: { type: string, format: uuid }
+                note: { type: string }
+                merchant: { type: string }
+      responses:
+        '200':
+          description: Created transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEnvelope'
+        '400':
+          description: VALIDATION_FAILED with FieldError[] on rule violations
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/transactions/{id}:
+    get:
+      summary: Transaction detail with legs and edit history
+      operationId: getTransaction
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    patch:
+      summary: Edit a transaction (legs rewritten, edit_history appended)
+      operationId: updateTransaction
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount_minor: { type: integer, format: int64 }
+                occurred_at: { type: string, format: date-time }
+                category_id: { type: string, format: uuid, nullable: true }
+                note: { type: string, nullable: true }
+                merchant: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Updated transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Transaction is voided
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Void a transaction (soft, excluded from all math)
+      operationId: voidTransaction
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Voided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoidedEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/transactions/{id}/reversals:
+    post:
+      summary: Create a linked reversal (mirrored legs)
+      operationId: reverseTransaction
+      tags: [Transactions]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        '200':
+          description: Reversal transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Already voided or already reversed
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ------------------------------------------------------------ categories
+  /api/v1/categories:
+    get:
+      summary: List categories (flat; tree built client-side)
+      operationId: listCategories
+      tags: [Categories]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoriesEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create a category
+      operationId: createCategory
+      tags: [Categories]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1 }
+                parent_id: { type: string, format: uuid, nullable: true }
+                icon: { type: string, nullable: true }
+                essential: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Created category
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/categories/{id}:
+    patch:
+      summary: Update a category
+      operationId: updateCategory
+      tags: [Categories]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1 }
+                parent_id: { type: string, format: uuid, nullable: true }
+                icon: { type: string, nullable: true }
+                essential: { type: boolean }
+      responses:
+        '200':
+          description: Updated category
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Soft-archive a category
+      operationId: archiveCategory
+      tags: [Categories]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArchivedEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Used by a budget in the current period
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ----------------------------------------------------------------- bills
+  /api/v1/bills:
+    get:
+      summary: List bills
+      operationId: listBills
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Bills
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillsEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create a bill
+      operationId: createBill
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillInput'
+      responses:
+        '200':
+          description: Created bill
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/bills/{id}:
+    patch:
+      summary: Update any subset of a bill
+      operationId: updateBill
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillInput'
+      responses:
+        '200':
+          description: Updated bill
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Deactivate a bill
+      operationId: deactivateBill
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillActiveEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # --------------------------------------------------------------- budgets
+  /api/v1/budgets:
+    get:
+      summary: Budget rows with computed spend for a period
+      operationId: listBudgets
+      tags: [Budgets]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, pattern: '^\d{4}-\d{2}$', description: defaults to current Asia/Jakarta month }
+      responses:
+        '200':
+          description: Budget rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetsEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create a budget
+      operationId: createBudget
+      tags: [Budgets]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category_id, period, amount_minor]
+              properties:
+                category_id: { type: string, format: uuid }
+                period: { type: string, pattern: '^\d{4}-\d{2}$' }
+                amount_minor: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Created budget row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          description: Budget already exists for (category, period)
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/budgets/{id}:
+    patch:
+      summary: Update a budget amount
+      operationId: updateBudget
+      tags: [Budgets]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount_minor: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated budget row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Delete a budget
+      operationId: deleteBudget
+      tags: [Budgets]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeletedEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # -------------------------------------------------------------- overview
+  /api/v1/overview:
+    get:
+      summary: Safe-to-Spend hero cluster plus recent activity
+      operationId: getOverview
+      tags: [Overview]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Overview snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverviewEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ------------------------------------------------------------- analytics
+  /api/v1/analytics/category-breakdown:
+    get:
+      summary: Hierarchical expense breakdown (top-level donut, children sum to parent)
+      operationId: getCategoryBreakdown
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
+      responses:
+        '200':
+          description: Breakdown tree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryBreakdownEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/analytics/income-expense:
+    get:
+      summary: Weekly income-vs-expense buckets (Asia/Jakarta, Mon start)
+      operationId: getIncomeExpense
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
+      responses:
+        '200':
+          description: Weekly buckets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomeExpenseEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/analytics/sts-trend:
+    get:
+      summary: Safe-to-Spend (now value) with per-day trailing-burn runway
+      operationId: getStsTrend
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, default: 30, maximum: 365 }
+      responses:
+        '200':
+          description: Trend points
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StsTrendEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/analytics/heatmap:
+    get:
+      summary: Daily outflow heatmap with mean/std and >2σ anomaly flags
+      operationId: getHeatmap
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
+      responses:
+        '200':
+          description: Daily outflow series
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeatmapEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/analytics/top-merchants:
+    get:
+      summary: Merchants ranked by outflow in period
+      operationId: getTopMerchants
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        '200':
+          description: Ranked merchants
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopMerchantsEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/analytics/essential-lifestyle:
+    get:
+      summary: Essential vs lifestyle expense split
+      operationId: getEssentialLifestyle
+      tags: [Analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
+      responses:
+        '200':
+          description: Split totals
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EssentialLifestyleEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ------------------------------------------------------------ hold queue
+  /api/v1/hold-queue:
+    get:
+      summary: Parked pending actions awaiting confirmation
+      operationId: listHoldQueue
+      tags: [HoldQueue]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Pending actions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldQueueEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/hold-queue/{id}/resolve:
+    post:
+      summary: Confirm (execute) or discard a parked pending action
+      operationId: resolveHoldQueueItem
+      tags: [HoldQueue]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [confirm, discard] }
+      responses:
+        '200':
+          description: Resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # ---------------------------------------------------------------- badges
+  /api/v1/badges:
+    get:
+      summary: Rail badge counts
+      operationId: getBadges
+      tags: [System]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Badge counts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadgesEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  # -------------------------------------------------------------- settings
+  /api/v1/settings:
+    get:
+      summary: App settings
+      operationId: getSettings
+      tags: [Settings]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    put:
+      summary: Update settings
+      operationId: updateSettings
+      tags: [Settings]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [income_horizon_days]
+              properties:
+                income_horizon_days: { type: integer, minimum: 1, maximum: 90 }
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
   headers:
     TraceId:
       description: Request trace identifier mirrored in the response envelope.
       schema:
         type: string
         format: uuid
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    From:
+      name: from
+      in: query
+      schema: { type: string, format: date, description: Asia/Jakarta date; defaults to today-29 }
+    To:
+      name: to
+      in: query
+      schema: { type: string, format: date, description: Asia/Jakarta date; defaults to today }
   responses:
     ErrorResponse:
       description: Error envelope
@@ -60,93 +1060,638 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    ValidationError:
+      description: VALIDATION_FAILED with FieldError details
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnauthorizedError:
+      description: Missing or invalid bearer token
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFoundError:
+      description: Not found
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
   schemas:
+    # ------------------------------------------------------- system shapes
     HealthEnvelope:
       type: object
-      required:
-        - data
-        - trace_id
+      required: [data, trace_id]
       properties:
         data:
           $ref: '#/components/schemas/HealthResponse'
-        trace_id:
-          type: string
-          format: uuid
+        trace_id: { type: string, format: uuid }
     HealthResponse:
       type: object
-      required:
-        - status
-        - timestamp
+      required: [status, timestamp]
       properties:
-        status:
-          type: string
-          enum:
-            - ok
-        timestamp:
-          type: string
-          format: date-time
+        status: { type: string, enum: [ok] }
+        timestamp: { type: string, format: date-time }
     VersionEnvelope:
       type: object
-      required:
-        - data
-        - trace_id
+      required: [data, trace_id]
       properties:
         data:
           $ref: '#/components/schemas/VersionResponse'
-        trace_id:
-          type: string
-          format: uuid
+        trace_id: { type: string, format: uuid }
     VersionResponse:
       type: object
-      required:
-        - version
-        - commit
-        - build_time
+      required: [version, commit, build_time]
       properties:
-        version:
-          type: string
-          example: dev
-        commit:
-          type: string
-          example: unknown
-        build_time:
-          type: string
-          example: unknown
+        version: { type: string, example: dev }
+        commit: { type: string, example: unknown }
+        build_time: { type: string, example: unknown }
     ErrorEnvelope:
       type: object
-      required:
-        - error
-        - trace_id
+      required: [error, trace_id]
       properties:
         error:
           $ref: '#/components/schemas/ErrorBody'
-        trace_id:
-          type: string
-          format: uuid
+        trace_id: { type: string, format: uuid }
     ErrorBody:
       type: object
-      required:
-        - code
-        - message
+      required: [code, message]
       properties:
-        code:
-          type: string
-        message:
-          type: string
+        code: { type: string, description: apperror.Kind }
+        message: { type: string }
         details:
           type: array
           items:
             $ref: '#/components/schemas/FieldError'
     FieldError:
       type: object
-      required:
-        - field
-        - message
+      required: [field, message]
       properties:
-        field:
-          type: string
-        message:
-          type: string
+        field: { type: string }
+        rule: { type: string }
+        message: { type: string }
+    PageMeta:
+      type: object
+      properties:
+        next_cursor: { type: string }
+        prev_cursor: { type: string }
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer, format: int64 }
+
+    # ---------------------------------------------------------------- auth
+    OtpRequestEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [sent]
+          properties:
+            sent: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+    OtpVerifyEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [token, expires_at]
+          properties:
+            token: { type: string }
+            expires_at: { type: string, format: date-time }
+        trace_id: { type: string, format: uuid }
+    MeEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [phone]
+          properties:
+            phone: { type: string }
+        trace_id: { type: string, format: uuid }
+
+    # ------------------------------------------------------------- sources
+    Source:
+      type: object
+      required: [id, name, type, is_debt, currency, balance_minor]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        type: { type: string, enum: [cash, bank, ewallet, custom] }
+        is_debt: { type: boolean }
+        currency: { type: string }
+        balance_minor: { type: integer, format: int64, description: Σ non-voided legs }
+        archived_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    SourcesEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [sources, total_available_minor, total_debt_minor]
+          properties:
+            sources:
+              type: array
+              items:
+                $ref: '#/components/schemas/Source'
+            total_available_minor: { type: integer, format: int64, description: Σ balances of non-debt sources }
+            total_debt_minor: { type: integer, format: int64, description: Σ negative balances of debt sources (positive magnitude) }
+        trace_id: { type: string, format: uuid }
+    SourceEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Source'
+        trace_id: { type: string, format: uuid }
+    ArchivedEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [archived]
+          properties:
+            archived: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+
+    # -------------------------------------------------------- transactions
+    LedgerItem:
+      type: object
+      required: [transaction_id, occurred_at, type, amount_minor, source_id, source_name, review_status, voided]
+      properties:
+        transaction_id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        type: { type: string, enum: [expense, income, transfer, adjustment] }
+        merchant: { type: string, nullable: true }
+        note: { type: string, nullable: true }
+        amount_minor: { type: integer, format: int64, description: user-perspective signed (expense −, income +, transfer −) }
+        category_id: { type: string, format: uuid, nullable: true }
+        category_name: { type: string, nullable: true }
+        source_id: { type: string, format: uuid }
+        source_name: { type: string }
+        review_status: { type: string, enum: [clean, needs_review] }
+        voided: { type: boolean }
+        reverses_transaction_id: { type: string, format: uuid, nullable: true }
+    TransactionListEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [transactions]
+          properties:
+            transactions:
+              type: array
+              items:
+                $ref: '#/components/schemas/LedgerItem'
+        page:
+          $ref: '#/components/schemas/PageMeta'
+        trace_id: { type: string, format: uuid }
+    TransactionLeg:
+      type: object
+      required: [id, signed_amount]
+      properties:
+        id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid, nullable: true }
+        source_name: { type: string, nullable: true }
+        category_id: { type: string, format: uuid, nullable: true }
+        category_name: { type: string, nullable: true }
+        signed_amount: { type: integer, format: int64 }
+    EditHistoryEntry:
+      type: object
+      properties:
+        edited_at: { type: string, format: date-time }
+        changes:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              from: {}
+              to: {}
+    Transaction:
+      type: object
+      required: [id, occurred_at, origin, type, amount_minor, review_status, voided, legs, edit_history]
+      properties:
+        id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        origin: { type: string, enum: [whatsapp_text, whatsapp_photo, dashboard_manual, import] }
+        type: { type: string, enum: [expense, income, transfer, adjustment] }
+        merchant: { type: string, nullable: true }
+        note: { type: string, nullable: true }
+        amount_minor: { type: integer, format: int64, description: unsigned base amount }
+        category_id: { type: string, format: uuid, nullable: true }
+        category_name: { type: string, nullable: true }
+        category_source: { type: string, enum: [rules, llm, user, import], nullable: true }
+        category_confidence: { type: number, nullable: true }
+        review_status: { type: string, enum: [clean, needs_review] }
+        external_id: { type: string, nullable: true }
+        reverses_transaction_id: { type: string, format: uuid, nullable: true }
+        reverses_merchant: { type: string, nullable: true, description: merchant of the reversed transaction when present }
+        edit_history:
+          type: array
+          items:
+            $ref: '#/components/schemas/EditHistoryEntry'
+        voided: { type: boolean }
+        voided_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        legs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionLeg'
+    TransactionEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Transaction'
+        trace_id: { type: string, format: uuid }
+    VoidedEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [voided]
+          properties:
+            voided: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+
+    # ---------------------------------------------------------- categories
+    Category:
+      type: object
+      required: [id, name, essential]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        parent_id: { type: string, format: uuid, nullable: true }
+        icon: { type: string, nullable: true }
+        essential: { type: boolean }
+        archived_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    CategoriesEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [categories]
+          properties:
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/Category'
+        trace_id: { type: string, format: uuid }
+    CategoryEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Category'
+        trace_id: { type: string, format: uuid }
+
+    # --------------------------------------------------------------- bills
+    BillInput:
+      type: object
+      required: [name, amount_min_minor, amount_max_minor, cadence, next_due_date]
+      properties:
+        name: { type: string, minLength: 1 }
+        amount_min_minor: { type: integer, format: int64 }
+        amount_max_minor: { type: integer, format: int64 }
+        cadence: { type: string, enum: [weekly, monthly, annual] }
+        next_due_date: { type: string, format: date }
+        linked_source_id: { type: string, format: uuid, nullable: true }
+        category_id: { type: string, format: uuid, nullable: true }
+    Bill:
+      allOf:
+        - $ref: '#/components/schemas/BillInput'
+        - type: object
+          required: [id, active]
+          properties:
+            id: { type: string, format: uuid }
+            linked_source_id: { type: string, format: uuid, nullable: true }
+            linked_source_name: { type: string, nullable: true }
+            category_id: { type: string, format: uuid, nullable: true }
+            category_name: { type: string, nullable: true }
+            active: { type: boolean }
+            created_at: { type: string, format: date-time }
+    BillsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [bills]
+          properties:
+            bills:
+              type: array
+              items:
+                $ref: '#/components/schemas/Bill'
+        trace_id: { type: string, format: uuid }
+    BillEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Bill'
+        trace_id: { type: string, format: uuid }
+    BillActiveEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [active]
+          properties:
+            active: { type: boolean, enum: [false] }
+        trace_id: { type: string, format: uuid }
+
+    # ------------------------------------------------------------- budgets
+    BudgetRow:
+      type: object
+      required: [id, category_id, category_name, essential, amount_minor, spent_minor]
+      properties:
+        id: { type: string, format: uuid }
+        category_id: { type: string, format: uuid }
+        category_name: { type: string }
+        essential: { type: boolean }
+        amount_minor: { type: integer, format: int64 }
+        spent_minor: { type: integer, format: int64 }
+    BudgetsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [budgets]
+          properties:
+            period: { type: string }
+            budgets:
+              type: array
+              items:
+                $ref: '#/components/schemas/BudgetRow'
+        trace_id: { type: string, format: uuid }
+    BudgetEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/BudgetRow'
+        trace_id: { type: string, format: uuid }
+    DeletedEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [deleted]
+          properties:
+            deleted: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+
+    # ------------------------------------------------------------ overview
+    Overview:
+      type: object
+      required: [sts_minor, runway_days, daily_allowance_minor, reserved_tomorrow_minor, essential_minor, lifestyle_minor, available_minor, reserved_minor, recent, badges]
+      properties:
+        sts_minor: { type: integer, format: int64 }
+        runway_days: { type: integer, format: int64, description: 0 when burn ≤ 0 → render ∞ }
+        daily_allowance_minor: { type: integer, format: int64 }
+        reserved_tomorrow_minor: { type: integer, format: int64 }
+        reserved_minor: { type: integer, format: int64 }
+        available_minor: { type: integer, format: int64 }
+        essential_minor: { type: integer, format: int64 }
+        lifestyle_minor: { type: integer, format: int64 }
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerItem'
+        badges:
+          $ref: '#/components/schemas/BadgeCounts'
+    OverviewEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Overview'
+        trace_id: { type: string, format: uuid }
+    BadgeCounts:
+      type: object
+      required: [needs_review, hold_queue]
+      properties:
+        needs_review: { type: integer, format: int64 }
+        hold_queue: { type: integer, format: int64 }
+    BadgesEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/BadgeCounts'
+        trace_id: { type: string, format: uuid }
+
+    # ----------------------------------------------------------- analytics
+    CategoryBreakdownNode:
+      type: object
+      required: [category_id, name, essential, amount_minor, share]
+      properties:
+        category_id: { type: string, format: uuid }
+        name: { type: string }
+        essential: { type: boolean }
+        amount_minor: { type: integer, format: int64, description: includes descendants }
+        share: { type: number, description: fraction of total_minor }
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/CategoryBreakdownNode'
+    CategoryBreakdownEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [total_minor, categories]
+          properties:
+            total_minor: { type: integer, format: int64 }
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryBreakdownNode'
+        trace_id: { type: string, format: uuid }
+    IncomeExpenseBucket:
+      type: object
+      required: [week_start, income_minor, expense_minor]
+      properties:
+        week_start: { type: string, format: date }
+        income_minor: { type: integer, format: int64 }
+        expense_minor: { type: integer, format: int64, description: positive magnitude }
+    IncomeExpenseEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [buckets]
+          properties:
+            buckets:
+              type: array
+              items:
+                $ref: '#/components/schemas/IncomeExpenseBucket'
+        trace_id: { type: string, format: uuid }
+    StsPoint:
+      type: object
+      required: [date, sts_minor, runway_days]
+      properties:
+        date: { type: string, format: date }
+        sts_minor: { type: integer, format: int64 }
+        runway_days: { type: integer, format: int64 }
+    StsTrendEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [points]
+          properties:
+            points:
+              type: array
+              items:
+                $ref: '#/components/schemas/StsPoint'
+        trace_id: { type: string, format: uuid }
+    HeatmapDay:
+      type: object
+      required: [date, outflow_minor, anomaly]
+      properties:
+        date: { type: string, format: date }
+        outflow_minor: { type: integer, format: int64 }
+        anomaly: { type: boolean }
+    HeatmapEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [days, mean_minor, std_minor]
+          properties:
+            days:
+              type: array
+              items:
+                $ref: '#/components/schemas/HeatmapDay'
+            mean_minor: { type: integer, format: int64 }
+            std_minor: { type: integer, format: int64 }
+        trace_id: { type: string, format: uuid }
+    TopMerchant:
+      type: object
+      required: [name, amount_minor, tx_count]
+      properties:
+        name: { type: string }
+        amount_minor: { type: integer, format: int64 }
+        tx_count: { type: integer, format: int64 }
+    TopMerchantsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [merchants]
+          properties:
+            merchants:
+              type: array
+              items:
+                $ref: '#/components/schemas/TopMerchant'
+        trace_id: { type: string, format: uuid }
+    EssentialLifestyleEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [essential_minor, lifestyle_minor]
+          properties:
+            essential_minor: { type: integer, format: int64 }
+            lifestyle_minor: { type: integer, format: int64 }
+        trace_id: { type: string, format: uuid }
+
+    # ----------------------------------------------------------- hold queue
+    PendingAction:
+      type: object
+      required: [id, kind, params, summary, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        params: { type: object, additionalProperties: true }
+        summary: { type: string }
+        created_at: { type: string, format: date-time }
+    HoldQueueEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/PendingAction'
+        trace_id: { type: string, format: uuid }
+    ResolvedEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [resolved]
+          properties:
+            resolved: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+
+    # ------------------------------------------------------------ settings
+    Settings:
+      type: object
+      required: [income_horizon_days, phone]
+      properties:
+        income_horizon_days: { type: integer, minimum: 1, maximum: 90 }
+        phone: { type: string }
+    SettingsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Settings'
+        trace_id: { type: string, format: uuid }
 tags:
   - name: System
     description: Internal system status endpoints
+  - name: Auth
+    description: WhatsApp OTP session auth
+  - name: Sources
+    description: Places money lives
+  - name: Transactions
+    description: Two-leg ledger journals
+  - name: Categories
+    description: Category hierarchy
+  - name: Bills
+    description: Recurring obligations
+  - name: Budgets
+    description: Per-category monthly limits
+  - name: Overview
+    description: Safe-to-Spend hero cluster
+  - name: Analytics
+    description: Deterministic chart series
+  - name: HoldQueue
+    description: Parked pending actions
+  - name: Settings
+    description: App settings

@@ -2,6 +2,7 @@ package router
 
 import (
 	"github.com/glennprays/catet-backend/config"
+	"github.com/glennprays/catet-backend/internal/auth"
 	"github.com/glennprays/catet-backend/internal/handler"
 	"github.com/glennprays/catet-backend/internal/middleware"
 	"github.com/glennprays/log"
@@ -11,10 +12,25 @@ import (
 )
 
 type Router struct {
-	logger         *log.Logger
-	config         *config.Config
+	logger *log.Logger
+	config *config.Config
+
 	HealthHandler  *handler.HealthHandler
 	VersionHandler *handler.VersionHandler
+	AuthHandler    *auth.Handler
+
+	// RequireAuth guards every route below the public set.
+	AuthMiddleware fiber.Handler
+
+	SourceHandler      *handler.SourceHandler
+	TransactionHandler *handler.TransactionHandler
+	CategoryHandler    *handler.CategoryHandler
+	BillHandler        *handler.BillHandler
+	BudgetHandler      *handler.BudgetHandler
+	OverviewHandler    *handler.OverviewHandler
+	AnalyticsHandler   *handler.AnalyticsHandler
+	HoldQueueHandler   *handler.HoldQueueHandler
+	SettingsHandler    *handler.SettingsHandler
 }
 
 func NewRouter(
@@ -22,17 +38,40 @@ func NewRouter(
 	logger *log.Logger,
 	healthHandler *handler.HealthHandler,
 	versionHandler *handler.VersionHandler,
+	authHandler *auth.Handler,
+	authMiddleware fiber.Handler,
+	sourceHandler *handler.SourceHandler,
+	transactionHandler *handler.TransactionHandler,
+	categoryHandler *handler.CategoryHandler,
+	billHandler *handler.BillHandler,
+	budgetHandler *handler.BudgetHandler,
+	overviewHandler *handler.OverviewHandler,
+	analyticsHandler *handler.AnalyticsHandler,
+	holdQueueHandler *handler.HoldQueueHandler,
+	settingsHandler *handler.SettingsHandler,
 ) *Router {
 	routerLogger := logger.With(log.String("component", "router"))
 	return &Router{
-		logger:         routerLogger,
-		config:         cfg,
-		HealthHandler:  healthHandler,
-		VersionHandler: versionHandler,
+		logger:             routerLogger,
+		config:             cfg,
+		HealthHandler:      healthHandler,
+		VersionHandler:     versionHandler,
+		AuthHandler:        authHandler,
+		AuthMiddleware:     authMiddleware,
+		SourceHandler:      sourceHandler,
+		TransactionHandler: transactionHandler,
+		CategoryHandler:    categoryHandler,
+		BillHandler:        billHandler,
+		BudgetHandler:      budgetHandler,
+		OverviewHandler:    overviewHandler,
+		AnalyticsHandler:   analyticsHandler,
+		HoldQueueHandler:   holdQueueHandler,
+		SettingsHandler:    settingsHandler,
 	}
 }
 
-// Setup configures all application routes
+// Setup configures all application routes. Public set: /health,
+// /version, /auth/otp/*. Everything else requires a bearer session.
 func (r *Router) Setup(app *fiber.App) {
 	// Global middleware. TraceID must run before recover so that any
 	// panic surfaced by the recovery middleware can be correlated by
@@ -53,12 +92,25 @@ func (r *Router) Setup(app *fiber.App) {
 	// API v1 group
 	v1 := app.Group("/api/v1")
 
+	// Public routes (no auth).
 	r.setupHealthRoutes(v1)
 	r.setupVersionRoutes(v1)
+	otp := v1.Group("/auth/otp")
+	otp.Post("/request", r.AuthHandler.RequestOtp)
+	otp.Post("/verify", r.AuthHandler.VerifyOtp)
 
-	// Future route groups can be added here:
-	// r.setupUserRoutes(v1)
-	// r.setupAuthRoutes(v1)
+	// Protected routes.
+	protected := v1.Group("", r.AuthMiddleware)
+	r.setupAuthRoutes(protected)
+	r.setupSourceRoutes(protected)
+	r.setupTransactionRoutes(protected)
+	r.setupCategoryRoutes(protected)
+	r.setupBillRoutes(protected)
+	r.setupBudgetRoutes(protected)
+	r.setupOverviewRoutes(protected)
+	r.setupAnalyticsRoutes(protected)
+	r.setupHoldQueueRoutes(protected)
+	r.setupSettingsRoutes(protected)
 }
 
 func (r *Router) setupHealthRoutes(group fiber.Router) {
@@ -67,4 +119,71 @@ func (r *Router) setupHealthRoutes(group fiber.Router) {
 
 func (r *Router) setupVersionRoutes(group fiber.Router) {
 	group.Get("/version", r.VersionHandler.Get)
+}
+
+func (r *Router) setupAuthRoutes(group fiber.Router) {
+	group.Get("/auth/me", r.AuthHandler.Me)
+}
+
+func (r *Router) setupSourceRoutes(group fiber.Router) {
+	group.Get("/sources", r.SourceHandler.List)
+	group.Post("/sources", r.SourceHandler.Create)
+	group.Patch("/sources/:id", r.SourceHandler.Update)
+	group.Delete("/sources/:id", r.SourceHandler.Archive)
+	group.Post("/sources/:id/adjustments", r.SourceHandler.Adjust)
+}
+
+func (r *Router) setupTransactionRoutes(group fiber.Router) {
+	group.Get("/transactions", r.TransactionHandler.List)
+	group.Post("/transactions", r.TransactionHandler.Create)
+	group.Get("/transactions/:id", r.TransactionHandler.Get)
+	group.Patch("/transactions/:id", r.TransactionHandler.Update)
+	group.Delete("/transactions/:id", r.TransactionHandler.Void)
+	group.Post("/transactions/:id/reversals", r.TransactionHandler.Reverse)
+}
+
+func (r *Router) setupCategoryRoutes(group fiber.Router) {
+	group.Get("/categories", r.CategoryHandler.List)
+	group.Post("/categories", r.CategoryHandler.Create)
+	group.Patch("/categories/:id", r.CategoryHandler.Update)
+	group.Delete("/categories/:id", r.CategoryHandler.Archive)
+}
+
+func (r *Router) setupBillRoutes(group fiber.Router) {
+	group.Get("/bills", r.BillHandler.List)
+	group.Post("/bills", r.BillHandler.Create)
+	group.Patch("/bills/:id", r.BillHandler.Update)
+	group.Delete("/bills/:id", r.BillHandler.Deactivate)
+}
+
+func (r *Router) setupBudgetRoutes(group fiber.Router) {
+	group.Get("/budgets", r.BudgetHandler.List)
+	group.Post("/budgets", r.BudgetHandler.Create)
+	group.Patch("/budgets/:id", r.BudgetHandler.Update)
+	group.Delete("/budgets/:id", r.BudgetHandler.Delete)
+}
+
+func (r *Router) setupOverviewRoutes(group fiber.Router) {
+	group.Get("/overview", r.OverviewHandler.Get)
+	group.Get("/badges", r.OverviewHandler.Badges)
+}
+
+func (r *Router) setupAnalyticsRoutes(group fiber.Router) {
+	analytics := group.Group("/analytics")
+	analytics.Get("/category-breakdown", r.AnalyticsHandler.CategoryBreakdown)
+	analytics.Get("/income-expense", r.AnalyticsHandler.IncomeExpense)
+	analytics.Get("/sts-trend", r.AnalyticsHandler.StsTrend)
+	analytics.Get("/heatmap", r.AnalyticsHandler.Heatmap)
+	analytics.Get("/top-merchants", r.AnalyticsHandler.TopMerchants)
+	analytics.Get("/essential-lifestyle", r.AnalyticsHandler.EssentialLifestyle)
+}
+
+func (r *Router) setupHoldQueueRoutes(group fiber.Router) {
+	group.Get("/hold-queue", r.HoldQueueHandler.List)
+	group.Post("/hold-queue/:id/resolve", r.HoldQueueHandler.Resolve)
+}
+
+func (r *Router) setupSettingsRoutes(group fiber.Router) {
+	group.Get("/settings", r.SettingsHandler.Get)
+	group.Put("/settings", r.SettingsHandler.Update)
 }

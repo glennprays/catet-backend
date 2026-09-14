@@ -10,6 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	// Embed tzdata so Asia/Jakarta day boundaries resolve in any
+	// container image.
+	_ "time/tzdata"
+
 	"github.com/glennprays/catet-backend/config"
 	"github.com/glennprays/catet-backend/internal/infrastructure"
 	"github.com/glennprays/catet-backend/internal/middleware"
@@ -25,8 +29,10 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to initialize app: %v", err))
 	}
-	defer func() { _ = app.Logger.Sync() }()
-
+	defer func() {
+		_ = app.Logger.Sync()
+		app.Pool.Close()
+	}()
 	logger := app.Logger.With(log.String("component", "main"))
 
 	// Create Fiber app with custom error handler and explicit limits.
