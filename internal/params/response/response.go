@@ -33,9 +33,9 @@ type SourceResponse struct {
 }
 
 type SourcesData struct {
-	Sources            []SourceResponse `json:"sources"`
-	TotalAvailableMinor int64           `json:"total_available_minor"`
-	TotalDebtMinor      int64           `json:"total_debt_minor"`
+	Sources             []SourceResponse `json:"sources"`
+	TotalAvailableMinor int64            `json:"total_available_minor"`
+	TotalDebtMinor      int64            `json:"total_debt_minor"`
 }
 
 type ArchivedData struct {
@@ -47,20 +47,20 @@ type ArchivedData struct {
 // LedgerItem is the flattened list row: user-perspective signed amount
 // (expense −, income +, transfer −) plus display names.
 type LedgerItem struct {
-	TransactionID         uuid.UUID `json:"transaction_id"`
-	OccurredAt            time.Time `json:"occurred_at"`
-	Type                  string    `json:"type"`
-	Merchant              *string   `json:"merchant"`
-	Note                  *string   `json:"note"`
-	AmountMinor           int64     `json:"amount_minor"`
+	TransactionID         uuid.UUID  `json:"transaction_id"`
+	OccurredAt            time.Time  `json:"occurred_at"`
+	Type                  string     `json:"type"`
+	Merchant              *string    `json:"merchant"`
+	Note                  *string    `json:"note"`
+	AmountMinor           int64      `json:"amount_minor"`
 	CategoryID            *uuid.UUID `json:"category_id"`
-	CategoryName          *string   `json:"category_name"`
-	SourceID              uuid.UUID `json:"source_id"`
-	SourceName            string    `json:"source_name"`
-	ReviewStatus          string    `json:"review_status"`
-	CategorySource        *string   `json:"category_source"`
-	CategoryConfidence    *float64  `json:"category_confidence"`
-	Voided                bool      `json:"voided"`
+	CategoryName          *string    `json:"category_name"`
+	SourceID              uuid.UUID  `json:"source_id"`
+	SourceName            string     `json:"source_name"`
+	ReviewStatus          string     `json:"review_status"`
+	CategorySource        *string    `json:"category_source"`
+	CategoryConfidence    *float64   `json:"category_confidence"`
+	Voided                bool       `json:"voided"`
 	ReversesTransactionID *uuid.UUID `json:"reverses_transaction_id"`
 }
 
@@ -90,7 +90,7 @@ type BillsData struct {
 // ---------------------------------------------------------------- budgets
 
 type BudgetsData struct {
-	Period  string           `json:"period"`
+	Period  string             `json:"period"`
 	Budgets []entity.BudgetRow `json:"budgets"`
 }
 
@@ -102,16 +102,16 @@ type BadgeCounts struct {
 }
 
 type OverviewData struct {
-	StsMinor               int64          `json:"sts_minor"`
-	RunwayDays             int64          `json:"runway_days"`
-	DailyAllowanceMinor    int64          `json:"daily_allowance_minor"`
-	ReservedTomorrowMinor  int64          `json:"reserved_tomorrow_minor"`
-	ReservedMinor          int64          `json:"reserved_minor"`
-	AvailableMinor         int64          `json:"available_minor"`
-	EssentialMinor         int64          `json:"essential_minor"`
-	LifestyleMinor         int64          `json:"lifestyle_minor"`
-	Recent                 []LedgerItem   `json:"recent"`
-	Badges                 BadgeCounts    `json:"badges"`
+	StsMinor              int64        `json:"sts_minor"`
+	RunwayDays            int64        `json:"runway_days"`
+	DailyAllowanceMinor   int64        `json:"daily_allowance_minor"`
+	ReservedTomorrowMinor int64        `json:"reserved_tomorrow_minor"`
+	ReservedMinor         int64        `json:"reserved_minor"`
+	AvailableMinor        int64        `json:"available_minor"`
+	EssentialMinor        int64        `json:"essential_minor"`
+	LifestyleMinor        int64        `json:"lifestyle_minor"`
+	Recent                []LedgerItem `json:"recent"`
+	Badges                BadgeCounts  `json:"badges"`
 }
 
 type BadgesData = BadgeCounts
