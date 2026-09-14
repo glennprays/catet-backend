@@ -64,8 +64,16 @@ build:
 hooks:
 	@lefthook install
 
+# Integration tests truncate their schema. They run against
+# TEST_DATABASE_URL (a *_test database, created on demand) and the
+# harness refuses anything else, so dev data is never at risk.
 test:
 	@go test ./... -race -count=1
+
+# Rebuilds the development dataset from scratch (destructive, dev only).
+seed:
+	@echo "Seeding development data into $(DATABASE_URL)..."
+	@DATABASE_URL="$(DATABASE_URL)" go run ./cmd/seed
 
 lint:
 	@golangci-lint run ./...
