@@ -193,10 +193,11 @@ const intentSystem = "You are the intent router of a personal-finance WhatsApp b
 	"\"summary\" asks about spending today or this week; " +
 	"anything else, including greetings and questions you cannot map, is \"unknown\"."
 
-// Intent classifies one inbound message. A nil client is the documented
-// "LLM disabled" state: the harness then falls back to rules only.
+// Intent classifies one inbound message. A disabled client (nil, or a
+// provider with no API key) is the documented "LLM disabled" state: the
+// harness then falls back to rules only.
 func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error) {
-	if c == nil {
+	if !c.Enabled(ctx) {
 		return nil, ErrUnavailable
 	}
 

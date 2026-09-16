@@ -30,7 +30,7 @@ func (h *Harness) intentStage(
 	state *repository.ChatState,
 	lang string,
 ) (string, []uuid.UUID, string, error) {
-	if h.llm == nil {
+	if !h.llm.Enabled(ctx) {
 		return h.intentFallback(ctx, p, parsed, state, lang)
 	}
 

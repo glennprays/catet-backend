@@ -212,25 +212,106 @@ func TestTimeoutRetriesThenFails(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&calls))
 }
 
-func TestProvideAndNilReceiver(t *testing.T) {
-	assert.Nil(t, llm.Provide(&config.Config{}))
-
-	client := llm.Provide(&config.Config{LlmAPIKey: "sk-test", LlmBaseURL: "https://example.test/v1", LlmModel: "gpt", LlmTimeoutSecs: 5})
-	require.NotNil(t, client)
+// AI is optional, and "optional" is expressed in exactly two ways: no
+// client at all, and a client whose provider carries no API key.
+// Neither may reach the network.
+func TestEnabledAndNilReceiver(t *testing.T) {
+	ctx := context.Background()
 
 	var absent *llm.Client
-	id, conf, err := absent.PickCategory(context.Background(), "kopi", "", "expense", nil)
-	assert.Nil(t, id)
-	assert.Zero(t, conf)
-	assert.ErrorIs(t, err, llm.ErrUnavailable)
+	assert.False(t, absent.Enabled(ctx), "no client is never enabled")
 
-	sid, err := absent.PickSource(context.Background(), "bca", nil)
-	assert.Nil(t, sid)
-	assert.ErrorIs(t, err, llm.ErrUnavailable)
+	keyless := llm.NewWithSource(&fakeSource{settings: llm.EnvSettings(&config.Config{
+		LlmBaseURL: "https://example.test/v1", LlmModel: "gpt", LlmTimeoutSecs: 5,
+	})})
+	assert.False(t, keyless.Enabled(ctx), "an empty key is the documented AI-off state")
 
-	verdict, err := absent.Verdict(context.Background(), "id", nil)
-	assert.Empty(t, verdict)
-	assert.ErrorIs(t, err, llm.ErrUnavailable)
+	keyed := llm.NewWithSource(&fakeSource{settings: llm.EnvSettings(&config.Config{
+		LlmAPIKey: "sk-test", LlmBaseURL: "https://example.test/v1", LlmModel: "gpt", LlmTimeoutSecs: 5,
+	})})
+	assert.True(t, keyed.Enabled(ctx))
+
+	for _, c := range []*llm.Client{absent, keyless} {
+		id, conf, err := c.PickCategory(ctx, "kopi", "", "expense", nil)
+		assert.Nil(t, id)
+		assert.Zero(t, conf)
+		assert.ErrorIs(t, err, llm.ErrUnavailable)
+
+		sid, err := c.PickSource(ctx, "bca", nil)
+		assert.Nil(t, sid)
+		assert.ErrorIs(t, err, llm.ErrUnavailable)
+
+		verdict, err := c.Verdict(ctx, "id", nil)
+		assert.Empty(t, verdict)
+		assert.ErrorIs(t, err, llm.ErrUnavailable)
+
+		assert.ErrorIs(t, c.Ping(ctx), llm.ErrUnavailable)
+	}
+}
+
+// fakeSource is a settings source the test can repoint between calls —
+// the whole point of resolving the provider per request.
+type fakeSource struct {
+	settings llm.Settings
+}
+
+func (f *fakeSource) Current(context.Context) llm.Settings { return f.settings }
+
+// The admin saves a new provider between two bot messages: the next
+// request must go to the new endpoint with the new model, without
+// anything being rebuilt or restarted.
+func TestSettingsChangeTakesEffectOnTheNextRequest(t *testing.T) {
+	cat := llm.Candidate{ID: uuid.New(), Name: "Makanan"}
+	var firstCalls, secondCalls int32
+	var firstBodies, secondBodies []map[string]any
+	first := contentServer(t, `{"category_id":`+jsonString(cat.ID.String())+`,"confidence":0.9}`, &firstCalls, &firstBodies)
+	second := contentServer(t, `{"category_id":`+jsonString(cat.ID.String())+`,"confidence":0.9}`, &secondCalls, &secondBodies)
+
+	src := &fakeSource{settings: llm.Settings{
+		BaseURL: first.URL + "/", APIKey: "k1", Model: "model-one", Timeout: 2 * time.Second,
+	}}
+	client := llm.NewWithSource(src)
+
+	_, _, err := client.PickCategory(context.Background(), "kopi", "", "expense", []llm.Candidate{cat})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&firstCalls), "a trailing slash in the base URL must not break the path")
+	require.Len(t, firstBodies, 1)
+	assert.Equal(t, "model-one", firstBodies[0]["model"])
+
+	src.settings = llm.Settings{BaseURL: second.URL, APIKey: "k2", Model: "model-two", Timeout: 2 * time.Second}
+
+	_, _, err = client.PickCategory(context.Background(), "kopi", "", "expense", []llm.Candidate{cat})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&firstCalls), "the old endpoint must not be called again")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&secondCalls))
+	require.Len(t, secondBodies, 1)
+	assert.Equal(t, "model-two", secondBodies[0]["model"])
+}
+
+// Ping is the dashboard's connection test: one tiny completion, any 2xx
+// is a pass, and a provider error is reported verbatim.
+func TestPing(t *testing.T) {
+	var body map[string]any
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`))
+	}))
+	defer ok.Close()
+
+	require.NoError(t, llm.New(ok.URL, "k", "ping-model", 2*time.Second).Ping(context.Background()))
+	assert.Equal(t, "ping-model", body["model"])
+	assert.EqualValues(t, 8, body["max_tokens"])
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+	}))
+	defer bad.Close()
+
+	err := llm.New(bad.URL, "k", "m", 2*time.Second).Ping(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid api key")
 }
 
 // A receipt request must arrive as a multimodal message: the prompt as

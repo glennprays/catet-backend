@@ -9,7 +9,6 @@ import (
 	"github.com/glennprays/catet-backend/internal/bot"
 	"github.com/glennprays/catet-backend/internal/gateway"
 	"github.com/glennprays/catet-backend/internal/handler"
-	"github.com/glennprays/catet-backend/internal/llm"
 	"github.com/glennprays/catet-backend/internal/repository"
 	"github.com/glennprays/catet-backend/internal/router"
 	"github.com/glennprays/catet-backend/internal/service"
@@ -41,6 +40,7 @@ var RepositorySet = wire.NewSet(
 	repository.NewUserRepository,
 	repository.NewInviteRepository,
 	repository.NewPasswordResetRepository,
+	repository.NewLLMProviderRepository,
 	wire.Bind(new(auth.CodeStore), new(*repository.OtpRepository)),
 )
 
@@ -57,6 +57,8 @@ var ServiceSet = wire.NewSet(
 	service.NewReminderService,
 	service.NewHoldQueueService,
 	service.NewOnboardingService,
+	service.NewLLMProviderService,
+	provideSecretBox,
 )
 
 var AuthSet = wire.NewSet(
@@ -82,12 +84,13 @@ var ApiSet = wire.NewSet(
 	handler.NewHoldQueueHandler,
 	handler.NewSettingsHandler,
 	handler.NewUserHandler,
+	handler.NewAdminLLMHandler,
 	handler.NewWebhookHandler,
 	router.NewRouter,
 )
 
 var BotSet = wire.NewSet(
-	llm.Provide,
+	provideLLMClient,
 	bot.NewHarness,
 	provideWebhookVerifier,
 	wire.Bind(new(service.PendingExecutor), new(*bot.Harness)),

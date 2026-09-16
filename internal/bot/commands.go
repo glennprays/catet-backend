@@ -241,7 +241,7 @@ func (h *Harness) rekapMinggu(ctx context.Context, lang string) (string, error) 
 // verdict is the optional one-line commentary. It is off by default and
 // numbers are stripped by the client — the templates own every figure.
 func (h *Harness) verdict(ctx context.Context, lang string, facts map[string]string) string {
-	if !h.cfg.LlmVerdictEnabled || h.llm == nil {
+	if !h.cfg.LlmVerdictEnabled || !h.llm.Enabled(ctx) {
 		return ""
 	}
 	out, err := h.llm.Verdict(ctx, lang, facts)

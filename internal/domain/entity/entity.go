@@ -209,3 +209,21 @@ type Invite struct {
 	UsedAt    *time.Time `json:"used_at"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+
+// LLMProvider is the instance-wide AI provider the admin configured
+// from the dashboard: the one row of llm_provider. It has no user id by
+// design — one instance, one provider, one bill. APIKeyEnc is
+// AES-256-GCM ciphertext (see internal/secretbox); APIKeyLast4 is the
+// only fragment of the key that ever leaves the server. An empty
+// APIKeyEnc is the documented "AI off" state.
+type LLMProvider struct {
+	BaseURL              string     `json:"base_url"`
+	APIKeyEnc            string     `json:"-"`
+	APIKeyLast4          string     `json:"api_key_last4"`
+	Model                string     `json:"model"`
+	VisionModel          string     `json:"vision_model"`
+	TimeoutSeconds       int        `json:"timeout_seconds"`
+	VisionTimeoutSeconds int        `json:"vision_timeout_seconds"`
+	UpdatedBy            *uuid.UUID `json:"updated_by"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+}

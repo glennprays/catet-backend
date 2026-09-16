@@ -199,7 +199,7 @@ func TruncateAll(t *testing.T, pool *pgxpool.Pool) {
 	_, err := pool.Exec(ctx,
 		`TRUNCATE legs, transactions, categories, sources, bills, budgets, tags,
 		        bot_chat_state, inbound_messages, pending_actions, otp_codes,
-		        password_resets, invites, user_settings, users CASCADE`,
+		        password_resets, invites, user_settings, users, llm_provider CASCADE`,
 	)
 	require.NoError(t, err, "truncate schema")
 }

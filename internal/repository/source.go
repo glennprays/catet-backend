@@ -87,8 +87,8 @@ func (r *SourceRepository) List(ctx context.Context, includeArchived bool) ([]en
 	return out, rows.Err()
 }
 
-// Update applies name/is_debt changes; nil = unchanged.
-func (r *SourceRepository) Update(ctx context.Context, id uuid.UUID, name *string, isDebt *bool) (*entity.Source, error) {
+// Update applies name/type/is_debt changes; nil = unchanged.
+func (r *SourceRepository) Update(ctx context.Context, id uuid.UUID, name *string, typ *string, isDebt *bool) (*entity.Source, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
@@ -96,11 +96,70 @@ func (r *SourceRepository) Update(ctx context.Context, id uuid.UUID, name *strin
 	return scanSource(r.db.QueryRow(ctx,
 		`UPDATE sources SET
 			name = COALESCE($2, name),
-			is_debt = COALESCE($3, is_debt)
-		 WHERE id = $1 AND user_id = $4
+			type = COALESCE($3, type),
+			is_debt = COALESCE($4, is_debt)
+		 WHERE id = $1 AND user_id = $5
 		 RETURNING `+sourceColumns,
-		id, name, isDebt, uid,
+		id, name, typ, isDebt, uid,
 	))
+}
+
+// Unarchive lifts the soft delete. Returns nil when the source does
+// not exist or is not archived.
+func (r *SourceRepository) Unarchive(ctx context.Context, id uuid.UUID) (*entity.Source, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanSource(r.db.QueryRow(ctx,
+		`UPDATE sources SET archived_at = NULL WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL
+		 RETURNING `+sourceColumns,
+		id, uid,
+	))
+}
+
+// DeletePermanently drops the row for good. Bills linking the source
+// keep existing — the link is a hint, so it is cleared first. Callers
+// must have checked that no leg references the source.
+func (r *SourceRepository) DeletePermanently(ctx context.Context, id uuid.UUID) (bool, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE bills SET linked_source_id = NULL WHERE linked_source_id = $1 AND user_id = $2`,
+		id, uid,
+	); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM sources WHERE id = $1 AND user_id = $2`, id, uid)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClearAsPhotoDefault drops the source from the bot's photo default so
+// an archived source is never proposed again (internal/bot/source.go).
+func (r *SourceRepository) ClearAsPhotoDefault(ctx context.Context, id uuid.UUID) error {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(ctx,
+		`UPDATE user_settings SET photo_default_source_id = NULL WHERE user_id = $2 AND photo_default_source_id = $1`,
+		id, uid,
+	)
+	return err
 }
 
 // Archive soft-deletes a source.
@@ -158,6 +217,37 @@ func (r *SourceRepository) Balances(ctx context.Context) (map[uuid.UUID]int64, e
 			return nil, err
 		}
 		out[id] = amount
+	}
+	return out, rows.Err()
+}
+
+// WithHistory reports which sources are referenced by at least one
+// leg. Voided transactions count — history is history, and a voided
+// row still points at the source.
+func (r *SourceRepository) WithHistory(ctx context.Context) (map[uuid.UUID]bool, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx,
+		`SELECT DISTINCT l.source_id
+		 FROM legs l
+		 JOIN transactions t ON t.id = l.transaction_id
+		 WHERE l.source_id IS NOT NULL AND t.user_id = $1`,
+		uid,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query source history: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[uuid.UUID]bool{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
 	}
 	return out, rows.Err()
 }

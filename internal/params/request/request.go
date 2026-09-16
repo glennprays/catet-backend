@@ -62,6 +62,7 @@ type CreateSourceRequest struct {
 
 type UpdateSourceRequest struct {
 	Name   *string `json:"name" validate:"omitempty,min=1"`
+	Type   *string `json:"type" validate:"omitempty,oneof=cash bank ewallet custom"`
 	IsDebt *bool   `json:"is_debt"`
 }
 
@@ -215,4 +216,28 @@ type UpdateSettingsRequest struct {
 	// ReminderHour is optional so a client that predates the bill digest
 	// cannot silently reset the user's send hour.
 	ReminderHour *int `json:"reminder_hour" validate:"omitempty,min=0,max=23"`
+}
+
+// ------------------------------------------------------------ admin: llm
+
+// UpdateLLMProviderRequest is the whole AI-provider form. APIKey is a
+// three-state field and the tri-state is the point: absent/null keeps
+// the stored key (so the admin can change only the model without
+// re-typing a secret the API never shows back), "" clears it and turns
+// AI off, and a value replaces it.
+type UpdateLLMProviderRequest struct {
+	BaseURL              string  `json:"base_url" validate:"required,url"`
+	APIKey               *string `json:"api_key"`
+	Model                string  `json:"model" validate:"required"`
+	VisionModel          string  `json:"vision_model"`
+	TimeoutSeconds       int     `json:"timeout_seconds" validate:"required,min=1,max=60"`
+	VisionTimeoutSeconds int     `json:"vision_timeout_seconds" validate:"required,min=1,max=120"`
+}
+
+// LLMModelsRequest asks a provider what it serves. It carries the
+// draft base URL and key so the admin can list models before saving;
+// an absent key falls back to the stored one, then to the environment.
+type LLMModelsRequest struct {
+	BaseURL string  `json:"base_url" validate:"required,url"`
+	APIKey  *string `json:"api_key"`
 }

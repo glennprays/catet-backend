@@ -52,7 +52,7 @@ func (h *SourceHandler) Update(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	out, err := h.svc.Update(c.UserContext(), id, service.UpdateSourceInput{Name: req.Name, IsDebt: req.IsDebt})
+	out, err := h.svc.Update(c.UserContext(), id, service.UpdateSourceInput{Name: req.Name, Type: req.Type, IsDebt: req.IsDebt})
 	if err != nil {
 		return err
 	}
@@ -68,6 +68,29 @@ func (h *SourceHandler) Archive(c *fiber.Ctx) error {
 		return err
 	}
 	return httperror.OK(c, response.ArchivedData{Archived: true})
+}
+
+func (h *SourceHandler) Restore(c *fiber.Ctx) error {
+	id, err := uuidParam(c, "id")
+	if err != nil {
+		return err
+	}
+	out, err := h.svc.Restore(c.UserContext(), id)
+	if err != nil {
+		return err
+	}
+	return httperror.OK(c, out)
+}
+
+func (h *SourceHandler) DeletePermanently(c *fiber.Ctx) error {
+	id, err := uuidParam(c, "id")
+	if err != nil {
+		return err
+	}
+	if err := h.svc.DeletePermanently(c.UserContext(), id); err != nil {
+		return err
+	}
+	return httperror.OK(c, response.DeletedData{Deleted: true})
 }
 
 func (h *SourceHandler) Adjust(c *fiber.Ctx) error {

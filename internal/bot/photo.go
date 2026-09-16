@@ -81,7 +81,7 @@ func (h *Harness) readPhoto(
 		return tmpl.Render(lang, "photo_duplicate", map[string]any{"Summary": summary}), nil, reactRejected, nil
 	}
 
-	if h.llm == nil {
+	if !h.llm.Enabled(ctx) {
 		return tmpl.Render(lang, "photo_llm_off", nil), nil, reactRejected, nil
 	}
 
@@ -222,7 +222,7 @@ func (h *Harness) readCaption(
 	if hit := resolveSourceRules(caption, sources); hit != nil {
 		return hit, nil
 	}
-	if h.llm == nil {
+	if !h.llm.Enabled(ctx) {
 		return nil, nil
 	}
 	in, err := h.llm.Intent(ctx, llm.IntentRequest{

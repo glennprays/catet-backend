@@ -57,7 +57,7 @@ func (h *Harness) resolveSource(ctx context.Context, hint string, sources []enti
 	if hit := resolveSourceRules(hint, sources); hit != nil {
 		return hit
 	}
-	if hint == "" || h.llm == nil {
+	if hint == "" || !h.llm.Enabled(ctx) {
 		return nil
 	}
 	cands := make([]llm.Candidate, 0, len(sources))
@@ -178,7 +178,7 @@ func (h *Harness) resolveCategory(ctx context.Context, merchant, note, typ strin
 			}
 		}
 	}
-	if h.llm == nil || len(cats) == 0 {
+	if !h.llm.Enabled(ctx) || len(cats) == 0 {
 		return needsReview
 	}
 

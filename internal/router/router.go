@@ -33,6 +33,7 @@ type Router struct {
 	HoldQueueHandler   *handler.HoldQueueHandler
 	SettingsHandler    *handler.SettingsHandler
 	UserHandler        *handler.UserHandler
+	AdminLLMHandler    *handler.AdminLLMHandler
 	// WebhookHandler is nil when the bot is not configured.
 	WebhookHandler *handler.WebhookHandler
 }
@@ -54,6 +55,7 @@ func NewRouter(
 	holdQueueHandler *handler.HoldQueueHandler,
 	settingsHandler *handler.SettingsHandler,
 	userHandler *handler.UserHandler,
+	adminLLMHandler *handler.AdminLLMHandler,
 	webhookHandler *handler.WebhookHandler,
 ) *Router {
 	routerLogger := logger.With(log.String("component", "router"))
@@ -74,6 +76,7 @@ func NewRouter(
 		HoldQueueHandler:   holdQueueHandler,
 		SettingsHandler:    settingsHandler,
 		UserHandler:        userHandler,
+		AdminLLMHandler:    adminLLMHandler,
 		WebhookHandler:     webhookHandler,
 	}
 }
@@ -136,6 +139,9 @@ func (r *Router) Setup(app *fiber.App) {
 	// Account management is admin-only; the flag is checked once, at the
 	// group.
 	r.setupUserRoutes(protected.Group("/users", auth.RequireAdmin))
+	// The AI provider is instance-wide configuration, so it sits behind
+	// the same admin gate.
+	r.setupAdminRoutes(protected.Group("/admin", auth.RequireAdmin))
 }
 
 func (r *Router) setupHealthRoutes(group fiber.Router) {
@@ -171,11 +177,25 @@ func (r *Router) setupUserRoutes(group fiber.Router) {
 	group.Post("/:id/activate", r.UserHandler.Activate)
 }
 
+// setupAdminRoutes mounts instance-wide configuration. /llm is the
+// OpenAI-compatible provider the bot uses; saving it takes effect on
+// the next request, without a restart.
+func (r *Router) setupAdminRoutes(group fiber.Router) {
+	group.Get("/llm", r.AdminLLMHandler.Get)
+	group.Put("/llm", r.AdminLLMHandler.Update)
+	group.Delete("/llm", r.AdminLLMHandler.Reset)
+	group.Post("/llm/models", r.AdminLLMHandler.Models)
+	group.Post("/llm/test", r.AdminLLMHandler.Test)
+}
+
 func (r *Router) setupSourceRoutes(group fiber.Router) {
 	group.Get("/sources", r.SourceHandler.List)
 	group.Post("/sources", r.SourceHandler.Create)
 	group.Patch("/sources/:id", r.SourceHandler.Update)
 	group.Delete("/sources/:id", r.SourceHandler.Archive)
+	// Registered explicitly so "permanent" is never read as an id.
+	group.Delete("/sources/:id/permanent", r.SourceHandler.DeletePermanently)
+	group.Post("/sources/:id/restore", r.SourceHandler.Restore)
 	group.Post("/sources/:id/adjustments", r.SourceHandler.Adjust)
 }
 

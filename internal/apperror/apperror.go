@@ -29,7 +29,11 @@ const (
 	KindConflict        Kind = "CONFLICT"
 	KindValidation      Kind = "VALIDATION_FAILED"
 	KindTooManyRequests Kind = "TOO_MANY_REQUESTS"
-	KindInternal        Kind = "INTERNAL"
+	// KindUpstream is a third party's failure, not ours: the request was
+	// well formed and we could not get an answer out of the service it
+	// depends on (the configured LLM provider, today).
+	KindUpstream Kind = "UPSTREAM_ERROR"
+	KindInternal Kind = "INTERNAL"
 )
 
 // FieldError describes one failed rule on one field. Used inside
@@ -119,6 +123,8 @@ func (e *Error) HTTPStatus() int {
 		return http.StatusConflict
 	case KindTooManyRequests:
 		return http.StatusTooManyRequests
+	case KindUpstream:
+		return http.StatusBadGateway
 	default:
 		return http.StatusInternalServerError
 	}
@@ -135,6 +141,7 @@ var (
 	ErrConflict        = &Error{Kind: KindConflict, Message: "conflict"}
 	ErrValidation      = &Error{Kind: KindValidation, Message: "validation failed"}
 	ErrTooManyRequests = &Error{Kind: KindTooManyRequests, Message: "too many requests"}
+	ErrUpstream        = &Error{Kind: KindUpstream, Message: "upstream error"}
 	ErrInternal        = &Error{Kind: KindInternal, Message: "internal error"}
 )
 
@@ -147,6 +154,7 @@ func NotFound(msg string) *Error        { return &Error{Kind: KindNotFound, Mess
 func Conflict(msg string) *Error        { return &Error{Kind: KindConflict, Message: msg} }
 func Validation(msg string) *Error      { return &Error{Kind: KindValidation, Message: msg} }
 func TooManyRequests(msg string) *Error { return &Error{Kind: KindTooManyRequests, Message: msg} }
+func BadGateway(msg string) *Error      { return &Error{Kind: KindUpstream, Message: msg} }
 func Internal(msg string) *Error        { return &Error{Kind: KindInternal, Message: msg} }
 
 // Formatted variants. Save fmt.Sprintf at the call site.
@@ -168,6 +176,9 @@ func Conflictf(format string, a ...any) *Error {
 }
 func Validationf(format string, a ...any) *Error {
 	return Validation(fmt.Sprintf(format, a...))
+}
+func BadGatewayf(format string, a ...any) *Error {
+	return BadGateway(fmt.Sprintf(format, a...))
 }
 func Internalf(format string, a ...any) *Error {
 	return Internal(fmt.Sprintf(format, a...))

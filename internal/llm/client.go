@@ -19,14 +19,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/glennprays/catet-backend/config"
 	"github.com/google/uuid"
 )
 
-// ErrUnavailable is returned by every method of a nil *Client. Provide
-// returns nil when no API key is configured, so callers can hold the
-// client unconditionally and branch on this error instead of scattering
-// nil checks.
+// ErrUnavailable is returned by every method of a nil *Client and by
+// every method of a client whose provider has no API key. AI is an
+// optional dependency: callers hold the client unconditionally and
+// branch on this error instead of scattering nil checks.
 var ErrUnavailable = errors.New("llm unavailable")
 
 // Candidate is one whitelisted choice offered to the model. Hint is the
@@ -38,77 +37,94 @@ type Candidate struct {
 	Hint string
 }
 
-// Client talks to an OpenAI-compatible /chat/completions endpoint. The
-// vision pair is a second (model, timeout) for image requests: reading a
-// receipt photo is a different model class and an order of magnitude
-// slower than a category pick.
+// Client talks to an OpenAI-compatible /chat/completions endpoint. It
+// holds no provider configuration of its own: the admin can repoint the
+// instance from the dashboard between two messages, so every request
+// resolves the provider from source first (see settings.go).
 type Client struct {
-	baseURL       string
-	apiKey        string
-	model         string
-	timeout       time.Duration
-	visionModel   string
-	visionTimeout time.Duration
-	http          *http.Client
+	source SettingsSource
+	http   *http.Client
 }
 
 // defaultTimeout mirrors config's LLM_TIMEOUT_SECONDS default and keeps
-// a hand-built client from hanging forever.
+// a client whose settings carry no timeout from hanging forever.
 const defaultTimeout = 8 * time.Second
+
+// defaultVisionTimeout mirrors LLM_VISION_TIMEOUT_SECONDS: reading a
+// receipt photo is an order of magnitude slower than a category pick.
+const defaultVisionTimeout = 45 * time.Second
 
 // maxAttempts is the whole retry policy: one extra try for a transient
 // failure, never more — a WhatsApp reply that arrives late is worse than
 // an uncategorised write.
 const maxAttempts = 2
 
+// New builds a client pinned to one provider. The vision pair defaults
+// to the text one; WithVision overrides it.
 func New(baseURL, apiKey, model string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
+	return NewWithSource(&staticSource{settings: Settings{
+		BaseURL:       baseURL,
+		APIKey:        apiKey,
+		Model:         model,
+		VisionModel:   model,
+		Timeout:       timeout,
+		VisionTimeout: timeout,
+	}})
+}
+
+// NewWithSource builds a client whose provider is resolved per request.
+// This is the production constructor: source is the service that reads
+// the dashboard's singleton row and falls back to the environment.
+func NewWithSource(source SettingsSource) *Client {
 	return &Client{
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		apiKey:        apiKey,
-		model:         model,
-		timeout:       timeout,
-		visionModel:   model,
-		visionTimeout: timeout,
+		source: source,
 		// No client-level timeout: the per-attempt deadline rides on the
 		// request context so the retry budget stays in one place.
 		http: &http.Client{},
 	}
 }
 
-// Provide returns nil when no API key is set. A nil client is the
-// documented "LLM disabled" state, not a bug.
-func Provide(cfg *config.Config) *Client {
-	if cfg == nil || cfg.LlmAPIKey == "" {
-		return nil
-	}
-	return New(cfg.LlmBaseURL, cfg.LlmAPIKey, cfg.LlmModel, time.Duration(cfg.LlmTimeoutSecs)*time.Second).
-		WithVision(cfg.LlmVisionModel, time.Duration(cfg.LlmVisionTimeoutSecs)*time.Second)
-}
-
 // WithVision points image requests at their own model and timeout. An
 // empty model or a non-positive timeout keeps the text defaults, so a
 // deployment without LLM_VISION_MODEL still reads photos with whatever
-// LLM_MODEL is.
+// LLM_MODEL is. It only affects a client built by New: a client whose
+// provider comes from the dashboard carries the vision pair in its
+// settings instead.
 func (c *Client) WithVision(model string, timeout time.Duration) *Client {
 	if c == nil {
 		return nil
 	}
+	static, ok := c.source.(*staticSource)
+	if !ok {
+		return c
+	}
 	if strings.TrimSpace(model) != "" {
-		c.visionModel = model
+		static.settings.VisionModel = model
 	}
 	if timeout > 0 {
-		c.visionTimeout = timeout
+		static.settings.VisionTimeout = timeout
 	}
 	return c
+}
+
+// Enabled reports whether the provider currently configured has an API
+// key. A nil client — the wiring's "no bot" case — is never enabled.
+// Every exported method refuses when this is false, so the bot's call
+// sites ask this instead of comparing the client to nil.
+func (c *Client) Enabled(ctx context.Context) bool {
+	if c == nil || c.source == nil {
+		return false
+	}
+	return strings.TrimSpace(c.source.Current(ctx).APIKey) != ""
 }
 
 // PickCategory chooses one category id for a transaction. An id the
 // model made up, or one missing from cats, is read as "no answer".
 func (c *Client) PickCategory(ctx context.Context, merchant, note, typ string, cats []Candidate) (*uuid.UUID, float64, error) {
-	if c == nil {
+	if !c.Enabled(ctx) {
 		return nil, 0, ErrUnavailable
 	}
 	if len(cats) == 0 {
@@ -155,7 +171,7 @@ func (c *Client) PickCategory(ctx context.Context, merchant, note, typ string, c
 
 // PickSource resolves a typed alias ("spay", "bca") to one Source id.
 func (c *Client) PickSource(ctx context.Context, hint string, sources []Candidate) (*uuid.UUID, error) {
-	if c == nil {
+	if !c.Enabled(ctx) {
 		return nil, ErrUnavailable
 	}
 	if len(sources) == 0 {
@@ -199,7 +215,7 @@ const verdictMaxRunes = 90
 // broke the no-numbers/short-sentence contract. A rejected verdict is
 // not an error — the rekap simply ships without it.
 func (c *Client) Verdict(ctx context.Context, lang string, facts map[string]string) (string, error) {
-	if c == nil {
+	if !c.Enabled(ctx) {
 		return "", ErrUnavailable
 	}
 
@@ -298,7 +314,7 @@ type usage struct {
 // complete runs one guarded text call against the text model, ignoring
 // token accounting.
 func (c *Client) complete(ctx context.Context, system, user, schemaName string, schema map[string]any, out any) error {
-	_, err := c.completeWith(ctx, c.model, c.timeout, []chatMessage{
+	_, err := c.completeWith(ctx, false, []chatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: user},
 	}, schemaName, schema, out)
@@ -306,18 +322,24 @@ func (c *Client) complete(ctx context.Context, system, user, schemaName string, 
 }
 
 // completeWith runs one guarded call: at most maxAttempts attempts, each
-// bounded by timeout, all of them inside a 2x budget so a hung endpoint
-// can never hold a WhatsApp reply longer than that. The system message
-// (messages[0], by convention) gets the schema appended.
+// bounded by the resolved timeout, all of them inside a 2x budget so a
+// hung endpoint can never hold a WhatsApp reply longer than that. The
+// system message (messages[0], by convention) gets the schema appended.
+// The provider is resolved once here, so every attempt of one request
+// talks to the same endpoint even if the admin saves a new one midway.
 func (c *Client) completeWith(
 	ctx context.Context,
-	model string,
-	timeout time.Duration,
+	vision bool,
 	messages []chatMessage,
 	schemaName string,
 	schema map[string]any,
 	out any,
 ) (usage, error) {
+	settings := c.resolve(ctx)
+	model, timeout := settings.model, settings.timeout
+	if vision {
+		model, timeout = settings.visionModel, settings.visionTimeout
+	}
 	var used usage
 	// JSON-object mode plus the schema spelled out in the prompt, rather
 	// than OpenAI's strict json_schema: OpenAI-compatible routers
@@ -355,7 +377,7 @@ func (c *Client) completeWith(
 
 	var lastErr error
 	for range maxAttempts {
-		content, u, retryable, err := c.attempt(budget, timeout, body)
+		content, u, retryable, err := c.attempt(budget, settings, timeout, body)
 		if u != nil {
 			used = *u
 		}
@@ -392,16 +414,16 @@ func extractJSONObject(content string) (string, bool) {
 // failure is worth one more try: network faults, timeouts and 5xx are;
 // a 4xx is our own fault and never is. The usage is nil unless the
 // provider reported it.
-func (c *Client) attempt(budget context.Context, timeout time.Duration, body []byte) (string, *usage, bool, error) {
+func (c *Client) attempt(budget context.Context, settings resolved, timeout time.Duration, body []byte) (string, *usage, bool, error) {
 	ctx, cancel := context.WithTimeout(budget, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, settings.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", nil, false, fmt.Errorf("llm: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Authorization", "Bearer "+settings.apiKey)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -431,6 +453,64 @@ func (c *Client) attempt(budget context.Context, timeout time.Duration, body []b
 		return "", parsed.Usage, false, errors.New("llm: empty choices")
 	}
 	return parsed.Choices[0].Message.Content, parsed.Usage, false, nil
+}
+
+// Ping is the admin's connection test: one minimal completion against
+// the configured provider. Any 2xx counts — the point is to prove the
+// base URL, key and model name are a working triple, not to grade the
+// answer, so no schema is imposed and no content is parsed. The error
+// carries the provider's own message so the dashboard can show it.
+func (c *Client) Ping(ctx context.Context) error {
+	if !c.Enabled(ctx) {
+		return ErrUnavailable
+	}
+	settings := c.resolve(ctx)
+	body, err := json.Marshal(pingRequest{
+		Model: settings.model,
+		Messages: []chatMessage{
+			{Role: "system", Content: `Reply with JSON {"ok":true}`},
+			{Role: "user", Content: "ping"},
+		},
+		Temperature: 0,
+		MaxTokens:   8,
+	})
+	if err != nil {
+		return fmt.Errorf("llm: encode request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, settings.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, settings.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("llm: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+settings.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("llm: request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("llm: read response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("llm: status %d: %s", resp.StatusCode, snippet(raw))
+	}
+	return nil
+}
+
+// pingRequest is the connection test's wire shape: no response_format,
+// because a provider that rejects JSON mode would fail a test that is
+// only asking whether the endpoint answers at all.
+type pingRequest struct {
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	Temperature float64       `json:"temperature"`
+	MaxTokens   int           `json:"max_tokens"`
 }
 
 // objectSchema builds the schema handed to the model: every property

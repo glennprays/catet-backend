@@ -72,7 +72,7 @@ var isoDate = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 // sender's own hint and cats the category whitelist — an id outside it is
 // dropped like everywhere else (ADR-0003).
 func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption string, cats []Candidate) (*ReceiptRead, error) {
-	if c == nil {
+	if !c.Enabled(ctx) {
 		return nil, ErrUnavailable
 	}
 
@@ -150,7 +150,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 			{Type: "image_url", ImageURL: &imageURL{URL: dataURL(mime, img)}},
 		}},
 	}
-	used, err := c.completeWith(ctx, c.visionModel, c.visionTimeout, messages, "receipt_read", schema, &out)
+	used, err := c.completeWith(ctx, true, messages, "receipt_read", schema, &out)
 	if err != nil {
 		return nil, err
 	}

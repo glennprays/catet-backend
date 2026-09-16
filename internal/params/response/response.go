@@ -79,10 +79,12 @@ type InvitesData struct {
 
 // --------------------------------------------------------------- sources
 
-// SourceResponse is a source with its ledger-computed balance.
+// SourceResponse is a source with its ledger-computed balance and
+// whether any leg ever referenced it (drives permanent delete).
 type SourceResponse struct {
 	entity.Source
-	BalanceMinor int64 `json:"balance_minor"`
+	BalanceMinor    int64 `json:"balance_minor"`
+	HasTransactions bool  `json:"has_transactions"`
 }
 
 type SourcesData struct {
@@ -276,4 +278,38 @@ type SettingsData struct {
 	PhotoDefaultSourceID   *uuid.UUID `json:"photo_default_source_id"`
 	PhotoDefaultSourceName *string    `json:"photo_default_source_name"`
 	ReminderHour           int        `json:"reminder_hour"`
+}
+
+// ------------------------------------------------------------ admin: llm
+
+// LLMProviderData is the AI provider as the dashboard may see it. The
+// API key is write-only: Source says where the configuration came from
+// ("dashboard" once saved, "env" while the environment is
+// authoritative), APIKeySet says whether one is installed and
+// APIKeyLast4 is the only fragment that ever leaves the server.
+// Enabled is the bot's own answer: no key, no AI.
+type LLMProviderData struct {
+	Source               string `json:"source"`
+	BaseURL              string `json:"base_url"`
+	Model                string `json:"model"`
+	VisionModel          string `json:"vision_model"`
+	TimeoutSeconds       int    `json:"timeout_seconds"`
+	VisionTimeoutSeconds int    `json:"vision_timeout_seconds"`
+	APIKeySet            bool   `json:"api_key_set"`
+	APIKeyLast4          string `json:"api_key_last4"`
+	Enabled              bool   `json:"enabled"`
+}
+
+// LLMModelsData is the provider's catalogue, sorted, so the dashboard
+// can offer a picker instead of asking the admin to type a model id.
+type LLMModelsData struct {
+	Models []string `json:"models"`
+}
+
+// LLMTestData is one connection test: it answered, how fast, and as
+// which model.
+type LLMTestData struct {
+	OK        bool   `json:"ok"`
+	LatencyMs int64  `json:"latency_ms"`
+	Model     string `json:"model"`
 }

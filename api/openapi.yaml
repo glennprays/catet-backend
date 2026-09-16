@@ -508,7 +508,7 @@ paths:
           $ref: '#/components/responses/ErrorResponse'
   /api/v1/sources/{id}:
     patch:
-      summary: Rename a source or toggle its debt flag
+      summary: Rename a source, change its type, or toggle its debt flag
       operationId: updateSource
       tags: [Sources]
       security: [{ bearerAuth: [] }]
@@ -521,6 +521,7 @@ paths:
               type: object
               properties:
                 name: { type: string, minLength: 1 }
+                type: { type: string, enum: [cash, bank, ewallet, custom] }
                 is_debt: { type: boolean }
       responses:
         '200':
@@ -555,7 +556,53 @@ paths:
         '404':
           $ref: '#/components/responses/NotFoundError'
         '409':
-          description: Referenced by open (active) bills
+          description: Referenced by open (active) bills, or the source still holds a balance
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/sources/{id}/permanent:
+    delete:
+      summary: Permanently delete a source that has no transactions
+      operationId: deleteSourcePermanently
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Deleted; bills linking the source were unlinked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeletedEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Source has transactions; archive it instead
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/sources/{id}/restore:
+    post:
+      summary: Lift the archive flag from a source
+      operationId: restoreSource
+      tags: [Sources]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Restored source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Source is not archived
           $ref: '#/components/responses/ErrorResponse'
         '500':
           $ref: '#/components/responses/ErrorResponse'
@@ -1458,6 +1505,163 @@ paths:
         '500':
           $ref: '#/components/responses/ErrorResponse'
 
+  # ----------------------------------------------------------- admin: llm
+  /api/v1/admin/llm:
+    get:
+      summary: AI provider configuration (admin only)
+      operationId: getLlmProvider
+      tags: [Admin]
+      security: [{ bearerAuth: [] }]
+      description: |
+        The provider the bot uses right now. `source` says where it came
+        from: `dashboard` once an admin has saved one, `env` while the
+        server's LLM_* variables are still authoritative. The API key is
+        write-only — only `api_key_set` and `api_key_last4` are returned.
+      responses:
+        '200':
+          description: Current provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMProviderEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    put:
+      summary: Save the AI provider (admin only)
+      operationId: updateLlmProvider
+      tags: [Admin]
+      security: [{ bearerAuth: [] }]
+      description: |
+        Takes effect on the next bot request, without a restart. `api_key`
+        is tri-state: absent or null keeps the stored key, `""` clears it
+        (AI off), any other value replaces it. A first save that names no
+        key inherits the environment's, so the model can be changed
+        without re-typing the secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LLMProviderUpdate'
+      responses:
+        '200':
+          description: Saved provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMProviderEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      summary: Drop the dashboard override (admin only)
+      operationId: resetLlmProvider
+      tags: [Admin]
+      security: [{ bearerAuth: [] }]
+      description: >-
+        Deletes the saved configuration; the instance falls back to its
+        LLM_* environment variables. The answer is the provider now in
+        effect, so `source` is `env`.
+      responses:
+        '200':
+          description: Provider after the reset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMProviderEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/admin/llm/models:
+    post:
+      summary: List the models a provider serves (admin only)
+      operationId: listLlmModels
+      tags: [Admin]
+      security: [{ bearerAuth: [] }]
+      description: >-
+        Proxies GET {base_url}/models so the dashboard can offer a picker
+        before anything is saved. A POST because it carries the draft key,
+        which does not belong in a query string. An absent `api_key` falls
+        back to the stored key, then to the environment's.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [base_url]
+              properties:
+                base_url: { type: string, format: uri, example: 'https://api.openai.com/v1' }
+                api_key:
+                  type: string
+                  nullable: true
+                  description: Draft key; absent or empty uses the stored or environment key.
+      responses:
+        '200':
+          description: Model ids, sorted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMModelsEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '502':
+          description: UPSTREAM_ERROR — the provider refused or did not answer with a model list
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/admin/llm/test:
+    post:
+      summary: Test a provider (admin only)
+      operationId: testLlmProvider
+      tags: [Admin]
+      security: [{ bearerAuth: [] }]
+      description: >-
+        Sends one minimal completion to the draft provider and reports the
+        round trip. Any 2xx is a pass; a provider error is returned
+        verbatim as UPSTREAM_ERROR so the admin sees its own words.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LLMProviderUpdate'
+      responses:
+        '200':
+          description: The provider answered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMTestEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '502':
+          description: UPSTREAM_ERROR — the provider refused; the message is its own
+          $ref: '#/components/responses/ErrorResponse'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1727,7 +1931,7 @@ components:
     # ------------------------------------------------------------- sources
     Source:
       type: object
-      required: [id, name, type, is_debt, currency, balance_minor]
+      required: [id, name, type, is_debt, currency, balance_minor, has_transactions]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
@@ -1735,6 +1939,7 @@ components:
         is_debt: { type: boolean }
         currency: { type: string }
         balance_minor: { type: integer, format: int64, description: Σ non-voided legs }
+        has_transactions: { type: boolean, description: at least one leg ever referenced this source (voided included) }
         archived_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
     SourcesEnvelope:
@@ -2340,6 +2545,74 @@ components:
         data:
           $ref: '#/components/schemas/Settings'
         trace_id: { type: string, format: uuid }
+
+    # ----------------------------------------------------------- admin: llm
+    LLMProvider:
+      type: object
+      required: [source, base_url, model, vision_model, timeout_seconds, vision_timeout_seconds, api_key_set, api_key_last4, enabled]
+      properties:
+        source:
+          type: string
+          enum: [dashboard, env]
+          description: Where the configuration in effect came from.
+        base_url: { type: string, format: uri, example: 'https://api.openai.com/v1' }
+        model: { type: string, example: gpt-4o-mini }
+        vision_model: { type: string, description: Model for receipt photos; empty reuses `model`. }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60 }
+        vision_timeout_seconds: { type: integer, minimum: 1, maximum: 120 }
+        api_key_set: { type: boolean, description: A key is installed. The key itself is never returned. }
+        api_key_last4: { type: string, description: Last four characters of the installed key; empty when none. }
+        enabled: { type: boolean, description: The bot will call the provider (a key is installed). }
+    LLMProviderUpdate:
+      type: object
+      required: [base_url, model, timeout_seconds, vision_timeout_seconds]
+      properties:
+        base_url: { type: string, format: uri, example: 'https://api.openai.com/v1' }
+        api_key:
+          type: string
+          nullable: true
+          description: >-
+            Absent or null keeps the stored key; "" clears it and turns AI
+            off; any other value replaces it.
+        model: { type: string, example: gpt-4o-mini }
+        vision_model: { type: string, description: Empty reuses `model` for receipt photos. }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60 }
+        vision_timeout_seconds: { type: integer, minimum: 1, maximum: 120 }
+    LLMModels:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items: { type: string }
+    LLMTest:
+      type: object
+      required: [ok, latency_ms, model]
+      properties:
+        ok: { type: boolean, enum: [true] }
+        latency_ms: { type: integer, format: int64 }
+        model: { type: string }
+    LLMProviderEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/LLMProvider'
+        trace_id: { type: string, format: uuid }
+    LLMModelsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/LLMModels'
+        trace_id: { type: string, format: uuid }
+    LLMTestEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/LLMTest'
+        trace_id: { type: string, format: uuid }
 tags:
   - name: System
     description: Internal system status endpoints
@@ -2347,6 +2620,8 @@ tags:
     description: Phone + password sessions, invites and password reset
   - name: Users
     description: Admin-only account management
+  - name: Admin
+    description: Admin-only instance configuration (AI provider)
   - name: Sources
     description: Places money lives
   - name: Transactions

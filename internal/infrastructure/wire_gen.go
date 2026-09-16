@@ -17,7 +17,6 @@ import (
 	"github.com/glennprays/catet-backend/internal/bot"
 	"github.com/glennprays/catet-backend/internal/gateway"
 	"github.com/glennprays/catet-backend/internal/handler"
-	"github.com/glennprays/catet-backend/internal/llm"
 	"github.com/glennprays/catet-backend/internal/repository"
 	"github.com/glennprays/catet-backend/internal/router"
 	"github.com/glennprays/catet-backend/internal/service"
@@ -50,6 +49,7 @@ func InitializeApp() (*App, error) {
 	settingsRepo := repository.NewSettingsRepository(pool)
 	pendingRepo := repository.NewPendingActionRepository(pool)
 	analyticsRepo := repository.NewAnalyticsRepository(pool)
+	llmProviderRepo := repository.NewLLMProviderRepository(pool)
 
 	inboundRepo := repository.NewInboundMessageRepository(pool)
 	chatStateRepo := repository.NewBotChatStateRepository(pool)
@@ -68,6 +68,7 @@ func InitializeApp() (*App, error) {
 	overviewSvc := service.NewOverviewService(sourceRepo, billRepo, settingsRepo, analyticsRepo, pendingRepo, transactionSvc)
 	badgesSvc := service.NewBadgesService(analyticsRepo, pendingRepo, billRepo)
 	settingsSvc := service.NewSettingsService(settingsRepo, sourceRepo)
+	llmProviderSvc := service.NewLLMProviderService(llmProviderRepo, cfg, provideSecretBox(cfg), logger)
 	onboardingSvc := service.NewOnboardingService(categoryRepo, sourceRepo)
 
 	// Auth. The invite service is built before the bot: the harness
@@ -84,7 +85,7 @@ func InitializeApp() (*App, error) {
 	// WhatsApp bot. The harness is also the Hold Queue's executor, so a
 	// draft confirmed from the dashboard runs the same write path as one
 	// confirmed in chat.
-	llmClient := llm.Provide(cfg)
+	llmClient := provideLLMClient(llmProviderSvc)
 	botHarness := bot.NewHarness(
 		cfg, logger, waSender, llmClient,
 		transactionSvc, overviewSvc, analyticsSvc, billSvc,
@@ -105,6 +106,7 @@ func InitializeApp() (*App, error) {
 	holdQueueHandler := handler.NewHoldQueueHandler(holdQueueSvc)
 	settingsHandler := handler.NewSettingsHandler(settingsSvc)
 	userHandler := handler.NewUserHandler(userRepo, inviteSvc)
+	adminLLMHandler := handler.NewAdminLLMHandler(llmProviderSvc)
 	healthHandler := handler.NewHealthHandler()
 	versionHandler := handler.NewVersionHandler()
 	// Verification needs the shared secret; without one the route is not
@@ -131,6 +133,7 @@ func InitializeApp() (*App, error) {
 		holdQueueHandler,
 		settingsHandler,
 		userHandler,
+		adminLLMHandler,
 		webhookHandler,
 	)
 
