@@ -14,7 +14,10 @@ package infrastructure
 import (
 	"github.com/glennprays/catet-backend/config"
 	"github.com/glennprays/catet-backend/internal/auth"
+	"github.com/glennprays/catet-backend/internal/bot"
+	"github.com/glennprays/catet-backend/internal/gateway"
 	"github.com/glennprays/catet-backend/internal/handler"
+	"github.com/glennprays/catet-backend/internal/llm"
 	"github.com/glennprays/catet-backend/internal/repository"
 	"github.com/glennprays/catet-backend/internal/router"
 	"github.com/glennprays/catet-backend/internal/service"
@@ -41,30 +44,55 @@ func InitializeApp() (*App, error) {
 	transactionRepo := repository.NewTransactionRepository(pool)
 	categoryRepo := repository.NewCategoryRepository(pool)
 	billRepo := repository.NewBillRepository(pool)
+	billPaymentRepo := repository.NewBillPaymentRepository(pool)
+	reminderSendRepo := repository.NewBillReminderSendRepository(pool)
 	budgetRepo := repository.NewBudgetRepository(pool)
 	settingsRepo := repository.NewSettingsRepository(pool)
 	pendingRepo := repository.NewPendingActionRepository(pool)
 	analyticsRepo := repository.NewAnalyticsRepository(pool)
 
+	inboundRepo := repository.NewInboundMessageRepository(pool)
+	chatStateRepo := repository.NewBotChatStateRepository(pool)
+	userRepo := repository.NewUserRepository(pool)
+	inviteRepo := repository.NewInviteRepository(pool)
+	resetRepo := repository.NewPasswordResetRepository(pool)
+	otpRepo := repository.NewOtpRepository(pool)
+
 	// Services.
-	transactionSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo)
+	transactionSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, billPaymentRepo, billRepo, logger)
 	sourceSvc := service.NewSourceService(sourceRepo, transactionSvc)
 	categorySvc := service.NewCategoryService(categoryRepo)
-	billSvc := service.NewBillService(billRepo)
+	billSvc := service.NewBillService(billRepo, billPaymentRepo, transactionSvc, sourceRepo)
 	analyticsSvc := service.NewAnalyticsService(analyticsRepo, categoryRepo, sourceRepo, billRepo, settingsRepo)
 	budgetSvc := service.NewBudgetService(budgetRepo, categoryRepo, analyticsSvc)
 	overviewSvc := service.NewOverviewService(sourceRepo, billRepo, settingsRepo, analyticsRepo, pendingRepo, transactionSvc)
-	badgesSvc := service.NewBadgesService(analyticsRepo, pendingRepo)
-	settingsSvc := provideSettingsService(settingsRepo, cfg)
-	holdQueueSvc := service.NewHoldQueueService(pendingRepo)
+	badgesSvc := service.NewBadgesService(analyticsRepo, pendingRepo, billRepo)
+	settingsSvc := service.NewSettingsService(settingsRepo, sourceRepo)
+	onboardingSvc := service.NewOnboardingService(categoryRepo, sourceRepo)
 
-	// Auth.
+	// Auth. The invite service is built before the bot: the harness
+	// re-sends an invited stranger's register link through it.
+	waSender := gateway.Provide(cfg, logger)
 	tokenSvc := auth.ProvideTokenService(cfg)
-	otpSender := auth.ProvideOtpSender(cfg, logger)
-	otpRepo := repository.NewOtpRepository(pool)
-	otpSvc := auth.ProvideOtpService(otpRepo, otpSender, tokenSvc, cfg)
-	authHandler := auth.NewHandler(otpSvc, tokenSvc)
-	authMiddleware := auth.ProvideRequireAuth(tokenSvc)
+	otpSender := auth.ProvideOtpSender(waSender)
+	otpSvc := auth.ProvideOtpService(otpRepo, otpSender, cfg)
+	authSvc := auth.ProvideAuthService(userRepo, inviteRepo, resetRepo, otpSvc, tokenSvc, onboardingSvc, waSender)
+	inviteSvc := auth.ProvideInviteService(inviteRepo, userRepo, waSender, logger, cfg)
+	authHandler := auth.NewHandler(authSvc)
+	authMiddleware := auth.ProvideRequireAuth(tokenSvc, userRepo)
+
+	// WhatsApp bot. The harness is also the Hold Queue's executor, so a
+	// draft confirmed from the dashboard runs the same write path as one
+	// confirmed in chat.
+	llmClient := llm.Provide(cfg)
+	botHarness := bot.NewHarness(
+		cfg, logger, waSender, llmClient,
+		transactionSvc, overviewSvc, analyticsSvc, billSvc,
+		sourceRepo, categoryRepo, transactionRepo, pendingRepo,
+		inboundRepo, chatStateRepo, analyticsRepo, settingsRepo,
+		userRepo, billRepo, reminderSendRepo, inviteSvc,
+	)
+	holdQueueSvc := service.NewHoldQueueService(pendingRepo, botHarness)
 
 	// Handlers.
 	sourceHandler := handler.NewSourceHandler(sourceSvc)
@@ -76,8 +104,15 @@ func InitializeApp() (*App, error) {
 	analyticsHandler := handler.NewAnalyticsHandler(analyticsSvc)
 	holdQueueHandler := handler.NewHoldQueueHandler(holdQueueSvc)
 	settingsHandler := handler.NewSettingsHandler(settingsSvc)
+	userHandler := handler.NewUserHandler(userRepo, inviteSvc)
 	healthHandler := handler.NewHealthHandler()
 	versionHandler := handler.NewVersionHandler()
+	// Verification needs the shared secret; without one the route is not
+	// mounted, so the handler is not built either.
+	var webhookHandler *handler.WebhookHandler
+	if cfg.WaWebhookSecret != "" {
+		webhookHandler = handler.NewWebhookHandler(provideWebhookVerifier(cfg), botHarness)
+	}
 
 	routerRouter := router.NewRouter(
 		cfg,
@@ -95,13 +130,22 @@ func InitializeApp() (*App, error) {
 		analyticsHandler,
 		holdQueueHandler,
 		settingsHandler,
+		userHandler,
+		webhookHandler,
 	)
 
+	reminderSvc := service.NewReminderService(userRepo, billRepo, reminderSendRepo, settingsRepo, waSender, pool, logger)
+
 	app := &App{
-		Config: cfg,
-		Logger: logger,
-		Pool:   pool,
-		Router: routerRouter,
+		Config:  cfg,
+		Logger:  logger,
+		Pool:    pool,
+		Router:  routerRouter,
+		Bot:     botHarness,
+		Users:   userRepo,
+		Gateway: waSender,
+
+		Reminders: reminderSvc,
 	}
 	return app, nil
 }

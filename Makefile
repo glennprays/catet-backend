@@ -61,6 +61,10 @@ dev:
 build:
 	@go build -ldflags "$(LDFLAGS)" -o ./tmp/main ./cmd/api
 
+# Operator CLI (account break-glass): ./tmp/catet user list
+cli:
+	@go build -o ./tmp/catet ./cmd/catet
+
 hooks:
 	@lefthook install
 

@@ -3,13 +3,17 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/repository"
+	"github.com/glennprays/catet-backend/pkg/logctx"
+	"github.com/glennprays/log"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TransactionService owns the ledger engine: leg construction, the
@@ -19,20 +23,38 @@ type TransactionService struct {
 	repo       *repository.TransactionRepository
 	sources    *repository.SourceRepository
 	categories *repository.CategoryRepository
+	// Bill links are repository-level deps, not a BillService: the
+	// ledger must be able to rewind a bill on void without depending on
+	// the service that pays it (BillService already depends on this one).
+	billPayments *repository.BillPaymentRepository
+	bills        *repository.BillRepository
+	log          *log.Logger
 }
 
 func NewTransactionService(
 	repo *repository.TransactionRepository,
 	sources *repository.SourceRepository,
 	categories *repository.CategoryRepository,
+	billPayments *repository.BillPaymentRepository,
+	bills *repository.BillRepository,
+	logger *log.Logger,
 ) *TransactionService {
-	return &TransactionService{repo: repo, sources: sources, categories: categories}
+	return &TransactionService{
+		repo:         repo,
+		sources:      sources,
+		categories:   categories,
+		billPayments: billPayments,
+		bills:        bills,
+		log:          logger,
+	}
 }
 
 // ---------------------------------------------------------------- create
 
-// CreateManualInput is the validated payload of POST /transactions.
-type CreateManualInput struct {
+// CreateInput is one validated ledger write. Every capture surface
+// (dashboard POST /transactions, WhatsApp bot) funnels through it and
+// declares its own provenance — the engine never guesses the origin.
+type CreateInput struct {
 	Type                string
 	OccurredAt          *time.Time
 	OccurredDate        *string
@@ -42,6 +64,15 @@ type CreateManualInput struct {
 	CategoryID          *uuid.UUID
 	Note                *string
 	Merchant            *string
+
+	// Provenance. Origin is required ("dashboard_manual" | "whatsapp_text");
+	// CategorySource defaults to "user" when a category is set.
+	Origin             string
+	CategorySource     *string
+	CategoryConfidence *float64
+	ReviewStatus       string // "" → "clean"
+	ExternalID         *string
+	ContentHash        *string
 }
 
 // fieldErrors accumulates validation failures; non-empty at the end of
@@ -61,9 +92,11 @@ func (f *fieldErrors) toError() error {
 	return apperror.Validation("transaction validation failed").WithDetails(f.errs...)
 }
 
-// CreateManual writes a dashboard peer capture: origin=dashboard_manual,
-// category_source=user, review_status=clean (ADR-0004 — no AI gate).
-func (s *TransactionService) CreateManual(ctx context.Context, in CreateManualInput) (*entity.Transaction, error) {
+// Create writes one capture. Provenance comes from the caller: the
+// dashboard declares origin=dashboard_manual / category_source=user
+// (ADR-0004 — no AI gate), the bot declares whatsapp_text plus whatever
+// its rules or the LLM decided.
+func (s *TransactionService) Create(ctx context.Context, in CreateInput) (*entity.Transaction, error) {
 	fe := &fieldErrors{}
 
 	// Both absent means "now" — the capture happened just now.
@@ -84,6 +117,11 @@ func (s *TransactionService) CreateManual(ctx context.Context, in CreateManualIn
 	}
 	if in.Type != "adjustment" && in.AmountMinor < 0 {
 		fe.add("amount_minor", "positive", "amount must be positive")
+	}
+	switch in.Origin {
+	case "dashboard_manual", "whatsapp_text", "whatsapp_photo", "import":
+	default:
+		fe.add("origin", "oneof", "origin must be dashboard_manual, whatsapp_text, whatsapp_photo or import")
 	}
 
 	// Referenced rows must exist — body references fail closed as
@@ -120,7 +158,13 @@ func (s *TransactionService) CreateManual(ctx context.Context, in CreateManualIn
 
 	switch in.Type {
 	case "expense", "income":
-		if in.CategoryID == nil {
+		// The dashboard is a deliberate capture surface: the user picked a
+		// category there. Bot captures may legitimately arrive unlabelled
+		// and are routed to Needs-Review instead of being refused — and so
+		// is a dashboard write that has no picker behind it (paying a bill
+		// with no category), which says so by asking for needs_review
+		// rather than landing an unlabelled row in the clean ledger.
+		if in.CategoryID == nil && in.Origin == "dashboard_manual" && in.ReviewStatus != "needs_review" {
 			fe.add("category_id", "required", "category is required")
 		}
 		if in.DestinationSourceID != nil {
@@ -149,26 +193,48 @@ func (s *TransactionService) CreateManual(ctx context.Context, in CreateManualIn
 		return nil, err
 	}
 
-	var categorySource *string
-	if in.CategoryID != nil {
+	categorySource := in.CategorySource
+	if in.CategoryID != nil && categorySource == nil {
 		cs := "user"
 		categorySource = &cs
 	}
+	if in.CategoryID == nil {
+		// A category_source without a category would be a dangling claim.
+		categorySource = nil
+	}
+	reviewStatus := in.ReviewStatus
+	if reviewStatus == "" {
+		reviewStatus = "clean"
+	}
+	// An uncategorised expense/income can only come from a capture the
+	// rules refused to label; it must land in Needs-Review.
+	if in.CategoryID == nil && (in.Type == "expense" || in.Type == "income") {
+		reviewStatus = "needs_review"
+	}
 	tx := &entity.Transaction{
-		ID:             uuid.New(),
-		OccurredAt:     occurredAt,
-		Origin:         "dashboard_manual",
-		Type:           in.Type,
-		Merchant:       in.Merchant,
-		Note:           in.Note,
-		AmountMinor:    abs64(in.AmountMinor),
-		CategoryID:     in.CategoryID,
-		CategorySource: categorySource,
-		ReviewStatus:   "clean",
-		Legs:           buildLegs(in.Type, in.AmountMinor, &in.SourceID, in.DestinationSourceID, in.CategoryID),
+		ID:                 uuid.New(),
+		OccurredAt:         occurredAt,
+		Origin:             in.Origin,
+		Type:               in.Type,
+		Merchant:           in.Merchant,
+		Note:               in.Note,
+		AmountMinor:        abs64(in.AmountMinor),
+		CategoryID:         in.CategoryID,
+		CategorySource:     categorySource,
+		CategoryConfidence: in.CategoryConfidence,
+		ReviewStatus:       reviewStatus,
+		ExternalID:         in.ExternalID,
+		ContentHash:        in.ContentHash,
+		Legs:               buildLegs(in.Type, in.AmountMinor, &in.SourceID, in.DestinationSourceID, in.CategoryID),
 	}
 	created, err := s.repo.Insert(ctx, tx)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// external_id is the bot's write-once key: a duplicate means
+			// this capture already landed.
+			return nil, apperror.Conflict("duplicate external_id")
+		}
 		return nil, apperror.Internal("failed to write transaction").Wrap(err)
 	}
 	return created, nil
@@ -217,6 +283,13 @@ func (s *TransactionService) Get(ctx context.Context, id uuid.UUID) (*entity.Tra
 	}
 	if tx == nil {
 		return nil, apperror.NotFound("transaction not found")
+	}
+	// A transaction that settled a bill says so on the detail read, so
+	// the dashboard can warn that deleting it rewinds the schedule.
+	if p, err := s.billPayments.ByTransaction(ctx, id); err == nil && p != nil {
+		name := p.BillName
+		tx.BillID = &p.BillID
+		tx.BillName = &name
 	}
 	return tx, nil
 }
@@ -342,8 +415,10 @@ func (s *TransactionService) Update(ctx context.Context, id uuid.UUID, in Update
 		fe.add("amount_minor", "nonzero", "amount must not be zero")
 	}
 	// The destination source of a transfer is never editable; amount
-	// changes rewrite both of its existing legs.
-	if in.CategoryID != nil && tx.CategoryID == nil {
+	// changes rewrite both of its existing legs. Only the two
+	// party-to-party types never carry a category — an expense or income
+	// the bot wrote without one is exactly what a correction fixes.
+	if in.CategoryID != nil && (tx.Type == "transfer" || tx.Type == "adjustment") {
 		fe.add("category_id", "forbidden", "this transaction type never carries a category")
 	}
 	if err := fe.toError(); err != nil {
@@ -465,14 +540,38 @@ func (s *TransactionService) Void(ctx context.Context, id uuid.UUID) error {
 	if !ok {
 		return apperror.Conflict("transaction was modified concurrently")
 	}
+	s.revertBillPayment(ctx, id)
 	return nil
+}
+
+// revertBillPayment rewinds the bill this transaction settled, for both
+// ways a payment is undone: a void (dashboard delete) and a reversal
+// (`batal` in chat). It is best-effort by design — the undo already
+// happened and must not fail because the bill has since been
+// rescheduled by hand, which is the newer intent and wins. The link row
+// goes either way, so a payment cannot be undone twice.
+func (s *TransactionService) revertBillPayment(ctx context.Context, txID uuid.UUID) {
+	p, err := s.billPayments.ByTransaction(ctx, txID)
+	if err != nil || p == nil {
+		return
+	}
+	reverted, err := s.bills.Revert(ctx, p.BillID, p.AdvancedTo, p.DueDate, p.Decremented)
+	if err != nil {
+		s.log.Warn(txTraceOf(ctx), "bill revert failed", map[string]any{"bill_id": p.BillID.String(), "error": err.Error()})
+	} else if !reverted {
+		s.log.Warn(txTraceOf(ctx), "bill payment voided but bill not reverted (edited since)", map[string]any{"bill_id": p.BillID.String()})
+	}
+	if err := s.billPayments.Delete(ctx, p.ID); err != nil {
+		s.log.Warn(txTraceOf(ctx), "bill payment link not deleted", map[string]any{"error": err.Error()})
+	}
 }
 
 // -------------------------------------------------------------- reversal
 
 // Reverse creates a linked reversal with mirrored (negated) legs. Both
-// transactions stay visible; nothing collapses into a silent edit.
-func (s *TransactionService) Reverse(ctx context.Context, id uuid.UUID, note *string) (*entity.Transaction, error) {
+// transactions stay visible; nothing collapses into a silent edit. The
+// reversal carries the origin of the surface that asked for it.
+func (s *TransactionService) Reverse(ctx context.Context, id uuid.UUID, note *string, origin string) (*entity.Transaction, error) {
 	tx, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return nil, apperror.Internal("failed to load transaction").Wrap(err)
@@ -497,15 +596,13 @@ func (s *TransactionService) Reverse(ctx context.Context, id uuid.UUID, note *st
 		}
 	}
 
-	var categorySource *string
-	if tx.CategoryID != nil {
-		cs := "user"
-		categorySource = &cs
-	}
+	// The reversal mirrors the original's category attribution verbatim —
+	// claiming "user" would invent provenance the user never gave.
+	categorySource := tx.CategorySource
 	reversal := &entity.Transaction{
 		ID:                    uuid.New(),
 		OccurredAt:            time.Now().UTC(),
-		Origin:                "dashboard_manual",
+		Origin:                origin,
 		Type:                  tx.Type,
 		Merchant:              tx.Merchant,
 		Note:                  note,
@@ -520,6 +617,9 @@ func (s *TransactionService) Reverse(ctx context.Context, id uuid.UUID, note *st
 	if err != nil {
 		return nil, apperror.Internal("failed to write reversal").Wrap(err)
 	}
+	// A reversed bill payment is an unpaid occurrence again. Both rows
+	// stay visible (Principle 5) — it is the schedule that rewinds.
+	s.revertBillPayment(ctx, id)
 	return created, nil
 }
 
@@ -613,3 +713,10 @@ func encodeCursor(at time.Time, id uuid.UUID) string {
 	return encodeCursorValue(fmt.Sprintf("v1|%d|%s", at.UnixNano(), id))
 }
 
+// txTraceOf keeps log calls correlated; the logger refuses an empty id.
+func txTraceOf(ctx context.Context) string {
+	if id := logctx.TraceID(ctx); id != "" {
+		return id
+	}
+	return "ledger"
+}

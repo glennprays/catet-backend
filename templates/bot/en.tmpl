@@ -1,0 +1,284 @@
+{{/* English bot copy: a plain translation of id.tmpl with identical
+template names, data fields and separators. Cancel keywords stay
+parser-recognised ("cancel", "yes", "no"), so the examples here are
+answerable. The voice mirrors id.tmpl: warm and professional, first
+person, no slang. Lead-ins map "Sip," → "Done,", "Oke," → "Okay,",
+"Hmm," → "Hmm,", "Aduh," → "Sorry,". No exclamation marks, no emoji. */}}
+
+{{/* Confirmations never quote a balance — see id.tmpl. Safe-to-Spend and
+runway appear only in the rituals the user asks for. */}}
+
+{{define "recorded_one" -}}
+Done, recorded: {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · {{.Category}} · {{.Source}}{{if .Backdated}} · {{.Date}}{{end}}
+{{- end}}
+
+{{define "recorded_income" -}}
+Done, {{.Amount}} in · {{.Merchant}} · to {{.Source}}
+{{- end}}
+
+{{define "recorded_transfer" -}}
+Done, moved {{.Amount}} · {{.Source}} → {{.Destination}}
+{{- end}}
+
+{{define "recorded_many" -}}
+Done, {{len .Items}} transactions recorded:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · {{.Category}} · {{.Source}}
+{{end}}If something is off, reply "cancel" to delete all or "cancel 2" for number 2.
+{{- end}}
+
+{{define "uncategorized" -}}
+no category yet
+{{- end}}
+
+{{define "hold_saved" -}}
+I'm holding this for now: {{.Summary}}
+{{.Question}}
+{{- end}}
+
+{{define "hold_to_dashboard" -}}
+I saved it as a draft for now, finish it in the dashboard.
+{{- end}}
+
+{{define "q_amount" -}}
+How much was it?
+{{- end}}
+
+{{define "q_amount_roles" -}}
+Two numbers here — which one was paid, which one is the change? Example: "pay 50k change 25k".
+{{- end}}
+
+{{define "q_source" -}}
+Which source did you pay with? {{join .Sources " / "}}
+{{- end}}
+
+{{define "q_destination" -}}
+Where should it move to? {{join .Sources " / "}}
+{{- end}}
+
+{{define "q_refund_target" -}}
+Refund for {{.Merchant}} {{.Amount}} ({{.Date}}), right? Reply yes/no.
+{{- end}}
+
+{{define "refund_done" -}}
+Okay, the {{.Merchant}} {{.Amount}} refund is back in {{.Source}}.
+{{- end}}
+
+{{define "refund_no_target" -}}
+I can't find a {{.Merchant}} transaction in the last 30 days. Have a look in the dashboard.
+{{- end}}
+
+{{define "batal_done" -}}
+Okay, I cancelled {{len .Items}} transactions:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}
+{{end}}
+{{- end}}
+
+{{define "batal_nothing" -}}
+There's nothing from chat I can cancel. Delete it in the dashboard.
+{{- end}}
+
+{{define "batal_bad_index" -}}
+Number {{.N}} isn't there — the last batch only has {{.Count}} items.
+{{- end}}
+
+{{define "discarded" -}}
+Okay, discarded. Nothing was written.
+{{- end}}
+
+{{define "no_open_question" -}}
+Nothing is waiting for an answer.
+{{- end}}
+
+{{/* Sent whenever a message arrives that does not settle the open
+draft — see id.tmpl. */}}
+{{define "open_question_reminder" -}}
+I'm still waiting on an answer for: {{.Summary}}. Reply "yes"/"no", or just name the source.
+{{- end}}
+
+{{define "unknown" -}}
+Hmm, I didn't catch that. To record a spend, type something like "coffee 25k with gopay"; for a summary, type "recap"; to correct something, "that category food".
+{{- end}}
+
+{{define "corrected" -}}
+{{if eq .Type "transfer"}}Okay, fixed: moved {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Okay, fixed: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}
+{{- end}}
+
+{{define "correct_nothing" -}}
+There's no chat transaction I can change yet. Change it in the dashboard.
+{{- end}}
+
+{{define "correct_failed" -}}
+I can't change {{.Field}} on that transaction from chat. Change it in the dashboard.
+{{- end}}
+
+{{/* Balances are quoted only here — see id.tmpl. */}}
+{{define "balance_one" -}}
+{{.Source}}: {{.Balance}}
+{{- end}}
+
+{{define "balance_all" -}}
+{{range .Items}}{{.Source}}: {{.Balance}}
+{{end}}Safe-to-Spend {{.Sts}}
+{{- end}}
+
+{{define "unsupported_media" -}}
+Send it as a photo — I can't read video, audio or documents.
+{{- end}}
+
+{{/* Receipt photos — see id.tmpl. A photo always parks as a draft. */}}
+
+{{define "photo_issue" -}}
+{{if eq . "blur"}}blurry{{else if eq . "glare"}}washed out by glare{{else if eq . "too_small"}}too small{{else if eq . "cropped"}}cut off{{else if eq . "download"}}impossible to download{{else}}unreadable{{end}}
+{{- end}}
+
+{{define "photo_unreadable" -}}
+The photo is {{template "photo_issue" .Issue}}, so I can't trust the digits. Retake it closer, flat and well lit.
+{{- end}}
+
+{{define "photo_no_total" -}}
+I can't see the TOTAL line yet. Send the bottom of the receipt — the part with the total is enough.
+{{- end}}
+
+{{define "photo_not_receipt" -}}
+Hmm, that doesn't look like a receipt or payment proof. Type the amount if you want me to record it.
+{{- end}}
+
+{{define "photo_statement" -}}
+I can't read statements or bills that hold many transactions. Send the receipts one at a time.
+{{- end}}
+
+{{define "photo_currency" -}}
+I don't support {{.Currency}} yet, only Rupiah for now.
+{{- end}}
+
+{{define "photo_too_large" -}}
+That photo is too large. Send it as a regular photo (not HD/document).
+{{- end}}
+
+{{define "photo_duplicate" -}}
+You already sent this photo: {{.Summary}}
+{{- end}}
+
+{{define "photo_llm_off" -}}
+Receipt reading is off right now. Just type the amount.
+{{- end}}
+
+{{define "receipt_summary" -}}
+{{if .Duplicate}}Possible duplicate · {{end}}{{if .Payment}}Payment proof {{.Merchant}} · {{.Total}}{{else}}Receipt {{.Merchant}} · {{.Date}} · {{.N}} items · {{.Total}}{{end}}{{if .Collapsed}} · breakdown inconsistent{{end}}
+{{- end}}
+
+{{/* The Source line says how the Source was decided — see id.tmpl. */}}
+{{define "receipt_hold" -}}
+{{.Summary}}
+{{range .Items}}• {{.Name}} {{.Amount}}{{if .Category}} · {{.Category}}{{end}}
+{{end}}{{if gt .More 0}}…and {{.More}} more
+{{end}}{{if .AskSource}}Which source paid? {{join .Sources " / "}}{{else}}Paid from {{.Source}}{{if or (eq .Basis "memory") (eq .Basis "default")}} (usually).{{else if eq .Basis "guess"}}?{{else}}.{{end}}
+Reply "yes" if that looks right, "no" to discard. Want a different source or category? Just say so.{{end}}
+{{- end}}
+
+{{define "receipt_recorded" -}}
+Done, {{.N}} lines from {{.Merchant}} recorded · {{.Total}} from {{.Source}}. Type "cancel" if it's wrong.
+{{- end}}
+
+{{/* One message may change several things about the draft at once;
+.Change is the " · "-join of the fragments below. */}}
+{{define "receipt_updated" -}}
+Okay, {{.Change}}. Does that look right? Reply yes/no.
+{{- end}}
+
+{{define "receipt_need_source" -}}
+Which source paid for it? {{join .Sources " / "}}
+{{- end}}
+
+{{define "receipt_default_learned" -}}
+I'll take the next receipt as {{.Source}} unless it says otherwise — you can change that in Settings.
+{{- end}}
+
+{{define "receipt_split_mismatch" -}}
+Hmm, the parts don't add up: {{.Parts}} ≠ {{.Total}}. Try again.
+{{- end}}
+
+{{define "receipt_split_unknown_source" -}}
+I don't know that source. The options are: {{join .Sources " / "}}
+{{- end}}
+
+{{define "receipt_change_source" -}}
+from {{.Source}}
+{{- end}}
+
+{{define "receipt_change_split" -}}
+{{range $i, $p := .Payments}}{{if $i}} · {{end}}{{$p.Source}} {{$p.Amount}}{{end}}
+{{- end}}
+
+{{define "receipt_change_category" -}}
+category {{.Category}}
+{{- end}}
+
+{{define "receipt_change_merchant" -}}
+merchant {{.Merchant}}
+{{- end}}
+
+{{define "receipt_change_date" -}}
+date {{.Date}}
+{{- end}}
+
+{{define "rekap_hari" -}}
+You spent {{.Spent}} today · Safe-to-Spend {{.Sts}} · reserved tomorrow {{.ReservedTomorrow}} · {{.Uncategorized}} uncategorised{{if .DueTomorrow}} · due tomorrow: {{join .DueTomorrow ", "}}{{end}}{{if .Overdue}} · {{.Overdue}} overdue{{end}}{{if .Verdict}}
+{{.Verdict}}{{end}}
+{{- end}}
+
+{{define "rekap_minggu" -}}
+You spent {{.Spent}} this week ({{.Delta}} vs last week)
+Days that stood out: {{if .AnomalyDays}}{{join .AnomalyDays ", "}}{{else}}none{{end}}
+{{.Uncategorized}} uncategorised
+Top: {{range $i, $t := .Top}}{{if $i}} · {{end}}{{$t.Name}} {{$t.Amount}}{{end}}{{if .Verdict}}
+{{.Verdict}}{{end}}
+{{- end}}
+
+{{define "error_generic" -}}
+Sorry, something broke on my side. Try again shortly.
+{{- end}}
+
+{{define "invite_sent" -}}
+You've been invited to catet. Sign up here (valid 7 days): {{.URL}}
+If you receive this link again, use the newest one.
+{{- end}}
+
+{{define "bill_reminder" -}}
+Bill reminder
+{{- if .Overdue}}
+Overdue: {{join .Overdue ", "}}{{end}}
+{{- if .Today}}
+Today: {{join .Today ", "}}{{end}}
+{{- if .Tomorrow}}
+Tomorrow: {{join .Tomorrow ", "}}{{end}}
+{{- if .InThree}}
+In 3 days: {{join .InThree ", "}}{{end}}
+Reply *lunas <amount>* once paid.
+{{- end}}
+
+{{define "lunas_none" -}}
+No matching bill.
+{{- end}}
+
+{{define "lunas_choose" -}}
+Which bill?
+{{range .Items}}{{.}}
+{{end}}Reply with the number.
+{{- end}}
+
+{{define "lunas_amount" -}}
+How much for {{.Name}}?
+{{- end}}
+
+{{define "lunas_source" -}}
+{{.Name}} has no linked source. Which one paid? {{join .Sources " · "}}
+{{- end}}
+
+{{define "lunas_done" -}}
+Paid: {{.Name}} {{.Amount}}. Next {{.Next}}.
+{{- end}}
+
+{{define "lunas_completed" -}}
+done
+{{- end}}

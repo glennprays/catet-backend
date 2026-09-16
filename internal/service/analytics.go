@@ -125,7 +125,7 @@ func (s *AnalyticsService) CategoryBreakdown(ctx context.Context, from, to time.
 
 	// Link children and collect roots with positive totals.
 	children := map[uuid.UUID][]response.CategoryBreakdownNode{}
-	var roots []response.CategoryBreakdownNode
+	roots := make([]response.CategoryBreakdownNode, 0, len(nodes))
 	for _, n := range nodes {
 		if n.item.AmountMinor <= 0 {
 			continue
@@ -233,18 +233,16 @@ func (s *AnalyticsService) StsTrend(ctx context.Context, days int) (*response.St
 			available += balances[src.ID]
 		}
 	}
-	today, err := parseJakartaDate(JakartaDate())
+	today := JakartaToday()
+	activeBills, err := s.bills.ListActive(ctx)
 	if err != nil {
-		return nil, err
+		return nil, apperror.Internal("failed to list bills").Wrap(err)
 	}
-	reserved, err := s.bills.ReservedSum(ctx, today, today.AddDate(0, 0, horizon))
-	if err != nil {
-		return nil, apperror.Internal("failed to sum reservations").Wrap(err)
-	}
+	reserved := ReservedBetween(activeBills, today, today.AddDate(0, 0, horizon), true)
 	sts := available - reserved
 
 	// Daily expenses over [today−(days−1)−30, today+1).
-	rangeStart := today.AddDate(0, 0, -(days - 1) - 30)
+	rangeStart := today.AddDate(0, 0, -(days-1)-30)
 	rangeEnd := today.AddDate(0, 0, 1)
 	_, expense, err := s.analytics.DailyFlows(ctx, rangeStart, rangeEnd)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/glennprays/catet-backend/internal/domain/entity"
+	"github.com/glennprays/catet-backend/internal/scope"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,6 +66,10 @@ func NewTransactionRepository(db *pgxpool.Pool) *TransactionRepository {
 // Insert writes the transaction header and its legs in one database
 // transaction. The caller assigns IDs.
 func (r *TransactionRepository) Insert(ctx context.Context, tx *entity.Transaction) (*entity.Transaction, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	pgTx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)
@@ -80,11 +85,11 @@ func (r *TransactionRepository) Insert(ctx context.Context, tx *entity.Transacti
 		`INSERT INTO transactions (
 			id, occurred_at, origin, type, merchant, note, category_id,
 			category_source, category_confidence, review_status, external_id,
-			content_hash, reverses_transaction_id, edit_history, voided_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			content_hash, reverses_transaction_id, edit_history, voided_at, user_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		tx.ID, tx.OccurredAt, tx.Origin, tx.Type, tx.Merchant, tx.Note, tx.CategoryID,
 		tx.CategorySource, tx.CategoryConfidence, tx.ReviewStatus, tx.ExternalID,
-		tx.ContentHash, tx.ReversesTransactionID, editHistory, tx.VoidedAt,
+		tx.ContentHash, tx.ReversesTransactionID, editHistory, tx.VoidedAt, uid,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert transaction: %w", err)
@@ -103,6 +108,10 @@ func (r *TransactionRepository) Insert(ctx context.Context, tx *entity.Transacti
 
 // Save replaces the mutable columns and the leg set atomically (PATCH).
 func (r *TransactionRepository) Save(ctx context.Context, tx *entity.Transaction) (*entity.Transaction, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	pgTx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)
@@ -113,9 +122,9 @@ func (r *TransactionRepository) Save(ctx context.Context, tx *entity.Transaction
 		`UPDATE transactions SET
 			occurred_at = $2, merchant = $3, note = $4, category_id = $5,
 			category_source = $6, review_status = $7, edit_history = $8
-		 WHERE id = $1 AND voided_at IS NULL`,
+		 WHERE id = $1 AND user_id = $9 AND voided_at IS NULL`,
 		tx.ID, tx.OccurredAt, tx.Merchant, tx.Note, tx.CategoryID,
-		tx.CategorySource, tx.ReviewStatus, tx.EditHistory,
+		tx.CategorySource, tx.ReviewStatus, tx.EditHistory, uid,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("update transaction: %w", err)
@@ -138,14 +147,130 @@ func (r *TransactionRepository) Save(ctx context.Context, tx *entity.Transaction
 // SetVoided soft-voids a transaction. Returns false when the row does
 // not exist, true when it was voided (idempotent on already-voided).
 func (r *TransactionRepository) SetVoided(ctx context.Context, id uuid.UUID, at time.Time) (bool, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return false, err
+	}
 	tag, err := r.db.Exec(ctx,
-		`UPDATE transactions SET voided_at = $2 WHERE id = $1 AND voided_at IS NULL`,
-		id, at,
+		`UPDATE transactions SET voided_at = $2 WHERE id = $1 AND user_id = $3 AND voided_at IS NULL`,
+		id, at, uid,
 	)
 	if err != nil {
 		return false, fmt.Errorf("void transaction: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// LastUserCategoryForMerchant is the bot's merchant memory: the category
+// the user themselves last put on this merchant. Only user-set labels
+// count — echoing back the LLM's own guess would launder a guess into a
+// rule.
+func (r *TransactionRepository) LastUserCategoryForMerchant(ctx context.Context, merchant string) (*uuid.UUID, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	err = r.db.QueryRow(ctx,
+		`SELECT category_id FROM transactions
+		 WHERE user_id = $2 AND lower(merchant) = lower($1)
+		   AND category_source = 'user'
+		   AND voided_at IS NULL AND category_id IS NOT NULL
+		 ORDER BY created_at DESC LIMIT 1`,
+		merchant, uid,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
+// LastSourceForMerchant is the bot's Source memory: the Source money
+// last left from for this merchant. It answers "a receipt from this shop
+// is usually paid with…" when the paper itself only says TUNAI. Inside
+// one batch (a split receipt writes several rows at the same instant)
+// the larger share wins, because that is the account the user thinks of
+// as having paid.
+func (r *TransactionRepository) LastSourceForMerchant(ctx context.Context, merchant string) (*uuid.UUID, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	err = r.db.QueryRow(ctx,
+		`SELECT l.source_id FROM transactions t
+		 JOIN legs l ON l.transaction_id = t.id
+		   AND l.source_id IS NOT NULL AND l.signed_amount < 0
+		 WHERE t.user_id = $2 AND lower(t.merchant) = lower($1)
+		   AND t.voided_at IS NULL
+		   AND t.reverses_transaction_id IS NULL
+		   AND t.type IN ('expense','transfer')
+		 ORDER BY t.occurred_at DESC, l.signed_amount ASC, t.created_at DESC LIMIT 1`,
+		merchant, uid,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
+// LatestExpenseByMerchant finds the refund target: the most recent live,
+// not-yet-reversed expense for this merchant since the given instant.
+func (r *TransactionRepository) LatestExpenseByMerchant(ctx context.Context, merchant string, since time.Time) (*entity.Transaction, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	err = r.db.QueryRow(ctx,
+		`SELECT t.id FROM transactions t
+		 WHERE t.user_id = $3 AND t.type = 'expense' AND t.voided_at IS NULL
+		   AND t.reverses_transaction_id IS NULL
+		   AND lower(t.merchant) = lower($1)
+		   AND t.occurred_at >= $2
+		   AND NOT EXISTS (
+		     SELECT 1 FROM transactions r
+		     WHERE r.reverses_transaction_id = t.id AND r.user_id = $3
+		       AND r.voided_at IS NULL
+		   )
+		 ORDER BY t.occurred_at DESC, t.created_at DESC LIMIT 1`,
+		merchant, since, uid,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.Get(ctx, id)
+}
+
+// IsReversed reports whether a live reversal already points at this
+// transaction. The bot uses it to keep an already-undone line out of
+// the correction candidates it shows the intent router.
+func (r *TransactionRepository) IsReversed(ctx context.Context, id uuid.UUID) (bool, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	err = r.db.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM transactions r
+		   WHERE r.reverses_transaction_id = $1 AND r.user_id = $2
+		     AND r.voided_at IS NULL
+		 )`, id, uid,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 const txDetailSelect = `
@@ -158,12 +283,30 @@ const txDetailSelect = `
 
 // Get loads one transaction with its legs (and display names).
 func (r *TransactionRepository) Get(ctx context.Context, id uuid.UUID) (*entity.Transaction, error) {
-	row := r.db.QueryRow(ctx, txDetailSelect+` WHERE t.id = $1`, id)
+	return r.getWhere(ctx, `t.id = $1`, id)
+}
+
+// GetByExternalID loads whatever a capture surface already wrote under
+// this idempotency key; nil when nothing did. The receipt path uses it
+// to adopt the lines a partial earlier attempt already inserted.
+func (r *TransactionRepository) GetByExternalID(ctx context.Context, externalID string) (*entity.Transaction, error) {
+	return r.getWhere(ctx, `t.external_id = $1`, externalID)
+}
+
+// getWhere is the one place Get and GetByExternalID are scoped: each
+// passes a single lookup argument as $1, so the tenant is always $2.
+// A row belonging to someone else scans as no row at all.
+func (r *TransactionRepository) getWhere(ctx context.Context, where string, arg any) (*entity.Transaction, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row := r.db.QueryRow(ctx, txDetailSelect+` WHERE `+where+` AND t.user_id = $2`, arg, uid)
 	var (
 		t           entity.Transaction
 		editHistory []byte
 	)
-	err := row.Scan(
+	err = row.Scan(
 		&t.ID, &t.OccurredAt, &t.Origin, &t.Type, &t.Merchant, &t.Note,
 		&t.CategoryID, &t.CategoryName, &t.CategorySource, &t.CategoryConfidence,
 		&t.ReviewStatus, &t.ExternalID, &t.ReversesTransactionID,
@@ -177,7 +320,7 @@ func (r *TransactionRepository) Get(ctx context.Context, id uuid.UUID) (*entity.
 	}
 	t.EditHistory = json.RawMessage(editHistory)
 
-	legs, err := r.legs(ctx, id)
+	legs, err := r.legs(ctx, t.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +338,69 @@ func (r *TransactionRepository) Get(ctx context.Context, id uuid.UUID) (*entity.
 		}
 	}
 	return &t, nil
+}
+
+// FindByContentHash returns the live transaction already written under
+// this fingerprint; nil when the content is new. A receipt's fingerprint
+// is merchant+date+total, so this catches the same receipt photographed
+// twice — and a photo of something already typed in by hand.
+func (r *TransactionRepository) FindByContentHash(ctx context.Context, hash string) (*uuid.UUID, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	err = r.db.QueryRow(ctx,
+		`SELECT id FROM transactions
+		 WHERE user_id = $2 AND content_hash = $1 AND voided_at IS NULL
+		 ORDER BY created_at DESC LIMIT 1`,
+		hash, uid,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
+// FindLikelyDuplicate looks for an expense of the same merchant and the
+// same amount inside one day — the shape of "I typed it, then I
+// photographed the receipt". It is a hint the user confirms, never an
+// automatic refusal.
+func (r *TransactionRepository) FindLikelyDuplicate(
+	ctx context.Context, merchant string, amountMinor int64, dayStart, dayEnd time.Time,
+) (*uuid.UUID, error) {
+	if merchant == "" || amountMinor <= 0 {
+		return nil, nil
+	}
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var id uuid.UUID
+	// The expense's money leaves through its source leg, so the match is
+	// on the negative signed amount — passed already negated, because an
+	// unadorned `-$2` has no inferable type in Postgres.
+	err = r.db.QueryRow(ctx,
+		`SELECT t.id FROM transactions t
+		 JOIN legs l ON l.transaction_id = t.id
+		   AND l.source_id IS NOT NULL AND l.signed_amount = $2
+		 WHERE t.user_id = $5 AND t.type = 'expense' AND t.voided_at IS NULL
+		   AND t.reverses_transaction_id IS NULL
+		   AND lower(t.merchant) = lower($1)
+		   AND t.occurred_at >= $3 AND t.occurred_at < $4
+		 ORDER BY t.created_at DESC LIMIT 1`,
+		merchant, -amountMinor, dayStart, dayEnd, uid,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 func (r *TransactionRepository) legs(ctx context.Context, txID uuid.UUID) ([]entity.Leg, error) {
@@ -257,8 +463,14 @@ const ledgerSelect = `
 	LEFT JOIN sources ps ON ps.id = p.source_id
 	LEFT JOIN categories c ON c.id = t.category_id`
 
-func (r *TransactionRepository) buildWhere(f ListFilter, args []any) (string, []any) {
-	conds := []string{"1 = 1"}
+// buildWhere numbers its placeholders from the args slice it is handed,
+// so the tenant predicate lands wherever the caller's own arguments end:
+// $2 for List (which already holds the limit as $1), $1 for Count. The
+// tenant is the first condition rather than a "1 = 1" placeholder, so a
+// filterless list is still one user's ledger.
+func (r *TransactionRepository) buildWhere(f ListFilter, args []any, uid uuid.UUID) (string, []any) {
+	args = append(args, uid)
+	conds := []string{fmt.Sprintf("t.user_id = $%d", len(args))}
 	add := func(cond string, val any) {
 		args = append(args, val)
 		conds = append(conds, fmt.Sprintf("%s $%d", cond, len(args)))
@@ -298,8 +510,12 @@ func (r *TransactionRepository) buildWhere(f ListFilter, args []any) (string, []
 
 // List returns one keyset page ordered (occurred_at, id) DESC.
 func (r *TransactionRepository) List(ctx context.Context, f ListFilter) ([]LedgerRow, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	args := []any{f.Limit}
-	where, args := r.buildWhere(f, args)
+	where, args := r.buildWhere(f, args, uid)
 	sql := ledgerSelect + where + ` ORDER BY t.occurred_at DESC, t.id DESC LIMIT $1`
 
 	rows, err := r.db.Query(ctx, sql, args...)
@@ -326,10 +542,14 @@ func (r *TransactionRepository) List(ctx context.Context, f ListFilter) ([]Ledge
 
 // Count reports the total rows matching the filter (ignores cursor/limit).
 func (r *TransactionRepository) Count(ctx context.Context, f ListFilter) (int64, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return 0, err
+	}
 	args := []any{}
-	where, args := r.buildWhere(f, args)
+	where, args := r.buildWhere(f, args, uid)
 	var total int64
-	err := r.db.QueryRow(ctx,
+	err = r.db.QueryRow(ctx,
 		`SELECT COUNT(*) FROM transactions t`+where, args...,
 	).Scan(&total)
 	return total, err

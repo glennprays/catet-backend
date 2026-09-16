@@ -46,3 +46,7 @@ Dockerfile
 /vendor
 
 .DS_Store
+
+# Exclude host build artefacts (Makefile output) — the image builds its own
+/catet
+/main

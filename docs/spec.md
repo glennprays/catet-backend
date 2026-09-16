@@ -4,14 +4,14 @@ Plan of record after the v1 brainstorm session (see git history / ADRs for what 
 
 ## 1. Vision
 
-A self-hosted, WhatsApp-first personal finance tracker for one user, solving **visibility first** (safe-to-spend clarity), then budgets, goals, and scattered BNPL/paylater debt. Deterministic core owns every number; a small bounded AI harness parses language in and narrates results out — never does math, never moves money.
+A self-hosted, WhatsApp-first personal finance tracker for a small, invited set of users, each with their own ledger and WhatsApp number, solving **visibility first** (safe-to-spend clarity), then budgets, goals, and scattered BNPL/paylater debt. Deterministic core owns every number; a small bounded AI harness parses language in and narrates results out — never does math, never moves money.
 
 ## 2. Guiding Principles (amended)
 
 1. **AI suggests, user decides.** The AI never moves money or commits to a plan on its own.
 2. **Deterministic core, LLM at the edges.** All numbers come from plain code. The LLM parses input and narrates output — never computes.
 3. **Bounded harness, not an agent.** Fixed small domain tool set. No shell, filesystem, or browsing.
-4. **Strictly reactive.** *(amended — supersedes v1's "proactive where money is at risk")* The bot never messages first, no exceptions. Budget thresholds, due dates, recaps: dashboard badges, calendar, and on-request queries only. System-health alerts (e.g. WhatsApp gateway disconnect) route through a separate ops channel (email/uptime monitor) — that is infrastructure talking, not the finance bot. Habit formation is **pull-based**: a daily ritual (`rekap hari ini`) and a weekly review ritual are *user-initiated*, never pushed.
+4. **Strictly reactive.** *(amended — supersedes v1's "proactive where money is at risk")* The bot never messages first, no exceptions. Budget thresholds, due dates, recaps: dashboard badges, calendar, and on-request queries only. System-health alerts (e.g. WhatsApp gateway disconnect) route through a separate ops channel (email/uptime monitor) — that is infrastructure talking, not the finance bot. Habit formation is **pull-based**: a daily ritual (`rekap hari ini`) and a weekly review ritual are *user-initiated*, never pushed. Exception (ADR-0006): per-bill reminders the user opted into are the user's own alarm, sent as one daily digest at the user's send hour, never naming amounts.
 5. **Nothing destructive is silent or permanent.** Soft-delete with restore window; named confirmations.
 6. **Fact vs label.** Fact Confidence gates writing; Category Confidence is always a fixable best-guess reviewed async.
 7. **Fail-closed capture.** *(new)* When in doubt, hold for confirmation — never guess into the ledger. See ADR-0003.
@@ -19,7 +19,7 @@ A self-hosted, WhatsApp-first personal finance tracker for one user, solving **v
 
 ## 3. Scope
 
-- Single user, self-hosted on own VPS.
+- Invite-only multi-tenant, self-hosted on own VPS: each user has their own ledger and their own WhatsApp number, isolated by `user_id` on every owned table (ADR-0005). Accounts are created only from an admin invite; the admin is the bootstrap user.
 - Bilingual (Bahasa Indonesia + English), auto-detected.
 - Channels: WhatsApp (self-hosted gateway, dedicated number; transport hidden behind an interface so an official Cloud API swap stays possible) + web dashboard.
 - Bot tone: neutral clerk by default — terse, factual, identical on both surfaces. An optional "sassy" narration mode is a Later-tier nicety; numbers never change with tone.
@@ -38,8 +38,8 @@ Leg: `transaction_id, source_id, signed_amount`
 Type derives from leg pairing: expense (source→expense), income (income→source), transfer (source→source), adjustment (system→source). `reverses_transaction_id` links a refund/cancellation to the transaction it reverses; both stay visible.
 
 **Bill** — *(new entity; v1 referenced reservations without defining this)*
-`id, name, amount_band (min,max), cadence, next_due_date, linked_source_id, category_id?, active`
-Incoming payments auto-match against bills by band + description rules; matched payments feed the calendar and reservations.
+`id, name, amount_band (min,max), cadence (once|weekly|monthly|annual), next_due_date, remaining_count?, reminder_offsets, linked_source_id, category_id?, active, completed_at?`
+A Bill is an expected obligation — recurring or one-time. Paying one ("Tandai lunas" on the dashboard, `lunas` in chat) writes an ordinary expense from the linked source and advances `next_due_date` by cadence; `once`, or the last unit of `remaining_count`, completes the Bill (`completed_at`). Reservations count every occurrence inside the income horizon; the calendar projects occurrences and paid days. `reminder_offsets` ⊆ {3, 1, 0} days before due opts the Bill into the daily reminder digest (ADR-0006).
 
 **Category** — user-defined hierarchy: `id, name, parent_id, icon, essential (bool), archived_at`. Merge/split/re-parent with retroactive rule re-run over history.
 
@@ -87,7 +87,7 @@ Money as `bigint` minor units (IDR-first). Timestamps UTC; all day-boundary logi
 - Dashboard analytics: category breakdown, income-vs-expense timeline, Safe-to-Spend/Runway trend, daily heatmap, top merchants, Essential-vs-Lifestyle split (ECharts)
 - Hold Queue and parked PendingActions actionable from the dashboard, not just chat
 - Tiered-confirmation harness skeleton (read tools free; writes confirmed by name)
-- Soft-delete + restore window; passkey auth; tailnet-preferred exposure; nightly encrypted off-box backup
+- Soft-delete + restore window; phone + password login (WhatsApp OTP verifies the phone at signup and resets the password; sessions revocable via `session_epoch`); tailnet-preferred exposure; nightly encrypted off-box backup
 - Dashboard-first onboarding: Sources + starting balances + Essential flags via forms; no chat wizard
 
 ### Next — pattern layer
@@ -126,6 +126,7 @@ Architecture unchanged from v1: orchestrator → intent classification → deter
 Amendments:
 - **Capture gate (ADR-0003):** keyword rules first; LLM output must resolve against whitelisted fields/categories; anything unresolved lands in the Hold Queue. LLM self-reported confidence is never the gate.
 - **Gate policy (deterministic rules):** a message with more than one money token and no role keyword (`bayar`, `dari`, `kembali`) → Hold. A transaction with no named Source → infer-if-unique, else Hold; the chosen Source is always shown on the confirmation card. Installments log pay-as-billed against a Bill schedule; refunds log as linked Reversals.
+- **Sender policy (ADR-0005):** the harness resolves the sender's number (or LID) to a user before parsing anything and answers only registered, active numbers, writing into that user's ledger alone. A number with an open invite is answered once with its register link; every other stranger — and every group chat — stays a silent drop.
 - **Low-confidence fallback:** short staged questionnaire seeded by the user's history, not a generic retry.
 - **Day-one intelligence:** parser + Tier-0 queries (`get_summary`, `compare_periods`, `search_transactions`). Full advisor chat deferred to Later.
 - Confirmation tiers (0–3) unchanged; parked PendingActions resume on plain "ya/tidak" replies without a second model call.
@@ -153,7 +154,7 @@ Amendments:
 
 ### Stack
 
-Next.js (App Router) · ECharts · TanStack Query · httpOnly-cookie session (passkey via WebAuthn).
+Next.js (App Router) · ECharts · TanStack Query · httpOnly-cookie session (phone + password login; WhatsApp OTP verifies the phone at signup and resets the password; sessions revocable via `session_epoch`). Installable PWA on the same origin (ADR-0007).
 
 ### Topology
 
@@ -211,7 +212,9 @@ All numbers computed in Go; Next.js renders only. The Go API returns ready-to-re
 
 ## 8. Security & Backup
 
-Unchanged from v1: DB encrypted at rest, gateway session tokens encrypted, passkey auth even single-user, dashboard preferably tailnet-only, nightly off-box encrypted backups, gateway-disconnect alert via ops channel (not the bot). Two-service exposure model: Next.js is the public edge; Go API is internal-only (docker network, no CORS).
+Unchanged from v1: DB encrypted at rest, gateway session tokens encrypted, dashboard preferably tailnet-only, nightly off-box encrypted backups, gateway-disconnect alert via ops channel (not the bot). Two-service exposure model: Next.js is the public edge; Go API is internal-only (docker network, no CORS). Auth is phone + password (argon2id) with WhatsApp OTP verifying the phone at signup and resetting the password; sessions are revocable via `session_epoch`, and tenant isolation is application-level filtering on `user_id` (ADR-0005) — a query without a scope errors rather than returning another user's rows. Sessions slide: a request with a token older than 7 days is answered with `X-Session-Renew`; the dashboard BFF re-sets its cookie, so an active device stays signed in while `session_epoch` remains the revocation lever.
+
+Exception: `POST /api/v1/webhooks/whatsapp` is reachable by the gateway. Its authentication is the per-subscription HMAC signature (`X-Webhook-Signature: sha256=…`), constant-time compared by the SDK before the body is parsed; the route is not mounted at all when `WA_WEBHOOK_SECRET` is empty, and production refuses to boot with a gateway URL and no secret. The body limit is the server-wide 1 MiB, the handler acknowledges before doing any work, and every delivery is deduplicated by `inbound_messages.message_id`. Messages from a JID that resolves to no active user — and every group chat — are recorded as `dropped` and never answered, except that a number with an open invite is sent its register link.
 
 ## 9. Tech Stack
 
@@ -220,4 +223,3 @@ Go backend/orchestrator (JSON API exposing Tier 0–3 tools) · PostgreSQL · se
 ## 10. Open Questions (remaining)
 
 - Multi-currency handling beyond IDR (deferred; schema keeps currency per Source).
-- WebAuthn/passkey implementation specifics in Next.js (library choice deferred to build).

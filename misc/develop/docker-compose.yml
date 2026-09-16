@@ -12,6 +12,38 @@ services:
     volumes:
       - catet-postgres-data:/var/lib/postgresql/data
 
+  # Opt-in: `docker compose --profile whatsapp up -d`. Upstream publishes
+  # no image, so build it once from a checkout of
+  # github.com/glennprays/whatsapp-gateway:
+  #   docker build -t whatsapp-gateway:latest .
+  # Then mint the phone-scoped JWT (POST /api/v1/register) and pair the
+  # number (POST /api/v1/login/qr_code/json) — see the backend
+  # .env.example. Without the profile the API keeps its log sender and
+  # nothing here is required.
+  #
+  # The gateway keeps its own schema; create it once:
+  #   docker exec catet-postgres createdb -U postgres waga
+  whatsapp-gateway:
+    container_name: catet-whatsapp-gateway
+    image: whatsapp-gateway:latest
+    profiles: ["whatsapp"]
+    depends_on:
+      - postgres
+    ports:
+      - "3010:3010"
+    environment:
+      ENV: development
+      PORT: 3010
+      SECRET_KEY: ${WA_GATEWAY_SECRET_KEY:-catet_dev_secret_key_change_me}
+      JWT_SECRET: ${WA_GATEWAY_JWT_SECRET:-catet_dev_jwt_secret_change_me}
+      # Tokens are never auto-renewed; a year keeps the bot from silently
+      # turning into 401s after a day.
+      JWT_TOKEN_DURATION_MINUTES: 525600
+      WHATSAPP_DATASTORE_TYPE: postgres
+      WHATSAPP_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/waga?sslmode=disable
+      WHATSAPP_WEBHOOK_HMAC_ENCRYPTION_MASTER_KEY: ${WA_GATEWAY_HMAC_MASTER_KEY:-0123456789abcdef0123456789abcdef}
+      WHATSAPP_DEVICE_LABEL: catet
+
   swagger-ui:
     container_name: catet-swagger-ui
     image: swaggerapi/swagger-ui

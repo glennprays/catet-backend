@@ -1,0 +1,555 @@
+package bot_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/glennprays/catet-backend/internal/llm"
+	waga "github.com/glennprays/whatsapp-gateway-sdk-go"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// fakeVisionLLM answers every prompt the photo path can make and counts
+// them, so a test can prove a duplicate photo never reaches the model
+// and that a rules-answerable reply never reaches the router.
+type fakeVisionLLM struct {
+	mu          sync.Mutex
+	visionCalls int
+	intentCalls int
+	sourceCalls int
+	receipt     func() string
+	sourceID    func() uuid.UUID
+	intent      func() string
+}
+
+func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var content string
+	switch {
+	case bytes.Contains(body, []byte("image_url")):
+		f.mu.Lock()
+		f.visionCalls++
+		f.mu.Unlock()
+		content = f.receipt()
+	case bytes.Contains(body, []byte("(intent)")):
+		f.mu.Lock()
+		f.intentCalls++
+		f.mu.Unlock()
+		content = f.intent()
+	case bytes.Contains(body, []byte("Alias:")):
+		f.mu.Lock()
+		f.sourceCalls++
+		f.mu.Unlock()
+		content = fmt.Sprintf(`{"source_id":%q}`, f.sourceID())
+	default:
+		content = `{"category_id":null,"confidence":0}`
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		"usage":   map[string]any{"prompt_tokens": 1200, "completion_tokens": 400},
+	})
+}
+
+func (f *fakeVisionLLM) intents() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.intentCalls
+}
+
+func (f *fakeVisionLLM) sourcePicks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sourceCalls
+}
+
+// unknownIntent is the router saying it has no idea: the default script
+// for a test that does not care what it says.
+const unknownIntent = `{"intent":"unknown","drafts":[],"correction":null,"undo_index":0,` +
+	`"period":"","balance_source_id":null,"answer":null}`
+
+func (f *fakeVisionLLM) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.visionCalls
+}
+
+// jpegBytes is a real (tiny) JPEG: the media fetch sniffs the body, so a
+// fixture has to be a decodable image.
+func jpegBytes(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 200, G: 200, B: 200, A: 255})
+	var buf bytes.Buffer
+	require.NoError(t, jpeg.Encode(&buf, img, nil))
+	return buf.Bytes()
+}
+
+// mediaServer stands in for the gateway's /storage endpoint.
+func mediaServer(t *testing.T, body []byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// sendPhoto delivers one image message with the gateway's media shape.
+func (f *botFixture) sendPhoto(t *testing.T, messageID, url string, size int, caption string) {
+	t.Helper()
+	f.deliver(t, &waga.IncomingWebhookPayload{
+		Event:     waga.IncomingEventMessageMessageIncoming,
+		Chat:      ownerPhone[1:] + "@s.whatsapp.net",
+		From:      ownerPhone[1:] + ":42@s.whatsapp.net",
+		MessageId: messageID,
+		PushName:  "Owner",
+		Timestamp: time.Now().Unix(),
+		Type:      waga.IncomingMessageTypeImage,
+		Media: &waga.IncomingMessageMediaInfo{
+			Type: waga.IncomingMessageTypeImage, Url: url,
+			MimeType: "image/jpeg", Size: size, Caption: caption,
+		},
+	})
+}
+
+// newPhotoFixture wires a bot whose LLM is the fake vision endpoint and
+// whose media comes from a local HTTP server.
+func newPhotoFixture(t *testing.T, receipt func(*botFixture) string) (*botFixture, *fakeVisionLLM, string, int) {
+	t.Helper()
+	img := jpegBytes(t)
+	media := mediaServer(t, img)
+
+	fake := &fakeVisionLLM{}
+	llmSrv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmSrv.Close)
+
+	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", 5*time.Second))
+	fake.receipt = func() string { return receipt(f) }
+	fake.sourceID = func() uuid.UUID { return f.bca.ID }
+	fake.intent = func() string { return unknownIntent }
+	return f, fake, media.URL + "/storage/x.jpg", len(img)
+}
+
+// twoLineReceipt is the canonical reading: two items that add up to the
+// printed total, paid with an alias only the model can resolve.
+func twoLineReceipt(f *botFixture) string {
+	return fmt.Sprintf(`{
+		"document_type":"receipt","legible":true,"issues":[],
+		"merchant":"Indomaret","date":"","currency":"IDR",
+		"has_total_line":true,"total_minor":35000,
+		"subtotal_minor":35000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,
+		"payment_method":"DEBIT BCA","direction":"","counterparty":"",
+		"items":[
+			{"name":"Indomie goreng","qty":2,"amount_minor":20000,"category_id":%q,"category_confidence":0.9},
+			{"name":"Aqua 600ml","qty":1,"amount_minor":15000,"category_id":null,"category_confidence":0}
+		]
+	}`, f.makanan.ID)
+}
+
+func TestPhotoParksReceiptThenYaWritesLines(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	// A photo never writes on arrival: it parks and asks.
+	assert.Empty(t, f.live(t), "a photo writes nothing before confirmation")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	assert.Equal(t, "receipt", open[0].Kind)
+
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, float64(35000), params["total_minor"])
+	assert.Equal(t, "Indomaret", params["merchant"])
+	assert.Equal(t, "BCA", params["source_name"], "the printed payment method resolved the Source")
+	items, ok := params["items"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+
+	reply := f.sender.last()
+	assert.Contains(t, reply, "Struk Indomaret")
+	assert.Contains(t, reply, "Indomie goreng")
+	assert.Contains(t, reply, `Balas "ya"`)
+	assert.Equal(t, 1, fake.calls())
+
+	// The media metadata is recorded; the bytes are not.
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.NotNil(t, row.MediaURL)
+	assert.Equal(t, url, *row.MediaURL)
+	require.NotNil(t, row.MediaSha256)
+	assert.Len(t, *row.MediaSha256, 64)
+
+	f.say(t, "m2", "ya")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2, "one ledger line per receipt item")
+	hashes := map[string]bool{}
+	for i, tx := range txs {
+		assert.Equal(t, "whatsapp_photo", tx.Origin)
+		assert.Equal(t, "expense", tx.Type)
+		require.NotNil(t, tx.ExternalID)
+		assert.Equal(t, fmt.Sprintf("m1#%d", i+1), *tx.ExternalID)
+		require.NotNil(t, tx.Merchant)
+		assert.Equal(t, "Indomaret", *tx.Merchant)
+		assert.Equal(t, f.bca.ID, legSourceID(t, tx.Legs))
+		var hash *string
+		require.NoError(t, f.pool.QueryRow(f.ctx,
+			`SELECT content_hash FROM transactions WHERE id = $1`, tx.ID).Scan(&hash))
+		require.NotNil(t, hash)
+		hashes[*hash] = true
+	}
+	assert.Len(t, hashes, 1, "every line of one receipt shares its fingerprint")
+	assert.Equal(t, int64(20_000), txs[0].AmountMinor)
+	assert.Equal(t, int64(15_000), txs[1].AmountMinor)
+	require.NotNil(t, txs[0].Note)
+	assert.Equal(t, "Indomie goreng", *txs[0].Note)
+	require.NotNil(t, txs[0].CategoryID)
+	assert.Equal(t, f.makanan.ID, *txs[0].CategoryID)
+	assert.Equal(t, "clean", txs[0].ReviewStatus)
+	assert.Nil(t, txs[1].CategoryID)
+	assert.Equal(t, "needs_review", txs[1].ReviewStatus, "an unlabelled line needs a human")
+
+	assert.Contains(t, f.sender.last(), "2 baris dari Indomaret tercatat")
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open, "the parked receipt is resolved once executed")
+
+	// "batal" reverses the whole batch the confirmation wrote.
+	f.say(t, "m3", "batal")
+	for _, tx := range txs {
+		var reversals int
+		require.NoError(t, f.pool.QueryRow(f.ctx,
+			`SELECT COUNT(*) FROM transactions WHERE reverses_transaction_id = $1`, tx.ID,
+		).Scan(&reversals))
+		assert.Equal(t, 1, reversals, "line %s was not reversed", tx.ID)
+	}
+}
+
+func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+
+	f.sendPhoto(t, "m1", url, size, "")
+	require.Equal(t, 1, fake.calls())
+	first := f.sender.last()
+
+	// The same picture forwarded again, under a new message id.
+	f.sendPhoto(t, "m2", url, size, "")
+
+	assert.Equal(t, 1, fake.calls(), "the same bytes never reach the model twice")
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Foto ini sudah pernah kamu kirim"),
+		"reply was %q", f.sender.last())
+	assert.Contains(t, f.sender.last(), "Struk Indomaret")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Len(t, open, 1, "a duplicate photo parks nothing new")
+	assert.NotEqual(t, first, f.sender.last())
+}
+
+// A gateway that does not download media hands us WhatsApp's encrypted
+// CDN body. It must never reach the model as if it were a photo.
+func TestPhotoCiphertextIsUnreadable(t *testing.T) {
+	media := mediaServer(t, bytes.Repeat([]byte{0x9f, 0x01, 0xff, 0x00}, 16))
+
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return `{}` },
+		sourceID: uuid.New,
+	}
+	llmSrv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer llmSrv.Close()
+
+	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", 5*time.Second))
+	f.sendPhoto(t, "m1", media.URL+"/storage/x.enc", 64, "")
+
+	assert.Equal(t, 0, fake.calls(), "undecryptable bytes never reach the model")
+	assert.Contains(t, f.sender.last(), "Fotonya")
+	assert.Empty(t, f.live(t))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open)
+}
+
+// Without a vision model the bot says so instead of guessing.
+func TestPhotoWithoutLlmSaysSo(t *testing.T) {
+	img := jpegBytes(t)
+	media := mediaServer(t, img)
+
+	f := newBotFixture(t, nil)
+	f.sendPhoto(t, "m1", media.URL+"/storage/x.jpg", len(img), "")
+
+	assert.Contains(t, f.sender.last(), "Baca struk lagi nonaktif")
+	assert.Empty(t, f.live(t))
+}
+
+// A receipt whose printed total was already typed in by hand the same
+// day is parked with a duplicate warning — not refused, not merged.
+func TestPhotoOfAnAlreadyCapturedExpenseWarnsAboutDuplication(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return fmt.Sprintf(`{
+			"document_type":"receipt","legible":true,"issues":[],
+			"merchant":"Indomaret","date":"","currency":"IDR",
+			"has_total_line":true,"total_minor":35000,
+			"subtotal_minor":35000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,
+			"payment_method":"BCA","direction":"","counterparty":"",
+			"items":[{"name":"Indomie goreng","qty":1,"amount_minor":35000,"category_id":%q,"category_confidence":0.9}]
+		}`, f.makanan.ID)
+	})
+
+	f.say(t, "m1", "indomaret 35rb pakai bca")
+	require.Len(t, f.live(t), 1)
+
+	f.sendPhoto(t, "m2", url, size, "")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.NotEmpty(t, params["duplicate_of"], "the earlier capture is flagged on the draft")
+	assert.Contains(t, open[0].Summary, "Mungkin duplikat")
+	assert.Contains(t, f.sender.last(), "Mungkin duplikat")
+}
+
+// cashReceipt is the trap the live test fell into: the paper says TUNAI
+// because that is what a register prints, while the money actually left
+// a bank account. The bot must ask rather than file it under Cash.
+func cashReceipt(merchant string, f *botFixture) string {
+	return fmt.Sprintf(`{
+		"document_type":"receipt","legible":true,"issues":[],
+		"merchant":%q,"date":"","currency":"IDR",
+		"has_total_line":true,"total_minor":35000,
+		"subtotal_minor":35000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,
+		"payment_method":"TUNAI","direction":"","counterparty":"",
+		"items":[
+			{"name":"Indomie goreng","qty":2,"amount_minor":20000,"category_id":%q,"category_confidence":0.9},
+			{"name":"Aqua 600ml","qty":1,"amount_minor":15000,"category_id":null,"category_confidence":0}
+		]
+	}`, merchant, f.makanan.ID)
+}
+
+// photoDefaultSource reads the learned fallback from the owner's
+// settings row.
+func (f *botFixture) photoDefaultSource(t *testing.T) *uuid.UUID {
+	t.Helper()
+	id, err := f.settings.GetPhotoDefaultSource(f.ctx)
+	require.NoError(t, err)
+	return id
+}
+
+func (f *botFixture) openQuestion(t *testing.T) *uuid.UUID {
+	t.Helper()
+	state, err := f.chats.Get(f.ctx, ownerPhone[1:]+"@s.whatsapp.net")
+	require.NoError(t, err)
+	if state == nil {
+		return nil
+	}
+	return state.OpenPendingActionID
+}
+
+// The round-2 headline: printed cash decides nothing, and one message
+// may both name the Source and confirm the draft.
+func TestPhotoAnswerWithSourceAndYaWritesFromThatSource(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return cashReceipt("Indomaret", f)
+	})
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	reply := f.sender.last()
+	assert.Contains(t, reply, "Bayar dari mana?", "printed TUNAI must not decide, reply was %q", reply)
+	assert.Equal(t, 0, fake.sourcePicks(), "a cash-like method never pays for an alias repair")
+	assert.Empty(t, f.live(t))
+
+	f.say(t, "m2", "bayar pake BCA, ya catat")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2, "one ledger line per receipt item")
+	for _, tx := range txs {
+		assert.Equal(t, f.bca.ID, legSourceID(t, tx.Legs))
+	}
+	reply = f.sender.last()
+	assert.Contains(t, reply, "2 baris dari Indomaret tercatat")
+	assert.Contains(t, reply, "Struk berikutnya kuanggap dari BCA")
+
+	id := f.photoDefaultSource(t)
+	require.NotNil(t, id, "the first Source the user picks becomes the fallback")
+	assert.Equal(t, f.bca.ID, *id)
+
+	assert.Equal(t, 1, fake.calls(), "one vision call")
+	assert.Equal(t, 0, fake.intents(), "a message the rules explain never reaches the router")
+	assert.Equal(t, []string{"👀", "📋", "✅"}, f.sender.reactionsOn("m1"))
+	assert.Nil(t, f.openQuestion(t))
+}
+
+// A message the bot cannot use must never cost the user their draft.
+func TestPhotoUnknownReplyKeepsQuestionOpen(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+
+	f.sendPhoto(t, "m1", url, size, "")
+	open := f.openQuestion(t)
+	require.NotNil(t, open)
+
+	f.say(t, "m2", "halo apa kabar")
+
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Aku masih nunggu"),
+		"reply was %q", f.sender.last())
+	still := f.openQuestion(t)
+	require.NotNil(t, still, "the question survives a message that was not an answer")
+	assert.Equal(t, *open, *still)
+	assert.Empty(t, f.live(t))
+}
+
+// One bill, two Sources: the shares are money facts, so the lines bend
+// around them and the split still sums to the printed total.
+func TestPhotoSplitPaymentWritesBothSources(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return fmt.Sprintf(`{
+			"document_type":"receipt","legible":true,"issues":[],
+			"merchant":"Indomaret","date":"","currency":"IDR",
+			"has_total_line":true,"total_minor":38000,
+			"subtotal_minor":38000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,
+			"payment_method":"TUNAI","direction":"","counterparty":"",
+			"items":[
+				{"name":"a","qty":1,"amount_minor":10000,"category_id":%q,"category_confidence":0.9},
+				{"name":"b","qty":1,"amount_minor":9000,"category_id":null,"category_confidence":0},
+				{"name":"c","qty":1,"amount_minor":8000,"category_id":null,"category_confidence":0},
+				{"name":"d","qty":1,"amount_minor":5000,"category_id":null,"category_confidence":0},
+				{"name":"e","qty":1,"amount_minor":4000,"category_id":null,"category_confidence":0},
+				{"name":"f","qty":1,"amount_minor":2000,"category_id":null,"category_confidence":0}
+			]
+		}`, f.makanan.ID)
+	})
+
+	f.sendPhoto(t, "m1", url, size, "")
+	require.Contains(t, f.sender.last(), "Bayar dari mana?")
+
+	fake.intent = func() string {
+		return fmt.Sprintf(`{"intent":"answer","drafts":[],"correction":null,"undo_index":0,`+
+			`"period":"","balance_source_id":null,"answer":{"confirm":"yes","source_id":null,`+
+			`"payments":[{"source_id":%q,"amount_text":"20rb"},{"source_id":%q,"amount_text":""}],`+
+			`"category_id":null,"merchant":null,"day_offset":null}}`, f.cash.ID, f.bca.ID)
+	}
+	f.say(t, "m2", "20rb cash sisanya bca")
+
+	perSource := map[uuid.UUID]int64{}
+	externals := map[string]bool{}
+	var total int64
+	for _, tx := range f.live(t) {
+		perSource[legSourceID(t, tx.Legs)] += tx.AmountMinor
+		total += tx.AmountMinor
+		require.NotNil(t, tx.ExternalID)
+		externals[*tx.ExternalID] = true
+	}
+	assert.Equal(t, int64(38_000), total, "the split still sums to the printed total")
+	assert.Equal(t, int64(20_000), perSource[f.cash.ID])
+	assert.Equal(t, int64(18_000), perSource[f.bca.ID])
+	assert.True(t, externals["m1#3a"], "the cut line's halves keep their own idempotency keys")
+	assert.True(t, externals["m1#3b"])
+	assert.Contains(t, f.sender.last(), "7 baris dari Indomaret tercatat", "the straddling line is written as two")
+}
+
+// The Source memory answers what the paper cannot: this shop was paid
+// from BCA last time, so say so instead of asking again.
+func TestPhotoMerchantMemoryPicksSource(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return cashReceipt("Alfamart", f)
+	})
+
+	f.say(t, "m0", "alfamart 20k pakai bca")
+	require.Len(t, f.live(t), 1)
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	reply := f.sender.last()
+	assert.Contains(t, reply, "Bayar dari BCA (biasanya).", "reply was %q", reply)
+	assert.Equal(t, 0, fake.sourcePicks())
+}
+
+// The fallback is learned once. Overwriting it on every answer would
+// make the bot's "usually" wander with the last receipt.
+func TestPhotoDefaultLearnedOnlyOnce(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return cashReceipt("Indomaret", f)
+	})
+
+	f.sendPhoto(t, "m1", url, size, "")
+	f.say(t, "m2", "pakai bca ya")
+	first := f.photoDefaultSource(t)
+	require.NotNil(t, first)
+	require.Equal(t, f.bca.ID, *first)
+
+	// A second receipt, answered with a different Source.
+	img := jpegBytes(t)
+	other := mediaServer(t, append(img, 0x00))
+	f.sendPhoto(t, "m3", other.URL+"/storage/y.jpg", len(img)+1, "")
+	f.say(t, "m4", "pakai gopay ya")
+
+	assert.NotContains(t, f.sender.last(), "Struk berikutnya",
+		"the fallback is only ever announced when it is learned")
+	after := f.photoDefaultSource(t)
+	require.NotNil(t, after)
+	assert.Equal(t, f.bca.ID, *after, "the learned fallback is not overwritten")
+}
+
+// The caption is the user speaking, so it outranks whatever the paper
+// printed — and it resolves with the rules alone when it is plainly a
+// Source name.
+func TestPhotoCaptionBeatsThePrintedMethod(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt) // prints "DEBIT BCA"
+
+	f.sendPhoto(t, "m1", url, size, "gopay")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "GoPay", params["source_name"])
+	assert.Equal(t, "hint", params["source_basis"])
+	assert.Contains(t, f.sender.last(), "Bayar dari GoPay.")
+	assert.Equal(t, 0, fake.intents(), "a caption that is a Source name needs no router")
+}
+
+// A caption the rules cannot read is worth one router call, which may
+// label every line of the receipt at once.
+func TestPhotoCaptionCategoryLabelsEveryLine(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+	fake.intent = func() string {
+		return fmt.Sprintf(`{"intent":"answer","drafts":[],"correction":null,"undo_index":0,`+
+			`"period":"","balance_source_id":null,"answer":{"confirm":"","source_id":null,"payments":[],`+
+			`"category_id":%q,"merchant":null,"day_offset":null}}`, f.transpor.ID)
+	}
+
+	f.sendPhoto(t, "m1", url, size, "ini buat jalan-jalan kemarin")
+
+	assert.Equal(t, 1, fake.intents())
+	f.say(t, "m2", "ya")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	for _, tx := range txs {
+		require.NotNil(t, tx.CategoryID)
+		assert.Equal(t, f.transpor.ID, *tx.CategoryID)
+		require.NotNil(t, tx.CategorySource)
+		assert.Equal(t, "user", *tx.CategorySource, "a label the user gave is not a guess")
+		assert.Equal(t, "clean", tx.ReviewStatus)
+	}
+}

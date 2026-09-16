@@ -25,15 +25,22 @@ type ledgerFixture struct {
 	catRepo    *repository.CategoryRepository
 }
 
+// The ledger is per-user, so the fixture opens an account first: every
+// repository below reads its tenant from this context, and a bare one
+// would fail closed.
 func newLedgerFixture(t *testing.T) *ledgerFixture {
 	t.Helper()
 	pool := testkit.NewDB(t)
+	ctx, _ := testkit.Scoped(t, pool, "+628111000001", "Ledger")
 	sourceRepo := repository.NewSourceRepository(pool)
 	categoryRepo := repository.NewCategoryRepository(pool)
 	transactionRepo := repository.NewTransactionRepository(pool)
-	txSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo)
+	txSvc := service.NewTransactionService(
+		transactionRepo, sourceRepo, categoryRepo,
+		repository.NewBillPaymentRepository(pool), repository.NewBillRepository(pool), testkit.Logger(t),
+	)
 	return &ledgerFixture{
-		ctx:        context.Background(),
+		ctx:        ctx,
 		tx:         txSvc,
 		src:        service.NewSourceService(sourceRepo, txSvc),
 		sourceRepo: sourceRepo,
@@ -70,13 +77,14 @@ func (f *ledgerFixture) adjust(t *testing.T, sourceID uuid.UUID, amount int64, n
 
 func (f *ledgerFixture) createExpense(t *testing.T, sourceID, categoryID uuid.UUID, amount int64, merchant string) *entity.Transaction {
 	t.Helper()
-	tx, err := f.tx.CreateManual(f.ctx, service.CreateManualInput{
+	tx, err := f.tx.Create(f.ctx, service.CreateInput{
 		Type:        "expense",
 		OccurredAt:  timePtr(time.Now()),
 		AmountMinor: amount,
 		SourceID:    sourceID,
 		CategoryID:  &categoryID,
 		Merchant:    &merchant,
+		Origin:      "dashboard_manual",
 	})
 	require.NoError(t, err)
 	return tx
@@ -94,12 +102,13 @@ func TestTransferMirrorsLegs(t *testing.T) {
 	gopay := f.createSource(t, "GoPay", "ewallet", false)
 	f.adjust(t, bca.ID, 2_000_000, "saldo awal")
 
-	transfer, err := f.tx.CreateManual(f.ctx, service.CreateManualInput{
+	transfer, err := f.tx.Create(f.ctx, service.CreateInput{
 		Type:                "transfer",
 		OccurredAt:          timePtr(time.Now()),
 		AmountMinor:         500_000,
 		SourceID:            bca.ID,
 		DestinationSourceID: &gopay.ID,
+		Origin:              "dashboard_manual",
 	})
 	require.NoError(t, err)
 
@@ -168,7 +177,7 @@ func TestReversalLinkage(t *testing.T) {
 	assert.Equal(t, int64(470_000), f.balances(t)[gopay.ID])
 
 	note := "refund gojek"
-	reversal, err := f.tx.Reverse(f.ctx, gojek.ID, &note)
+	reversal, err := f.tx.Reverse(f.ctx, gojek.ID, &note, "dashboard_manual")
 	require.NoError(t, err)
 
 	require.NotNil(t, reversal.ReversesTransactionID)
@@ -189,7 +198,7 @@ func TestReversalLinkage(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, page.Rows, 2)
 	// Reversing a reversal is rejected.
-	_, err = f.tx.Reverse(f.ctx, reversal.ID, nil)
+	_, err = f.tx.Reverse(f.ctx, reversal.ID, nil, "dashboard_manual")
 	require.Error(t, err)
 }
 
@@ -219,4 +228,48 @@ func TestEditHistoryAndLegRewrite(t *testing.T) {
 	require.NoError(t, json.Unmarshal(updated.EditHistory, &history))
 	require.Len(t, history, 1)
 	assert.Contains(t, history[0]["changes"], "amount_minor")
+}
+
+// TestCategorizeUncategorizedExpense verifies the correction path the
+// bot needs: an expense the harness wrote without a category (parked in
+// Needs-Review) can be labelled afterwards, and the label counts as the
+// user's.
+func TestCategorizeUncategorizedExpense(t *testing.T) {
+	f := newLedgerFixture(t)
+
+	bca := f.createSource(t, "BCA", "bank", false)
+	f.adjust(t, bca.ID, 500_000, "saldo awal")
+	makanan := f.createCategory(t, "Makanan & Minuman")
+
+	merchant := "ketang goreng"
+	tx, err := f.tx.Create(f.ctx, service.CreateInput{
+		Type:        "expense",
+		OccurredAt:  timePtr(time.Now()),
+		AmountMinor: 10_000,
+		SourceID:    bca.ID,
+		Merchant:    &merchant,
+		Origin:      "whatsapp_text",
+	})
+	require.NoError(t, err)
+	require.Nil(t, tx.CategoryID)
+	assert.Equal(t, "needs_review", tx.ReviewStatus)
+
+	updated, err := f.tx.Update(f.ctx, tx.ID, service.UpdateInput{CategoryID: &makanan.ID})
+	require.NoError(t, err)
+
+	require.NotNil(t, updated.CategoryID)
+	assert.Equal(t, makanan.ID, *updated.CategoryID)
+	require.NotNil(t, updated.CategorySource)
+	assert.Equal(t, "user", *updated.CategorySource)
+	assert.Equal(t, "clean", updated.ReviewStatus)
+
+	// Legs keep the source and gain the category side.
+	require.Len(t, updated.Legs, 2)
+	assert.Equal(t, -int64(10_000), updated.Legs[0].SignedAmount)
+	require.NotNil(t, updated.Legs[0].SourceID)
+	assert.Equal(t, bca.ID, *updated.Legs[0].SourceID)
+	assert.Equal(t, int64(10_000), updated.Legs[1].SignedAmount)
+	require.NotNil(t, updated.Legs[1].CategoryID)
+	assert.Equal(t, makanan.ID, *updated.Legs[1].CategoryID)
+	assert.Equal(t, int64(490_000), f.balances(t)[bca.ID])
 }

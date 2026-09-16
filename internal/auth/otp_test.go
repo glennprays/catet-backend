@@ -13,6 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testPhone is any number at all: the OTP service no longer knows who
+// deserves a code — eligibility is the caller's policy.
+const testPhone = "+628000000000"
+
 // fakeStore keeps a single outstanding code; the clock is injectable.
 type fakeStore struct {
 	now  time.Time
@@ -44,17 +48,19 @@ func (s *fakeStore) Consume(_ context.Context, _ uuid.UUID) error {
 	return nil
 }
 
-type fakeSender struct{ codes []string }
+// fakeOtpSender is an auth.OtpSender, not a gateway.Sender: the OTP
+// service only ever needs "deliver this code".
+type fakeOtpSender struct{ codes []string }
 
-func (s *fakeSender) Send(_ context.Context, _ string, code string) error {
+func (s *fakeOtpSender) Send(_ context.Context, _ string, code string) error {
 	s.codes = append(s.codes, code)
 	return nil
 }
 
-func newTestOtpService(now time.Time) (*OtpService, *fakeStore, *fakeSender) {
+func newTestOtpService(now time.Time) (*OtpService, *fakeStore, *fakeOtpSender) {
 	store := &fakeStore{now: now}
-	sender := &fakeSender{}
-	svc := NewOtpService(store, sender, NewTokenService("test-secret"), "+628000000000", 5*time.Minute)
+	sender := &fakeOtpSender{}
+	svc := NewOtpService(store, sender, 5*time.Minute)
 	svc.now = func() time.Time { return now }
 	svc.randomCode = func() (string, error) { return "123456", nil }
 	return svc, store, sender
@@ -68,84 +74,78 @@ func kindOf(t *testing.T, err error) apperror.Kind {
 	return ae.Kind
 }
 
-func TestOtpRequest_WrongPhoneRejected(t *testing.T) {
-	svc, _, _ := newTestOtpService(time.Now())
-	err := svc.Request(context.Background(), "+628999999999")
-	assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
-}
-
 func TestOtpRequest_ResendWithinCooldownRateLimited(t *testing.T) {
 	now := time.Now()
-	svc, _, _ := newTestOtpService(now)
+	svc, _, sender := newTestOtpService(now)
 
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
-	err := svc.Request(context.Background(), "+628000000000")
+	require.NoError(t, svc.Request(context.Background(), testPhone))
+	err := svc.Request(context.Background(), testPhone)
 	assert.Equal(t, apperror.KindTooManyRequests, kindOf(t, err))
+	assert.Len(t, sender.codes, 1, "the throttled resend must not reach WhatsApp")
 
 	// After 61 seconds a new code goes out.
 	svc.now = func() time.Time { return now.Add(61 * time.Second) }
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
+	require.NoError(t, svc.Request(context.Background(), testPhone))
+	assert.Len(t, sender.codes, 2)
 }
 
-func TestOtpVerify_HappyPathIssuesToken(t *testing.T) {
+// A correct code proves the number once: the row is consumed, so a
+// replayed code (an intercepted message, a resent form) is worthless.
+func TestOtpCheck_HappyPathConsumesTheCode(t *testing.T) {
 	now := time.Now()
 	svc, _, _ := newTestOtpService(now)
 
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
-	token, expiresAt, err := svc.Verify(context.Background(), "+628000000000", "123456")
-	require.NoError(t, err)
-	assert.NotEmpty(t, token)
-	assert.True(t, expiresAt.After(now))
+	require.NoError(t, svc.Request(context.Background(), testPhone))
+	require.NoError(t, svc.Check(context.Background(), testPhone, "123456"))
 
-	// The code is consumed: replaying fails.
-	_, _, err = svc.Verify(context.Background(), "+628000000000", "123456")
+	err := svc.Check(context.Background(), testPhone, "123456")
 	assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
 }
 
-func TestOtpVerify_ExpiredCodeRejected(t *testing.T) {
+func TestOtpCheck_ExpiredCodeRejected(t *testing.T) {
 	now := time.Now()
 	svc, _, _ := newTestOtpService(now)
 
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
+	require.NoError(t, svc.Request(context.Background(), testPhone))
 	svc.now = func() time.Time { return now.Add(6 * time.Minute) } // TTL is 5 min
 
-	_, _, err := svc.Verify(context.Background(), "+628000000000", "123456")
+	err := svc.Check(context.Background(), testPhone, "123456")
 	assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
 }
 
 // Wrong codes count up; the 5th invalidates the code — even the
 // correct code stops working afterwards (fail closed).
-func TestOtpVerify_AttemptsExceededInvalidates(t *testing.T) {
+func TestOtpCheck_AttemptsExceededInvalidates(t *testing.T) {
 	now := time.Now()
 	svc, _, _ := newTestOtpService(now)
 
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
+	require.NoError(t, svc.Request(context.Background(), testPhone))
 
 	for i := 1; i <= 4; i++ {
-		_, _, err := svc.Verify(context.Background(), "+628000000000", "000000")
+		err := svc.Check(context.Background(), testPhone, "000000")
 		assert.Equal(t, apperror.KindBadRequest, kindOf(t, err), "attempt %d", i)
 	}
 
 	// 5th bad try: code invalidated.
-	_, _, err := svc.Verify(context.Background(), "+628000000000", "000000")
+	err := svc.Check(context.Background(), testPhone, "000000")
 	assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
 	assert.Contains(t, err.Error(), "attempts_exceeded")
 
 	// Even the correct code is dead now.
-	_, _, err = svc.Verify(context.Background(), "+628000000000", "123456")
+	err = svc.Check(context.Background(), testPhone, "123456")
 	assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
 }
 
-// Four wrong tries followed by the right one still verifies.
-func TestOtpVerify_FourWrongThenRight(t *testing.T) {
+// Four wrong tries followed by the right one still verifies: the limit
+// exists to stop brute force, not to punish a typo.
+func TestOtpCheck_FourWrongThenRight(t *testing.T) {
 	now := time.Now()
 	svc, _, _ := newTestOtpService(now)
 
-	require.NoError(t, svc.Request(context.Background(), "+628000000000"))
+	require.NoError(t, svc.Request(context.Background(), testPhone))
 	for range 4 {
-		_, _, err := svc.Verify(context.Background(), "+628000000000", "000000")
+		err := svc.Check(context.Background(), testPhone, "000000")
 		assert.Equal(t, apperror.KindBadRequest, kindOf(t, err))
 	}
-	_, _, err := svc.Verify(context.Background(), "+628000000000", "123456")
-	require.NoError(t, err)
+	require.NoError(t, svc.Check(context.Background(), testPhone, "123456"))
 }

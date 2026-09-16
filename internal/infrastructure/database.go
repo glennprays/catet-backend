@@ -13,15 +13,16 @@ import (
 )
 
 // NewPool opens the pgx connection pool used by every repository.
-// The pool is small on purpose: the API serves exactly one user, so
-// four connections cover concurrent request handling without holding
-// idle Postgres backends.
+// The pool stays small on purpose: the API serves a handful of invited
+// users, so ten connections cover concurrent request handling — HTTP
+// plus the bot's own goroutines — without holding idle Postgres
+// backends on a self-hosted box.
 func NewPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = 10
 	poolCfg.MinConns = 0
 	poolCfg.MaxConnLifetime = time.Hour
 	poolCfg.MaxConnIdleTime = 15 * time.Minute

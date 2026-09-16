@@ -15,13 +15,66 @@ type OtpRequestData struct {
 	Sent bool `json:"sent"`
 }
 
-type OtpVerifyData struct {
+// SessionData is what every successful authentication returns. The
+// token never reaches the browser: the Next.js BFF turns it into the
+// httpOnly session cookie.
+type SessionData struct {
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// InviteInfoData is what the register page may know before anybody has
+// proved anything: which number this link is for.
+type InviteInfoData struct {
+	Phone     string    `json:"phone"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type ResetTokenData struct {
+	ResetToken string    `json:"reset_token"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 type MeData struct {
-	Phone string `json:"phone"`
+	ID          uuid.UUID `json:"id"`
+	Phone       string    `json:"phone"`
+	DisplayName string    `json:"display_name"`
+	IsAdmin     bool      `json:"is_admin"`
+}
+
+type OKData struct {
+	OK bool `json:"ok"`
+}
+
+// ----------------------------------------------------------------- users
+
+// UserData is one row of the admin users list.
+type UserData struct {
+	ID            uuid.UUID  `json:"id"`
+	Phone         string     `json:"phone"`
+	DisplayName   string     `json:"display_name"`
+	IsAdmin       bool       `json:"is_admin"`
+	DeactivatedAt *time.Time `json:"deactivated_at"`
+	LastLoginAt   *time.Time `json:"last_login_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+type UsersData struct {
+	Users []UserData `json:"users"`
+}
+
+// InviteData never carries the token: the link exists only in the
+// WhatsApp message and — for the gateway-down case — in the operator
+// CLI's output.
+type InviteData struct {
+	ID        uuid.UUID `json:"id"`
+	Phone     string    `json:"phone"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type InvitesData struct {
+	Invites []InviteData `json:"invites"`
 }
 
 // --------------------------------------------------------------- sources
@@ -87,6 +140,18 @@ type BillsData struct {
 	Bills []entity.Bill `json:"bills"`
 }
 
+// BillPaymentData is the result of settling one occurrence: the bill as
+// it now stands plus the transaction that paid it, so the dashboard can
+// refresh both without a second round trip.
+type BillPaymentData struct {
+	Bill        *entity.Bill        `json:"bill"`
+	Transaction *entity.Transaction `json:"transaction"`
+}
+
+type BillPaymentsData struct {
+	Payments []entity.BillPayment `json:"payments"`
+}
+
 // ---------------------------------------------------------------- budgets
 
 type BudgetsData struct {
@@ -97,8 +162,9 @@ type BudgetsData struct {
 // -------------------------------------------------------------- overview
 
 type BadgeCounts struct {
-	NeedsReview int64 `json:"needs_review"`
-	HoldQueue   int64 `json:"hold_queue"`
+	NeedsReview  int64 `json:"needs_review"`
+	HoldQueue    int64 `json:"hold_queue"`
+	BillsOverdue int64 `json:"bills_overdue"`
 }
 
 type OverviewData struct {
@@ -185,8 +251,14 @@ type HoldQueueData struct {
 	Items []entity.PendingAction `json:"items"`
 }
 
+// ResolvedData reports the decision and, when confirming executed a
+// parked draft, the transactions it wrote. A receipt writes one per
+// line; TransactionID stays as the first of them so existing clients
+// keep working.
 type ResolvedData struct {
-	Resolved bool `json:"resolved"`
+	Resolved       bool        `json:"resolved"`
+	TransactionID  *uuid.UUID  `json:"transaction_id,omitempty"`
+	TransactionIDs []uuid.UUID `json:"transaction_ids,omitempty"`
 }
 
 // ----------------------------------------------------------------- misc
@@ -200,6 +272,8 @@ type BillActiveData struct {
 }
 
 type SettingsData struct {
-	IncomeHorizonDays int    `json:"income_horizon_days"`
-	Phone             string `json:"phone"`
+	IncomeHorizonDays      int        `json:"income_horizon_days"`
+	PhotoDefaultSourceID   *uuid.UUID `json:"photo_default_source_id"`
+	PhotoDefaultSourceName *string    `json:"photo_default_source_name"`
+	ReminderHour           int        `json:"reminder_hour"`
 }

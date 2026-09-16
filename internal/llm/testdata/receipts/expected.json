@@ -1,0 +1,7 @@
+[
+  {"file":"000.jpg","merchant":"BOOK TA","total_minor":900,"date":"2018-12-25","legible":true,"has_total":true,"currency":"MYR"},
+  {"file":"001.jpg","merchant":"INDAH GIFT","total_minor":6030,"date":"2018-10-19","legible":true,"has_total":true,"currency":"MYR"},
+  {"file":"010.jpg","merchant":"SAM SAM","total_minor":1410,"date":"2017-12-29","legible":true,"has_total":true,"currency":"MYR"},
+  {"file":"000_dirty.jpg","legible":false},
+  {"file":"010_top.jpg","legible":true,"has_total":false}
+]

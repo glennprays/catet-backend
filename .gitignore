@@ -26,3 +26,8 @@ go.work.sum
 .env
 .DS_Store
 !/misc/develop/.env
+
+# Host build artefacts (make build / go build output)
+/catet
+/main
+/tmp/

@@ -1,8 +1,26 @@
 # catet
 
-A self-hosted, WhatsApp-first personal finance tracker for one user. Deterministic core owns all numbers; the AI only parses language in and narrates results out.
+A self-hosted, WhatsApp-first personal finance tracker for a small, invited set of users, each with their own ledger and WhatsApp number. Deterministic core owns all numbers; the AI only parses language in and narrates results out.
 
 ## Language
+
+### Accounts
+
+**Installed app**:
+The dashboard opened from the phone home screen (manifest `display: standalone`). Same session rules as a browser tab, but iOS keeps a separate cookie jar, so a Safari session is not shared with it.
+_Avoid_: native app, mobile app
+
+**Invite**:
+A phone-bound, single-use token, valid 7 days, that lets one number register. Created by the admin, delivered by the bot over WhatsApp; there is no other way to get an account.
+_Avoid_: signup link, referral
+
+**Session epoch**:
+A per-user counter embedded in the session token. Bumping it (password change, reset, log out everywhere, deactivation) signs every device out at once, with no revocation list.
+_Avoid_: token version, session store
+
+**User**:
+An account: a phone, a display name, a password, and its own ledger. Every user-owned row carries the user's id; nothing is shared between users.
+_Avoid_: owner, tenant, member
 
 ### Core records
 
@@ -67,8 +85,16 @@ _Avoid_: pending draft, queued action
 ### Planning & awareness
 
 **Bill**:
-An expected recurring obligation (rent, subscription, installment) with a cadence and an estimated amount band. Feeds reservations and the due calendar; incoming payments auto-match against it.
+An expected obligation — recurring or one-time (rent, subscription, installment) — with a cadence and an estimated amount band. Feeds reservations and the due calendar; incoming payments auto-match against it.
 _Avoid_: subscription, recurring expense, fixed cost
+
+**Bill Payment**:
+A transaction that settled one occurrence of a Bill; advances the Bill to its next due date, or completes it.
+_Avoid_: bill transaction, installment payment
+
+**Reminder Digest**:
+The once-a-day WhatsApp message listing the user's opted-in Bills by due day; never states amounts.
+_Avoid_: notification, alert, push
 
 **Reserved**:
 Money spoken for by upcoming Bills and active Goal commitments. Excluded from Safe-to-Spend.

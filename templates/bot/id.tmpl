@@ -1,0 +1,299 @@
+{{/* Indonesian bot copy. Every user-visible string lives here; Go code
+never concatenates copy. Money arrives already formatted, so the slots
+below must not add currency marks.
+
+One voice, warm and professional: the bot says "aku" and calls the user
+"kamu". A reply opens with a lead-in that says where we are — "Sip,"
+when something is done, "Oke," when something is acknowledged, "Hmm,"
+when the bot is unsure, "Aduh," when the fault is ours. A soft "ya"
+closes an instruction so it reads as a request, not an order. Questions,
+refusals and errors are full sentences; a confirmation keeps one compact
+fact line after the lead-in, with the existing " · " separators. No
+exclamation marks, no emoji, no "lu/gue", no "Anda". */}}
+
+{{/* Confirmations never quote a balance: a WhatsApp thread is readable
+from a notification shade and over someone's shoulder. Safe-to-Spend and
+runway are reported only by the rituals below, which the user asks for
+by name. */}}
+
+{{define "recorded_one" -}}
+Sip, tercatat: {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · {{.Category}} · {{.Source}}{{if .Backdated}} · {{.Date}}{{end}}
+{{- end}}
+
+{{define "recorded_income" -}}
+Sip, masuk {{.Amount}} · {{.Merchant}} · ke {{.Source}}
+{{- end}}
+
+{{define "recorded_transfer" -}}
+Sip, pindah {{.Amount}} · {{.Source}} → {{.Destination}}
+{{- end}}
+
+{{define "recorded_many" -}}
+Sip, {{len .Items}} transaksi tercatat:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · {{.Category}} · {{.Source}}
+{{end}}Kalau ada yang salah, balas "batal" untuk hapus semua atau "batal 2" untuk nomor 2.
+{{- end}}
+
+{{define "uncategorized" -}}
+belum ada kategori
+{{- end}}
+
+{{define "hold_saved" -}}
+Aku tahan dulu: {{.Summary}}
+{{.Question}}
+{{- end}}
+
+{{define "hold_to_dashboard" -}}
+Aku simpan sebagai draft dulu, lengkapi di dashboard ya.
+{{- end}}
+
+{{define "q_amount" -}}
+Nominalnya berapa?
+{{- end}}
+
+{{define "q_amount_roles" -}}
+Ada dua angka nih — mana yang dibayar, mana kembaliannya? Contoh: "bayar 50rb kembali 25rb".
+{{- end}}
+
+{{define "q_source" -}}
+Bayar pakai sumber mana? {{join .Sources " / "}}
+{{- end}}
+
+{{define "q_destination" -}}
+Dipindah ke mana? {{join .Sources " / "}}
+{{- end}}
+
+{{define "q_refund_target" -}}
+Refund untuk {{.Merchant}} {{.Amount}} ({{.Date}}), betul? Balas ya/tidak.
+{{- end}}
+
+{{define "refund_done" -}}
+Oke, refund {{.Merchant}} {{.Amount}} sudah kukembalikan ke {{.Source}}.
+{{- end}}
+
+{{define "refund_no_target" -}}
+Aku nggak nemu transaksi {{.Merchant}} dalam 30 hari terakhir. Coba cek di dashboard ya.
+{{- end}}
+
+{{define "batal_done" -}}
+Oke, {{len .Items}} transaksi kubatalkan:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}
+{{end}}
+{{- end}}
+
+{{define "batal_nothing" -}}
+Nggak ada yang bisa dibatalkan dari chat. Hapus lewat dashboard ya.
+{{- end}}
+
+{{define "batal_bad_index" -}}
+Nomor {{.N}} nggak ada — batch terakhir cuma {{.Count}} item.
+{{- end}}
+
+{{define "discarded" -}}
+Oke, kubuang. Nggak ada yang ditulis.
+{{- end}}
+
+{{define "no_open_question" -}}
+Nggak ada yang lagi nunggu jawaban.
+{{- end}}
+
+{{/* Sent whenever a message arrives that does not settle the open
+draft: the question survives the detour instead of stranding the draft. */}}
+{{define "open_question_reminder" -}}
+Aku masih nunggu jawaban buat: {{.Summary}}. Balas "ya"/"tidak", atau sebut sumbernya ya.
+{{- end}}
+
+{{define "unknown" -}}
+Hmm, aku belum nangkep maksudnya. Kalau mau catat pengeluaran, ketik misalnya "kopi 25k pakai gopay"; buat lihat ringkasan, ketik "rekap"; buat koreksi, "itu kategori makanan".
+{{- end}}
+
+{{define "corrected" -}}
+{{if eq .Type "transfer"}}Oke, kuperbaiki: pindah {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Oke, kuperbaiki: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}
+{{- end}}
+
+{{define "correct_nothing" -}}
+Belum ada transaksi dari chat yang bisa kuubah. Ubah lewat dashboard ya.
+{{- end}}
+
+{{define "correct_failed" -}}
+{{.Field}} untuk transaksi itu nggak bisa kuubah dari chat. Ubah lewat dashboard ya.
+{{- end}}
+
+{{/* Balances are quoted only here: the user asked for them by name. */}}
+{{define "balance_one" -}}
+{{.Source}}: {{.Balance}}
+{{- end}}
+
+{{define "balance_all" -}}
+{{range .Items}}{{.Source}}: {{.Balance}}
+{{end}}Safe-to-Spend {{.Sts}}
+{{- end}}
+
+{{define "unsupported_media" -}}
+Kirim sebagai foto ya — video, audio, dan dokumen belum bisa kubaca.
+{{- end}}
+
+{{/* Receipt photos. A photo never writes: it becomes a draft the user
+confirms with "ya". Every refusal below says what to do next, because a
+re-shot photo is cheap and a wrong number is not. */}}
+
+{{/* The problem word is chosen here, not in Go: the same issue code has
+to read naturally in each language. */}}
+{{define "photo_issue" -}}
+{{if eq . "blur"}}buram{{else if eq . "glare"}}kena pantulan cahaya{{else if eq . "too_small"}}terlalu kecil{{else if eq . "cropped"}}terpotong{{else if eq . "download"}}gagal diunduh{{else}}tidak terbaca{{end}}
+{{- end}}
+
+{{define "photo_unreadable" -}}
+Fotonya {{template "photo_issue" .Issue}}, aku nggak yakin sama angkanya. Coba foto ulang lebih dekat, rata, dan terang ya.
+{{- end}}
+
+{{define "photo_no_total" -}}
+Baris TOTAL-nya belum kelihatan. Foto bagian bawah struknya ya — cukup yang ada totalnya.
+{{- end}}
+
+{{define "photo_not_receipt" -}}
+Hmm, ini kayaknya bukan struk atau bukti bayar. Kalau mau kucatat, ketik nominalnya ya.
+{{- end}}
+
+{{define "photo_statement" -}}
+Mutasi atau tagihan yang isinya banyak transaksi belum bisa kubaca. Kirim struknya satu per satu ya.
+{{- end}}
+
+{{define "photo_currency" -}}
+Mata uang {{.Currency}} belum kudukung, cuma Rupiah dulu ya.
+{{- end}}
+
+{{define "photo_too_large" -}}
+Fotonya kegedean nih. Kirim sebagai foto biasa (bukan HD/dokumen) ya.
+{{- end}}
+
+{{define "photo_duplicate" -}}
+Foto ini sudah pernah kamu kirim: {{.Summary}}
+{{- end}}
+
+{{define "photo_llm_off" -}}
+Baca struk lagi nonaktif. Ketik nominalnya aja ya.
+{{- end}}
+
+{{/* The Hold Queue row label, also the first line of the question. */}}
+{{define "receipt_summary" -}}
+{{if .Duplicate}}Mungkin duplikat · {{end}}{{if .Payment}}Bukti bayar {{.Merchant}} · {{.Total}}{{else}}Struk {{.Merchant}} · {{.Date}} · {{.N}} item · {{.Total}}{{end}}{{if .Collapsed}} · rincian tidak konsisten{{end}}
+{{- end}}
+
+{{/* The Source line says how the Source was decided: a remembered or
+default Source is hedged with "(biasanya)" and a model guess with "?",
+so the user knows when a correction is expected of them. */}}
+{{define "receipt_hold" -}}
+{{.Summary}}
+{{range .Items}}• {{.Name}} {{.Amount}}{{if .Category}} · {{.Category}}{{end}}
+{{end}}{{if gt .More 0}}…dan {{.More}} lainnya
+{{end}}{{if .AskSource}}Bayar dari mana? {{join .Sources " / "}}{{else}}Bayar dari {{.Source}}{{if or (eq .Basis "memory") (eq .Basis "default")}} (biasanya).{{else if eq .Basis "guess"}}?{{else}}.{{end}}
+Balas "ya" kalau sudah pas, "tidak" untuk buang. Mau ganti sumber atau kategori? Tinggal bilang.{{end}}
+{{- end}}
+
+{{define "receipt_recorded" -}}
+Sip, {{.N}} baris dari {{.Merchant}} tercatat · {{.Total}} dari {{.Source}}. Kalau salah, ketik "batal" ya.
+{{- end}}
+
+{{/* One message may change several things about the draft at once;
+.Change is the " · "-join of the fragments below. */}}
+{{define "receipt_updated" -}}
+Oke, {{.Change}}. Sudah pas? Balas ya/tidak.
+{{- end}}
+
+{{define "receipt_need_source" -}}
+Bayar dari mana dulu? {{join .Sources " / "}}
+{{- end}}
+
+{{define "receipt_default_learned" -}}
+Struk berikutnya kuanggap dari {{.Source}} kecuali tertulis lain — bisa kamu ubah di Settings.
+{{- end}}
+
+{{define "receipt_split_mismatch" -}}
+Hmm, jumlahnya nggak pas: {{.Parts}} ≠ {{.Total}}. Coba lagi ya.
+{{- end}}
+
+{{define "receipt_split_unknown_source" -}}
+Sumbernya nggak kukenal. Pilihannya: {{join .Sources " / "}}
+{{- end}}
+
+{{define "receipt_change_source" -}}
+dari {{.Source}}
+{{- end}}
+
+{{define "receipt_change_split" -}}
+{{range $i, $p := .Payments}}{{if $i}} · {{end}}{{$p.Source}} {{$p.Amount}}{{end}}
+{{- end}}
+
+{{define "receipt_change_category" -}}
+kategori {{.Category}}
+{{- end}}
+
+{{define "receipt_change_merchant" -}}
+merchant {{.Merchant}}
+{{- end}}
+
+{{define "receipt_change_date" -}}
+tanggal {{.Date}}
+{{- end}}
+
+{{define "rekap_hari" -}}
+Hari ini kamu keluar {{.Spent}} · Safe-to-Spend {{.Sts}} · besok reserved {{.ReservedTomorrow}} · {{.Uncategorized}} belum kategori{{if .DueTomorrow}} · besok jatuh tempo: {{join .DueTomorrow ", "}}{{end}}{{if .Overdue}} · {{.Overdue}} terlambat{{end}}{{if .Verdict}}
+{{.Verdict}}{{end}}
+{{- end}}
+
+{{define "rekap_minggu" -}}
+Minggu ini kamu keluar {{.Spent}} ({{.Delta}} vs minggu lalu)
+Hari yang beda dari biasanya: {{if .AnomalyDays}}{{join .AnomalyDays ", "}}{{else}}tidak ada{{end}}
+{{.Uncategorized}} belum kategori
+Teratas: {{range $i, $t := .Top}}{{if $i}} · {{end}}{{$t.Name}} {{$t.Amount}}{{end}}{{if .Verdict}}
+{{.Verdict}}{{end}}
+{{- end}}
+
+{{define "error_generic" -}}
+Aduh, ada yang error di sisiku. Coba lagi sebentar ya.
+{{- end}}
+
+{{define "invite_sent" -}}
+Kamu diundang ke catet. Daftar lewat link ini (berlaku 7 hari): {{.URL}}
+Kalau link ini kamu terima lagi, pakai yang terbaru.
+{{- end}}
+
+{{define "bill_reminder" -}}
+Pengingat tagihan
+{{- if .Overdue}}
+Terlambat: {{join .Overdue ", "}}{{end}}
+{{- if .Today}}
+Hari ini: {{join .Today ", "}}{{end}}
+{{- if .Tomorrow}}
+Besok: {{join .Tomorrow ", "}}{{end}}
+{{- if .InThree}}
+3 hari lagi: {{join .InThree ", "}}{{end}}
+Balas *lunas <nominal>* setelah bayar.
+{{- end}}
+
+{{define "lunas_none" -}}
+Tidak ada tagihan yang cocok.
+{{- end}}
+
+{{define "lunas_choose" -}}
+Tagihan mana?
+{{range .Items}}{{.}}
+{{end}}Balas nomornya.
+{{- end}}
+
+{{define "lunas_amount" -}}
+Berapa nominal untuk {{.Name}}?
+{{- end}}
+
+{{define "lunas_source" -}}
+{{.Name}} belum punya sumber dana. Bayar pakai apa? {{join .Sources " · "}}
+{{- end}}
+
+{{define "lunas_done" -}}
+Lunas: {{.Name}} {{.Amount}}. Berikutnya {{.Next}}.
+{{- end}}
+
+{{define "lunas_completed" -}}
+selesai
+{{- end}}

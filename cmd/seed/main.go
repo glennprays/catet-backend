@@ -1,6 +1,7 @@
-// Command seed rebuilds a deterministic development dataset: sources
-// with opening balances, a category tree, a month of transactions,
-// bills, budgets, and one parked bot action.
+// Command seed rebuilds a deterministic development dataset owned by
+// one demo account (+628000000001): sources with opening balances, a
+// category tree, a month of transactions, bills, budgets, and one
+// parked bot action.
 //
 // It is destructive by design (dev data only) and refuses to run
 // against a database that is not the configured development one.
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/glennprays/catet-backend/internal/service"
 )
 
 var jakarta = time.FixedZone("WIB", 7*60*60)
@@ -72,70 +75,93 @@ func seed(ctx context.Context, conn *pgx.Conn) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Same wipe list as testkit.TruncateAll, named explicitly rather
+	// than left to CASCADE so the set is reviewable.
 	if _, err := tx.Exec(ctx,
-		`TRUNCATE legs, transactions, categories, sources, bills, budgets,
-		         pending_actions, otp_codes CASCADE`,
+		`TRUNCATE legs, transactions, categories, sources, bills, budgets, tags,
+		         bot_chat_state, inbound_messages, pending_actions, otp_codes,
+		         password_resets, invites, user_settings, users CASCADE`,
 	); err != nil {
 		return fmt.Errorf("truncate: %w", err)
 	}
 
-	categories, err := seedCategories(ctx, tx)
+	// Every row below is owned by one demo account: the dataset is only
+	// useful if it looks like a real tenant's ledger.
+	userID, err := seedDemoUser(ctx, tx)
 	if err != nil {
 		return err
 	}
-	sources, err := seedSources(ctx, tx)
+
+	categories, err := seedCategories(ctx, tx, userID)
 	if err != nil {
 		return err
 	}
-	if err := seedTransactions(ctx, tx, sources, categories); err != nil {
+	sources, err := seedSources(ctx, tx, userID)
+	if err != nil {
 		return err
 	}
-	if err := seedBillsAndBudgets(ctx, tx, categories); err != nil {
+	if err := seedTransactions(ctx, tx, userID, sources, categories); err != nil {
 		return err
 	}
-	if err := seedPendingAction(ctx, tx); err != nil {
+	if err := seedBillsAndBudgets(ctx, tx, userID, categories); err != nil {
+		return err
+	}
+	if err := seedPendingAction(ctx, tx, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-func seedCategories(ctx context.Context, tx pgx.Tx) (map[string]string, error) {
-	roots := []struct {
-		name      string
-		essential bool
-	}{
-		{"Makanan & Minuman", true},
-		{"Transportasi", true},
-		{"Tagihan", true},
-		{"Belanja", false},
-		{"Hiburan", false},
-		{"Penghasilan", false},
+// seedDemoUser creates the account the whole dataset hangs off. It has
+// no password: dev login goes through "Lupa kata sandi", same as the
+// bootstrap admin on a real install.
+func seedDemoUser(ctx context.Context, tx pgx.Tx) (string, error) {
+	var id string
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO users (phone, display_name) VALUES ('+628000000001', 'Demo') RETURNING id`,
+	).Scan(&id); err != nil {
+		return "", fmt.Errorf("insert demo user: %w", err)
 	}
+	// Settings are per user now; the row is expected to exist for every
+	// account, so the seed creates it exactly like Register does.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO user_settings (user_id) VALUES ($1)`, id,
+	); err != nil {
+		return "", fmt.Errorf("insert demo user settings: %w", err)
+	}
+	return id, nil
+}
+
+// seedCategories builds the same tree a fresh signup gets
+// (service.DefaultCategories), so a seeded dev database and a real
+// account can never drift apart.
+func seedCategories(ctx context.Context, tx pgx.Tx, userID string) (map[string]string, error) {
 	ids := map[string]string{}
-	for _, root := range roots {
+	for _, root := range service.DefaultCategories {
 		var id string
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO categories (name, essential) VALUES ($1, $2) RETURNING id`,
-			root.name, root.essential,
+			`INSERT INTO categories (user_id, name, essential) VALUES ($1, $2, $3) RETURNING id`,
+			userID, root.Name, root.Essential,
 		).Scan(&id); err != nil {
-			return nil, fmt.Errorf("insert category %s: %w", root.name, err)
+			return nil, fmt.Errorf("insert category %s: %w", root.Name, err)
 		}
-		ids[root.name] = id
-	}
-	for _, child := range []string{"Listrik", "Internet"} {
-		var id string
-		if err := tx.QueryRow(ctx,
-			`INSERT INTO categories (name, parent_id, essential) VALUES ($1, $2, true) RETURNING id`,
-			child, ids["Tagihan"],
-		).Scan(&id); err != nil {
-			return nil, fmt.Errorf("insert category %s: %w", child, err)
+		ids[root.Name] = id
+
+		for _, child := range root.Children {
+			var childID string
+			if err := tx.QueryRow(ctx,
+				`INSERT INTO categories (user_id, name, parent_id, essential) VALUES ($1, $2, $3, true) RETURNING id`,
+				userID, child, id,
+			).Scan(&childID); err != nil {
+				return nil, fmt.Errorf("insert category %s: %w", child, err)
+			}
+			ids[child] = childID
 		}
-		ids[child] = id
 	}
 	return ids, nil
 }
 
-func seedSources(ctx context.Context, tx pgx.Tx) (map[string]string, error) {
+func seedSources(ctx context.Context, tx pgx.Tx, userID string) (map[string]string, error) {
 	specs := []sourceSpec{
 		{"BCA", "bank", false, 8_250_000},
 		{"Cash", "cash", false, 750_000},
@@ -147,8 +173,8 @@ func seedSources(ctx context.Context, tx pgx.Tx) (map[string]string, error) {
 	for _, spec := range specs {
 		var id string
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO sources (name, type, is_debt) VALUES ($1, $2, $3) RETURNING id`,
-			spec.name, spec.kind, spec.isDebt,
+			`INSERT INTO sources (user_id, name, type, is_debt) VALUES ($1, $2, $3, $4) RETURNING id`,
+			userID, spec.name, spec.kind, spec.isDebt,
 		).Scan(&id); err != nil {
 			return nil, fmt.Errorf("insert source %s: %w", spec.name, err)
 		}
@@ -158,6 +184,7 @@ func seedSources(ctx context.Context, tx pgx.Tx) (map[string]string, error) {
 		// exactly what POST /sources/{id}/adjustments writes.
 		note := "Saldo awal"
 		txID, err := insertTransaction(ctx, tx, transactionRow{
+			userID:     userID,
 			occurredAt: opened,
 			kind:       "adjustment",
 			note:       &note,
@@ -175,7 +202,7 @@ func seedSources(ctx context.Context, tx pgx.Tx) (map[string]string, error) {
 	return ids, nil
 }
 
-func seedTransactions(ctx context.Context, tx pgx.Tx, sources, categories map[string]string) error {
+func seedTransactions(ctx context.Context, tx pgx.Tx, userID string, sources, categories map[string]string) error {
 	specs := []txSpec{
 		{kind: "income", amount: 9_500_000, source: "BCA", category: "Penghasilan", merchant: "Gaji", daysAgo: 13},
 		{kind: "expense", amount: 156_000, source: "BCA", category: "Belanja", merchant: "Shopee", daysAgo: 9, needsReview: true, confidence: 0.62},
@@ -190,6 +217,7 @@ func seedTransactions(ctx context.Context, tx pgx.Tx, sources, categories map[st
 
 	for _, spec := range specs {
 		row := transactionRow{
+			userID:     userID,
 			occurredAt: jakartaDay(spec.daysAgo),
 			kind:       spec.kind,
 			merchant:   ptr(spec.merchant),
@@ -241,7 +269,7 @@ func seedTransactions(ctx context.Context, tx pgx.Tx, sources, categories map[st
 	return nil
 }
 
-func seedBillsAndBudgets(ctx context.Context, tx pgx.Tx, categories map[string]string) error {
+func seedBillsAndBudgets(ctx context.Context, tx pgx.Tx, userID string, categories map[string]string) error {
 	bills := []struct {
 		name     string
 		min, max int64
@@ -255,9 +283,9 @@ func seedBillsAndBudgets(ctx context.Context, tx pgx.Tx, categories map[string]s
 	for _, bill := range bills {
 		categoryID := categories[bill.category]
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO bills (name, amount_min_minor, amount_max_minor, cadence, next_due_date, category_id)
-			 VALUES ($1, $2, $3, 'monthly', $4, $5)`,
-			bill.name, bill.min, bill.max, jakartaDay(-bill.dueInDay).Format("2006-01-02"), categoryID,
+			`INSERT INTO bills (user_id, name, amount_min_minor, amount_max_minor, cadence, next_due_date, category_id)
+			 VALUES ($1, $2, $3, $4, 'monthly', $5, $6)`,
+			userID, bill.name, bill.min, bill.max, jakartaDay(-bill.dueInDay).Format("2006-01-02"), categoryID,
 		); err != nil {
 			return fmt.Errorf("insert bill %s: %w", bill.name, err)
 		}
@@ -274,8 +302,8 @@ func seedBillsAndBudgets(ctx context.Context, tx pgx.Tx, categories map[string]s
 	}
 	for _, budget := range budgets {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO budgets (category_id, period, amount_minor) VALUES ($1, $2, $3)`,
-			categories[budget.category], period, budget.amount,
+			`INSERT INTO budgets (user_id, category_id, period, amount_minor) VALUES ($1, $2, $3, $4)`,
+			userID, categories[budget.category], period, budget.amount,
 		); err != nil {
 			return fmt.Errorf("insert budget %s: %w", budget.category, err)
 		}
@@ -283,14 +311,15 @@ func seedBillsAndBudgets(ctx context.Context, tx pgx.Tx, categories map[string]s
 	return nil
 }
 
-func seedPendingAction(ctx context.Context, tx pgx.Tx) error {
+func seedPendingAction(ctx context.Context, tx pgx.Tx, userID string) error {
 	params := fmt.Sprintf(
 		`{"type":"expense","amount_minor":75000,"source":"BCA","category":"Belanja","merchant":"Tokopedia","occurred_date":%q}`,
 		jakartaDay(1).Format("2006-01-02"),
 	)
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO pending_actions (kind, params, summary) VALUES ('create_transaction', $1::jsonb, $2)`,
-		params, "Catat belanja Tokopedia Rp75.000?",
+		`INSERT INTO pending_actions (user_id, kind, params, summary)
+		 VALUES ($1, 'create_transaction', $2::jsonb, $3)`,
+		userID, params, "Catat belanja Tokopedia Rp75.000?",
 	); err != nil {
 		return fmt.Errorf("insert pending action: %w", err)
 	}
@@ -300,6 +329,7 @@ func seedPendingAction(ctx context.Context, tx pgx.Tx) error {
 // ------------------------------------------------------------ helpers
 
 type transactionRow struct {
+	userID         string
 	occurredAt     time.Time
 	kind           string
 	merchant       *string
@@ -324,11 +354,11 @@ func insertTransaction(ctx context.Context, tx pgx.Tx, row transactionRow) (stri
 	var id string
 	err := tx.QueryRow(ctx,
 		`INSERT INTO transactions
-		   (occurred_at, origin, type, merchant, note, category_id,
+		   (user_id, occurred_at, origin, type, merchant, note, category_id,
 		    category_source, category_confidence, review_status)
-		 VALUES ($1, 'dashboard_manual', $2, $3, $4, $5, $6, $7, $8)
+		 VALUES ($1, $2, 'dashboard_manual', $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id`,
-		row.occurredAt, row.kind, row.merchant, row.note, row.categoryID,
+		row.userID, row.occurredAt, row.kind, row.merchant, row.note, row.categoryID,
 		row.categorySource, row.confidence, status,
 	).Scan(&id)
 	if err != nil {

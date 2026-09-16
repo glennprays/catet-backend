@@ -6,6 +6,7 @@ import (
 	"github.com/glennprays/catet-backend/internal/params/response"
 	"github.com/glennprays/catet-backend/internal/service"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
 
 // HoldQueueHandler serves /hold-queue and its resolve endpoint.
@@ -34,8 +35,29 @@ func (h *HoldQueueHandler) Resolve(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.svc.Resolve(c.UserContext(), id, req.Action); err != nil {
+	var overrides *service.PendingOverrides
+	if req.Overrides != nil {
+		overrides = &service.PendingOverrides{
+			AmountMinor:         req.Overrides.AmountMinor,
+			SourceID:            req.Overrides.SourceID,
+			DestinationSourceID: req.Overrides.DestinationSourceID,
+			CategoryID:          req.Overrides.CategoryID,
+			Merchant:            req.Overrides.Merchant,
+			Note:                req.Overrides.Note,
+			OccurredDate:        req.Overrides.OccurredDate,
+		}
+	}
+	txs, err := h.svc.Resolve(c.UserContext(), id, req.Action, overrides)
+	if err != nil {
 		return err
 	}
-	return httperror.OK(c, response.ResolvedData{Resolved: true})
+	out := response.ResolvedData{Resolved: true}
+	if len(txs) > 0 {
+		out.TransactionID = &txs[0].ID
+		out.TransactionIDs = make([]uuid.UUID, 0, len(txs))
+		for _, tx := range txs {
+			out.TransactionIDs = append(out.TransactionIDs, tx.ID)
+		}
+	}
+	return httperror.OK(c, out)
 }

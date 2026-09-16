@@ -4,8 +4,7 @@ import (
 	"context"
 
 	"github.com/glennprays/catet-backend/config"
-	"github.com/glennprays/catet-backend/internal/repository"
-	"github.com/glennprays/catet-backend/internal/service"
+	waga "github.com/glennprays/whatsapp-gateway-sdk-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -16,7 +15,9 @@ func ProvidePool(cfg *config.Config) (*pgxpool.Pool, error) {
 	return NewPool(context.Background(), cfg)
 }
 
-// provideSettingsService injects the env-only owner phone.
-func provideSettingsService(repo *repository.SettingsRepository, cfg *config.Config) *service.SettingsService {
-	return service.NewSettingsService(repo, cfg.OwnerPhone)
+// provideWebhookVerifier builds the HMAC verifier for the public
+// gateway webhook. The secret is the route's only authentication, so an
+// empty one leaves the route unmounted (see router.Setup).
+func provideWebhookVerifier(cfg *config.Config) *waga.WebhookVerifier {
+	return waga.NewWebhookVerifier(cfg.WaWebhookSecret)
 }

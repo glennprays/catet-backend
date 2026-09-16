@@ -28,6 +28,14 @@ func JakartaDate() string {
 	return JakartaNow().Format("2006-01-02")
 }
 
+// JakartaToday returns today as a Jakarta-midnight date — the anchor
+// every bill projection, reservation window and reminder slot is
+// measured from.
+func JakartaToday() time.Time {
+	now := JakartaNow()
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, jakartaLoc)
+}
+
 // parseJakartaDate parses a strict YYYY-MM-DD calendar date.
 func parseJakartaDate(s string) (time.Time, error) {
 	t, err := time.ParseInLocation("2006-01-02", s, jakartaLoc)

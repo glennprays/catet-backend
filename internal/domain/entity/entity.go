@@ -68,7 +68,11 @@ type Transaction struct {
 	EditHistory           json.RawMessage `json:"edit_history"`
 	VoidedAt              *time.Time      `json:"voided_at"`
 	CreatedAt             time.Time       `json:"created_at"`
-	Legs                  []Leg           `json:"legs"`
+	// BillID/BillName are set on the detail read when this transaction
+	// settled a bill occurrence; voiding it reverts that bill.
+	BillID   *uuid.UUID `json:"bill_id"`
+	BillName *string    `json:"bill_name"`
+	Legs     []Leg      `json:"legs"`
 }
 
 // MarshalJSON adds the derived `voided` flag the API contract requires.
@@ -82,7 +86,8 @@ func (t Transaction) MarshalJSON() ([]byte, error) {
 	}{alias(t), t.VoidedAt != nil})
 }
 
-// Bill is a recurring obligation with an estimated amount band.
+// Bill is an expected obligation — recurring or one-time — with an
+// estimated amount band.
 type Bill struct {
 	ID               uuid.UUID  `json:"id"`
 	Name             string     `json:"name"`
@@ -95,7 +100,44 @@ type Bill struct {
 	CategoryID       *uuid.UUID `json:"category_id"`
 	CategoryName     *string    `json:"category_name"`
 	Active           bool       `json:"active"`
-	CreatedAt        time.Time  `json:"created_at"`
+	// RemainingCount is an optional tenor: payments left before the
+	// bill completes. nil = open-ended.
+	RemainingCount *int `json:"remaining_count"`
+	// CompletedAt is set when the last occurrence was paid; a completed
+	// bill is inactive and cannot be reactivated.
+	CompletedAt *time.Time `json:"completed_at"`
+	// ReminderOffsets are days-before-due the user opted into (⊆ 3,1,0).
+	// Never nil on the wire — the dashboard indexes it.
+	ReminderOffsets []int `json:"reminder_offsets"`
+	// AnchorDay pins a monthly/annual bill to its day-of-month so
+	// February cannot permanently shorten it. Server-side only.
+	AnchorDay int       `json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// BillPayment records that a transaction settled one occurrence of a
+// bill. Voiding the transaction reverts the bill (ADR-0006).
+type BillPayment struct {
+	ID            uuid.UUID  `json:"id"`
+	BillID        uuid.UUID  `json:"bill_id"`
+	BillName      string     `json:"bill_name"`
+	TransactionID uuid.UUID  `json:"transaction_id"`
+	DueDate       time.Time  `json:"due_date"`
+	AdvancedTo    *time.Time `json:"advanced_to"`
+	AmountMinor   int64      `json:"amount_minor"`
+	Decremented   bool       `json:"decremented"`
+	PaidAt        time.Time  `json:"paid_at"`
+}
+
+// BillReminderSend is one delivered reminder slot — the dedup row
+// behind "a bill is named at most once per offset per due date".
+type BillReminderSend struct {
+	ID         uuid.UUID `json:"id"`
+	BillID     uuid.UUID `json:"bill_id"`
+	DueDate    time.Time `json:"due_date"`
+	OffsetDays int       `json:"offset_days"`
+	SendDate   time.Time `json:"send_date"`
+	SentAt     time.Time `json:"sent_at"`
 }
 
 // BudgetRow is a budget joined with its category and the computed
@@ -132,7 +174,38 @@ type OtpCode struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// AppSettings is the singleton settings row.
-type AppSettings struct {
-	IncomeHorizonDays int `json:"income_horizon_days"`
+// User is one account: its own ledger, its own WhatsApp number.
+//
+// Phone is the identity (E.164, normalised by auth.NormalizePhone);
+// PhoneDigits is the generated digits-only form the bot matches an
+// inbound JID against. WhatsAppLID is the opaque "@lid" identity the
+// gateway sometimes uses instead of the number. PasswordHash is NULL
+// until the account has a password: the bootstrap admin starts that way
+// and sets one through the reset flow.
+type User struct {
+	ID            uuid.UUID  `json:"id"`
+	Phone         string     `json:"phone"`
+	PhoneDigits   string     `json:"phone_digits"`
+	WhatsAppLID   *string    `json:"whatsapp_lid"`
+	DisplayName   string     `json:"display_name"`
+	PasswordHash  *string    `json:"-"`
+	IsAdmin       bool       `json:"is_admin"`
+	SessionEpoch  int        `json:"-"`
+	FailedLogins  int        `json:"-"`
+	LockedUntil   *time.Time `json:"-"`
+	DeactivatedAt *time.Time `json:"deactivated_at"`
+	LastLoginAt   *time.Time `json:"last_login_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// Invite is a phone-bound, single-use permission to register. The token
+// itself never lands here: only its sha256 is stored, and the plaintext
+// exists just long enough to be sent over WhatsApp.
+type Invite struct {
+	ID        uuid.UUID  `json:"id"`
+	Phone     string     `json:"phone"`
+	CreatedBy uuid.UUID  `json:"created_by"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	UsedAt    *time.Time `json:"used_at"`
+	CreatedAt time.Time  `json:"created_at"`
 }

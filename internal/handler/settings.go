@@ -29,7 +29,7 @@ func (h *SettingsHandler) Update(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	data, err := h.svc.Update(c.UserContext(), req.IncomeHorizonDays)
+	data, err := h.svc.Update(c.UserContext(), req.IncomeHorizonDays, req.PhotoDefaultSourceID, req.ReminderHour)
 	if err != nil {
 		return err
 	}

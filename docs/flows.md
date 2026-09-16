@@ -123,7 +123,9 @@ Full-text (merchant/note) + structured filters (source, category, tag, amount, d
 ## 13. Auth flow
 
 ```
-Passkey (WebAuthn) → httpOnly session cookie → Next.js edge → Go API (internal, JWT forwarded server-side)
+Phone + password (argon2id) → httpOnly session cookie (JWT carrying user id + session_epoch) → Next.js edge → Go API (internal, JWT forwarded server-side, request scoped to that user)
+Signup: admin invites a phone → bot sends the register link (7-day single-use token) → OTP verifies the number → name + password → seeded ledger, logged in
+Reset: phone → OTP → new password → session_epoch bumped (every other device out), logged in
 ```
 
 ## 14. Backup flow

@@ -71,7 +71,7 @@ func (h *TransactionHandler) Create(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	tx, err := h.svc.CreateManual(c.UserContext(), service.CreateManualInput{
+	tx, err := h.svc.Create(c.UserContext(), service.CreateInput{
 		Type:                req.Type,
 		OccurredAt:          req.OccurredAt,
 		OccurredDate:        req.OccurredDate,
@@ -81,6 +81,7 @@ func (h *TransactionHandler) Create(c *fiber.Ctx) error {
 		CategoryID:          req.CategoryID,
 		Note:                req.Note,
 		Merchant:            req.Merchant,
+		Origin:              "dashboard_manual",
 	})
 	if err != nil {
 		return err
@@ -144,7 +145,7 @@ func (h *TransactionHandler) Reverse(c *fiber.Ctx) error {
 			return apperror.BadRequestf("invalid request body: %v", err)
 		}
 	}
-	tx, err := h.svc.Reverse(c.UserContext(), id, req.Note)
+	tx, err := h.svc.Reverse(c.UserContext(), id, req.Note, "dashboard_manual")
 	if err != nil {
 		return err
 	}

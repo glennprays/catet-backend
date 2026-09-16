@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: catet Backend API
-  version: 0.2.0
+  version: 0.4.0
   description: |
     Internal Go API consumed only by the catet Next.js BFF.
 
@@ -10,6 +10,8 @@ info:
     - Money is int64 minor units (IDR cents = rupiah). Never floats.
     - Day boundaries and date params are Asia/Jakarta; storage is UTC (timestamptz).
     - Errors carry a stable machine `code` (apperror.Kind) plus optional FieldError[].
+    - Sessions slide: a request carrying a token 7 days old or older is answered with
+      `X-Session-Renew`, a freshly minted session JWT that the BFF re-sets as its cookie.
 servers:
   - url: /
     description: Internal API root
@@ -52,11 +54,54 @@ paths:
           $ref: '#/components/responses/ErrorResponse'
 
   # ------------------------------------------------------------------ auth
+  /api/v1/auth/login:
+    post:
+      summary: Exchange phone + password for a session JWT
+      operationId: login
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, password]
+              properties:
+                phone:
+                  type: string
+                  description: Phone in any local or international shape; normalised server-side
+                  example: "+628123456789"
+                password: { type: string }
+      responses:
+        '200':
+          description: Session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          description: Unknown number or wrong password — deliberately indistinguishable
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          description: |
+            FORBIDDEN with `details[0].field = "account"` and `rule` either
+            `locked` (five consecutive failures; 15 minutes) or `deactivated`.
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          description: Too many attempts for this number or from this address
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
   /api/v1/auth/otp/request:
     post:
       summary: Request a WhatsApp OTP code
       operationId: requestOtp
       tags: [Auth]
+      description: |
+        A code is sent only to a registered active number (password reset)
+        or a number holding an open invite (signup). The response is
+        `{sent: true}` in every case, including an unknown number, so the
+        endpoint cannot be used to discover who has an account.
       requestBody:
         required: true
         content:
@@ -67,27 +112,82 @@ paths:
               properties:
                 phone:
                   type: string
-                  description: E.164 owner phone
-                  example: "+628000000000"
+                  example: "+628123456789"
       responses:
         '200':
-          description: Code dispatched (log sender in dev)
+          description: Accepted (log sender in dev prints the code)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/OtpRequestEnvelope'
-        '400':
-          description: Phone is not the configured owner phone
-          $ref: '#/components/responses/ErrorResponse'
         '429':
-          description: An unexpired unconsumed code was requested less than 60s ago
+          description: A code was requested for this number less than 60s ago, or too many requests from this address
           $ref: '#/components/responses/ErrorResponse'
         '500':
           $ref: '#/components/responses/ErrorResponse'
-  /api/v1/auth/otp/verify:
+  /api/v1/auth/invites/{token}:
+    get:
+      summary: Resolve a register link
+      operationId: getInvite
+      tags: [Auth]
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The number this invite is bound to
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteInfoEnvelope'
+        '404':
+          description: Unknown, spent or expired invite
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/auth/register:
     post:
-      summary: Verify an OTP code and obtain a session JWT
-      operationId: verifyOtp
+      summary: Create the account behind an invite and log it in
+      operationId: register
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_token, code, display_name, password]
+              properties:
+                invite_token: { type: string }
+                code: { type: string, example: "123456" }
+                display_name: { type: string, maxLength: 60 }
+                password: { type: string, minLength: 10, maxLength: 128 }
+      responses:
+        '200':
+          description: Account created, seeded and logged in
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '400':
+          description: |
+            Wrong or expired code, or VALIDATION_FAILED on `display_name`
+            or `password` (field `password`, rule `min` | `max` | `common`).
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          description: Unknown, spent or expired invite
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: The number is already registered
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/auth/password/reset/verify:
+    post:
+      summary: Trade a WhatsApp code for a short-lived reset token
+      operationId: verifyPasswordReset
       tags: [Auth]
       requestBody:
         required: true
@@ -97,40 +197,262 @@ paths:
               type: object
               required: [phone, code]
               properties:
-                phone:
-                  type: string
-                code:
-                  type: string
-                  example: "123456"
+                phone: { type: string }
+                code: { type: string, example: "123456" }
       responses:
         '200':
-          description: Session token issued
+          description: Reset token issued (15 minutes)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OtpVerifyEnvelope'
+                $ref: '#/components/schemas/ResetTokenEnvelope'
         '400':
           description: |
-            Wrong/expired code, or `attempts_exceeded` after 5 bad tries
-            (the code is invalidated).
+            Wrong or expired code — the same answer an unregistered number
+            gets, so the form cannot enumerate accounts.
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          description: Too many requests from this address
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/auth/password/reset/complete:
+    post:
+      summary: Set a new password with a reset token and log in
+      operationId: completePasswordReset
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reset_token, password]
+              properties:
+                reset_token: { type: string }
+                password: { type: string, minLength: 10, maxLength: 128 }
+      responses:
+        '200':
+          description: Password set; session issued at the new epoch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '400':
+          description: |
+            Unknown, spent or expired reset token, or VALIDATION_FAILED on
+            `password` (rule `min` | `max` | `common`).
           $ref: '#/components/responses/ErrorResponse'
         '500':
           $ref: '#/components/responses/ErrorResponse'
   /api/v1/auth/me:
     get:
-      summary: Current session owner
+      summary: The session's own account
       operationId: getMe
       tags: [Auth]
       security: [{ bearerAuth: [] }]
       responses:
         '200':
-          description: Session phone
+          description: Account identity
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/MeEnvelope'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
+  /api/v1/auth/password/change:
+    post:
+      summary: Change the password of the calling account
+      operationId: changePassword
+      tags: [Auth]
+      security: [{ bearerAuth: [] }]
+      description: |
+        Bumps `session_epoch`, so every session — including the one that
+        made this call — is invalidated. The client must send the user to
+        the login screen.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 10, maxLength: 128 }
+      responses:
+        '200':
+          description: Password changed; all sessions revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkEnvelope'
+        '400':
+          description: |
+            The current password is wrong, or VALIDATION_FAILED on
+            `new_password` (rule `min` | `max` | `common`).
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+  /api/v1/auth/logout-all:
+    post:
+      summary: Revoke every session of the calling account
+      operationId: logoutAll
+      tags: [Auth]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Sessions revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # ----------------------------------------------------------------- users
+  /api/v1/users:
+    get:
+      summary: List accounts (admin only)
+      operationId: listUsers
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Every account, oldest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsersEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/users/invites:
+    get:
+      summary: List open invites (admin only)
+      operationId: listInvites
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Invites still waiting to be accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitesEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Invite a phone number (admin only)
+      operationId: createInvite
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      description: |
+        The register link is delivered by the bot over WhatsApp; the token
+        is never returned here, so possession of the number is part of the
+        proof. Inviting a number that already has an open invite replaces
+        it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, example: "+628999999999" }
+      responses:
+        '200':
+          description: Invite created and sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          description: The number is already registered
+          $ref: '#/components/responses/ErrorResponse'
+        '400':
+          description: VALIDATION_FAILED — the phone is not a valid number (field `phone`, rule `format`)
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/users/invites/{id}:
+    delete:
+      summary: Revoke an open invite (admin only)
+      operationId: revokeInvite
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Invite revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+  /api/v1/users/{id}/deactivate:
+    post:
+      summary: Disable an account and revoke its sessions (admin only)
+      operationId: deactivateUser
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Account disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          description: Refused — an admin cannot deactivate themselves
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+  /api/v1/users/{id}/activate:
+    post:
+      summary: Re-enable an account (admin only)
+      operationId: activateUser
+      tags: [Users]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Account re-enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: FORBIDDEN — the caller is not the admin
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
 
   # --------------------------------------------------------------- sources
   /api/v1/sources:
@@ -610,6 +932,87 @@ paths:
           $ref: '#/components/responses/UnauthorizedError'
         '500':
           $ref: '#/components/responses/ErrorResponse'
+  /api/v1/bills/payments:
+    get:
+      summary: Bill payments settled in a date range
+      operationId: listBillPayments
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date }, description: exclusive }
+      responses:
+        '200':
+          description: Payments
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillPaymentsEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/bills/{id}/activate:
+    post:
+      summary: Reactivate a deactivated bill
+      operationId: activateBill
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Reactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillActiveEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: The bill is completed and cannot be reactivated
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/bills/{id}/payments:
+    post:
+      summary: Mark one occurrence of a bill paid
+      description: >-
+        Writes an expense from the linked source (or the one named here) and
+        advances the bill to its next occurrence; a one-time bill, or the last
+        unit of a tenor, completes instead. Voiding the returned transaction
+        rewinds the schedule.
+      operationId: payBill
+      tags: [Bills]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillPaymentInput'
+      responses:
+        '200':
+          description: The advanced bill and the expense that settled it
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillPaymentEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: The bill is not active, or was modified concurrently
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
   /api/v1/bills/{id}:
     patch:
       summary: Update any subset of a bill
@@ -943,6 +1346,20 @@ paths:
               required: [action]
               properties:
                 action: { type: string, enum: [confirm, discard] }
+                overrides:
+                  type: object
+                  description: |
+                    Corrections applied to a parked capture before it is
+                    written. Ignored for `discard`. Every field is optional;
+                    omitted fields keep whatever the bot stored.
+                  properties:
+                    amount_minor: { type: integer, format: int64 }
+                    source_id: { type: string, format: uuid }
+                    destination_source_id: { type: string, format: uuid }
+                    category_id: { type: string, format: uuid }
+                    merchant: { type: string }
+                    note: { type: string }
+                    occurred_date: { type: string, format: date }
       responses:
         '200':
           description: Resolved
@@ -1010,6 +1427,23 @@ paths:
               required: [income_horizon_days]
               properties:
                 income_horizon_days: { type: integer, minimum: 1, maximum: 90 }
+                photo_default_source_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: |
+                    Source a photographed receipt falls back to when the
+                    paper names no payment method and the merchant has
+                    never been captured. Null or absent clears it, so
+                    the bot asks every time.
+                reminder_hour:
+                  type: integer
+                  minimum: 0
+                  maximum: 23
+                  nullable: true
+                  description: >-
+                    Asia/Jakarta hour the daily bill digest is sent. Absent
+                    or null leaves the stored hour unchanged.
       responses:
         '200':
           description: Updated settings
@@ -1036,6 +1470,12 @@ components:
       schema:
         type: string
         format: uuid
+    X-Session-Renew:
+      description: >-
+        Fresh session JWT; the BFF re-sets the httpOnly cookie. Sent when the
+        presented token is >=7 days old.
+      schema:
+        type: string
   parameters:
     Id:
       name: id
@@ -1160,26 +1600,128 @@ components:
           properties:
             sent: { type: boolean, enum: [true] }
         trace_id: { type: string, format: uuid }
-    OtpVerifyEnvelope:
+    OkEnvelope:
       type: object
       required: [data, trace_id]
       properties:
         data:
           type: object
-          required: [token, expires_at]
+          required: [ok]
           properties:
-            token: { type: string }
+            ok: { type: boolean, enum: [true] }
+        trace_id: { type: string, format: uuid }
+    Session:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: Session JWT. The BFF stores it in the httpOnly cookie and never forwards it to the browser.
+        expires_at: { type: string, format: date-time }
+    SessionEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Session'
+        trace_id: { type: string, format: uuid }
+    InviteInfoEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [phone, expires_at]
+          properties:
+            phone: { type: string }
             expires_at: { type: string, format: date-time }
         trace_id: { type: string, format: uuid }
+    ResetTokenEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [reset_token, expires_at]
+          properties:
+            reset_token: { type: string }
+            expires_at: { type: string, format: date-time }
+        trace_id: { type: string, format: uuid }
+    Me:
+      type: object
+      required: [id, phone, display_name, is_admin]
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        display_name: { type: string }
+        is_admin: { type: boolean }
     MeEnvelope:
       type: object
       required: [data, trace_id]
       properties:
         data:
+          $ref: '#/components/schemas/Me'
+        trace_id: { type: string, format: uuid }
+
+    # ----------------------------------------------------------------- users
+    User:
+      type: object
+      required: [id, phone, display_name, is_admin, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        display_name: { type: string }
+        is_admin: { type: boolean }
+        deactivated_at: { type: string, format: date-time, nullable: true }
+        last_login_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    UserEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/User'
+        trace_id: { type: string, format: uuid }
+    UsersEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
           type: object
-          required: [phone]
+          required: [users]
           properties:
-            phone: { type: string }
+            users:
+              type: array
+              items:
+                $ref: '#/components/schemas/User'
+        trace_id: { type: string, format: uuid }
+    Invite:
+      type: object
+      required: [id, phone, expires_at, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    InviteEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          $ref: '#/components/schemas/Invite'
+        trace_id: { type: string, format: uuid }
+    InvitesEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [invites]
+          properties:
+            invites:
+              type: array
+              items:
+                $ref: '#/components/schemas/Invite'
         trace_id: { type: string, format: uuid }
 
     # ------------------------------------------------------------- sources
@@ -1303,6 +1845,12 @@ components:
         external_id: { type: string, nullable: true }
         reverses_transaction_id: { type: string, format: uuid, nullable: true }
         reverses_merchant: { type: string, nullable: true, description: merchant of the reversed transaction when present }
+        bill_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: set on the detail read when this transaction settled a bill occurrence
+        bill_name: { type: string, nullable: true }
         edit_history:
           type: array
           items:
@@ -1373,15 +1921,28 @@ components:
         name: { type: string, minLength: 1 }
         amount_min_minor: { type: integer, format: int64 }
         amount_max_minor: { type: integer, format: int64 }
-        cadence: { type: string, enum: [weekly, monthly, annual] }
+        cadence: { type: string, enum: [once, weekly, monthly, annual] }
         next_due_date: { type: string, format: date }
         linked_source_id: { type: string, format: uuid, nullable: true }
         category_id: { type: string, format: uuid, nullable: true }
+        remaining_count:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: >-
+            Optional tenor: payments left before the bill completes. Null is
+            open-ended. Not allowed with cadence=once.
+        reminder_offsets:
+          type: array
+          description: >-
+            Days before the due date the user opted into for the daily
+            WhatsApp digest (ADR-0006). Empty means no reminders.
+          items: { type: integer, enum: [0, 1, 3] }
     Bill:
       allOf:
         - $ref: '#/components/schemas/BillInput'
         - type: object
-          required: [id, active]
+          required: [id, active, reminder_offsets]
           properties:
             id: { type: string, format: uuid }
             linked_source_id: { type: string, format: uuid, nullable: true }
@@ -1389,7 +1950,70 @@ components:
             category_id: { type: string, format: uuid, nullable: true }
             category_name: { type: string, nullable: true }
             active: { type: boolean }
+            completed_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: set when the last occurrence was paid; a completed bill cannot be reactivated
             created_at: { type: string, format: date-time }
+    BillPaymentInput:
+      type: object
+      required: [amount_minor]
+      properties:
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: what the user actually paid; the band is an estimate, never an authority
+        source_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: required when the bill has no linked source
+        occurred_date: { type: string, format: date, nullable: true, description: defaults to today (Asia/Jakarta) }
+    BillPayment:
+      type: object
+      required: [id, bill_id, bill_name, transaction_id, due_date, amount_minor, decremented, paid_at]
+      properties:
+        id: { type: string, format: uuid }
+        bill_id: { type: string, format: uuid }
+        bill_name: { type: string }
+        transaction_id: { type: string, format: uuid }
+        due_date: { type: string, format: date-time, description: the occurrence this payment settled }
+        advanced_to:
+          type: string
+          format: date-time
+          nullable: true
+          description: where the bill was pushed; null when the payment completed it
+        amount_minor: { type: integer, format: int64 }
+        decremented: { type: boolean, description: whether this payment consumed one remaining_count }
+        paid_at: { type: string, format: date-time }
+    BillPaymentEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [bill, transaction]
+          properties:
+            bill:
+              $ref: '#/components/schemas/Bill'
+            transaction:
+              $ref: '#/components/schemas/Transaction'
+        trace_id: { type: string, format: uuid }
+    BillPaymentsEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [payments]
+          properties:
+            payments:
+              type: array
+              items:
+                $ref: '#/components/schemas/BillPayment'
+        trace_id: { type: string, format: uuid }
     BillsEnvelope:
       type: object
       required: [data, trace_id]
@@ -1418,7 +2042,7 @@ components:
           type: object
           required: [active]
           properties:
-            active: { type: boolean, enum: [false] }
+            active: { type: boolean }
         trace_id: { type: string, format: uuid }
 
     # ------------------------------------------------------------- budgets
@@ -1492,10 +2116,11 @@ components:
         trace_id: { type: string, format: uuid }
     BadgeCounts:
       type: object
-      required: [needs_review, hold_queue]
+      required: [needs_review, hold_queue, bills_overdue]
       properties:
         needs_review: { type: integer, format: int64 }
         hold_queue: { type: integer, format: int64 }
+        bills_overdue: { type: integer, format: int64, description: active bills whose due date has passed }
     BadgesEnvelope:
       type: object
       required: [data, trace_id]
@@ -1632,8 +2257,31 @@ components:
       required: [id, kind, params, summary, created_at]
       properties:
         id: { type: string, format: uuid }
-        kind: { type: string }
-        params: { type: object, additionalProperties: true }
+        kind:
+          type: string
+          enum: [capture, refund, create_transaction, receipt]
+          description: |
+            `capture` — a WhatsApp capture the rules refused to finish;
+            `refund` — a linked reversal awaiting confirmation;
+            `create_transaction` — a parked write from another surface;
+            `receipt` — a photographed receipt, one ledger line per item.
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Kind-specific payload. A `capture` carries `type`,
+            `amount_minor`, `merchant`, `source_id`/`source_name`,
+            `destination_source_id`, `category_id`, `occurred_at`,
+            `message_id`, `original_text` and `missing` (the fields the
+            bot could not resolve). A `refund` carries
+            `reverses_transaction_id`, `merchant`, `amount_minor`,
+            `source_name`, `occurred_at`, `message_id`, `original_text`.
+            A `receipt` carries `type`, `document_type`, `merchant`,
+            `total_minor`, `items[] {n, name, qty, amount_minor,
+            category_id, category_name, category_confidence}`,
+            `source_id`/`source_name`, `occurred_at`, `receipt_date`,
+            `payment_method`, `message_id`, `original_text`,
+            `duplicate_of`, `collapsed`, `missing`.
         summary: { type: string }
         created_at: { type: string, format: date-time }
     HoldQueueEnvelope:
@@ -1658,15 +2306,33 @@ components:
           required: [resolved]
           properties:
             resolved: { type: boolean, enum: [true] }
+            transaction_id:
+              type: string
+              format: uuid
+              description: |
+                Present when confirming executed a parked draft; the
+                first written transaction for a multi-line receipt.
+            transaction_ids:
+              type: array
+              description: Every transaction the confirmation wrote — one per receipt line.
+              items:
+                type: string
+                format: uuid
         trace_id: { type: string, format: uuid }
 
     # ------------------------------------------------------------ settings
     Settings:
       type: object
-      required: [income_horizon_days, phone]
+      required: [income_horizon_days, reminder_hour]
       properties:
         income_horizon_days: { type: integer, minimum: 1, maximum: 90 }
-        phone: { type: string }
+        photo_default_source_id: { type: string, format: uuid, nullable: true, description: Source a photographed receipt falls back to; null means the bot asks }
+        photo_default_source_name: { type: string, nullable: true }
+        reminder_hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          description: Asia/Jakarta hour the daily bill digest is sent (ADR-0006)
     SettingsEnvelope:
       type: object
       required: [data, trace_id]
@@ -1678,7 +2344,9 @@ tags:
   - name: System
     description: Internal system status endpoints
   - name: Auth
-    description: WhatsApp OTP session auth
+    description: Phone + password sessions, invites and password reset
+  - name: Users
+    description: Admin-only account management
   - name: Sources
     description: Places money lives
   - name: Transactions

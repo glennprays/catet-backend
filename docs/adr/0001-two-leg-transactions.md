@@ -7,7 +7,7 @@ v1's data model was self-contradictory: it promised "first-class two-sided trans
 ## Considered Options
 
 - Single row with `destination_source_id` — simplest queries, but per-source ledgers and reconciliation break down; the "two-sided first-class" promise quietly dies.
-- Full double-entry general ledger with postings table — textbook-correct, but heavy machinery a single-user tracker never needs.
+- Full double-entry general ledger with postings table — textbook-correct, but heavy machinery a personal tracker never needs.
 - **Chosen: one logical transaction, two legs** — clean per-source ledgers, reconciliation works per-leg, UI still shows one card.
 
 ## Consequences

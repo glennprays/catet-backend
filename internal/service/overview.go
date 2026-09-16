@@ -126,14 +126,15 @@ func (s *OverviewService) Build(ctx context.Context) (*response.OverviewData, er
 		return nil, apperror.Internal("failed to resolve today").Wrap(err)
 	}
 	tomorrow := today.AddDate(0, 0, 1)
-	reserved, err := s.bills.ReservedSum(ctx, today, today.AddDate(0, 0, horizon))
+	activeBills, err := s.bills.ListActive(ctx)
 	if err != nil {
-		return nil, apperror.Internal("failed to sum reservations").Wrap(err)
+		return nil, apperror.Internal("failed to list bills").Wrap(err)
 	}
-	reservedTomorrow, err := s.bills.ReservedSum(ctx, tomorrow, tomorrow.AddDate(0, 0, 1))
-	if err != nil {
-		return nil, apperror.Internal("failed to sum tomorrow's reservations").Wrap(err)
-	}
+	// Every occurrence inside the horizon is reserved, not just the next
+	// one: a weekly bill costs four times before payday. Overdue bills
+	// keep their reservation — money still owed is not safe to spend.
+	reserved := ReservedBetween(activeBills, today, today.AddDate(0, 0, horizon), true)
+	reservedTomorrow := ReservedBetween(activeBills, tomorrow, tomorrow.AddDate(0, 0, 1), false)
 
 	now := time.Now().UTC()
 	_, expense30, err := s.analytics.DailyFlows(ctx, now.AddDate(0, 0, -30), now)
@@ -186,6 +187,10 @@ func (s *OverviewService) Build(ctx context.Context) (*response.OverviewData, er
 	if err != nil {
 		return nil, apperror.Internal("failed to count hold queue").Wrap(err)
 	}
+	billsOverdue, err := s.bills.CountOverdue(ctx, today)
+	if err != nil {
+		return nil, apperror.Internal("failed to count overdue bills").Wrap(err)
+	}
 
 	return &response.OverviewData{
 		StsMinor:              out.StsMinor,
@@ -198,8 +203,9 @@ func (s *OverviewService) Build(ctx context.Context) (*response.OverviewData, er
 		LifestyleMinor:        lifestyle,
 		Recent:                recent,
 		Badges: response.BadgeCounts{
-			NeedsReview: needsReview,
-			HoldQueue:   holdQueue,
+			NeedsReview:  needsReview,
+			HoldQueue:    holdQueue,
+			BillsOverdue: billsOverdue,
 		},
 	}, nil
 }
@@ -229,10 +235,15 @@ func LedgerItemFromRow(row repository.LedgerRow) response.LedgerItem {
 type BadgesService struct {
 	analytics *repository.AnalyticsRepository
 	pending   *repository.PendingActionRepository
+	bills     *repository.BillRepository
 }
 
-func NewBadgesService(analytics *repository.AnalyticsRepository, pending *repository.PendingActionRepository) *BadgesService {
-	return &BadgesService{analytics: analytics, pending: pending}
+func NewBadgesService(
+	analytics *repository.AnalyticsRepository,
+	pending *repository.PendingActionRepository,
+	bills *repository.BillRepository,
+) *BadgesService {
+	return &BadgesService{analytics: analytics, pending: pending, bills: bills}
 }
 
 func (s *BadgesService) Get(ctx context.Context) (response.BadgeCounts, error) {
@@ -244,18 +255,29 @@ func (s *BadgesService) Get(ctx context.Context) (response.BadgeCounts, error) {
 	if err != nil {
 		return response.BadgeCounts{}, apperror.Internal("failed to count hold queue").Wrap(err)
 	}
-	return response.BadgeCounts{NeedsReview: needsReview, HoldQueue: holdQueue}, nil
+	today, err := parseJakartaDate(JakartaDate())
+	if err != nil {
+		return response.BadgeCounts{}, apperror.Internal("failed to resolve today").Wrap(err)
+	}
+	billsOverdue, err := s.bills.CountOverdue(ctx, today)
+	if err != nil {
+		return response.BadgeCounts{}, apperror.Internal("failed to count overdue bills").Wrap(err)
+	}
+	return response.BadgeCounts{NeedsReview: needsReview, HoldQueue: holdQueue, BillsOverdue: billsOverdue}, nil
 }
 
-// settingsService-backed settings handler needs the phone; the config
-// value is the single source (env-only per plan).
+// SettingsService backs the settings handler. The Source repository is
+// here to turn the stored receipt-fallback id into a name the dashboard
+// can show, and to refuse an id that is not a live Source. The account
+// itself is not a setting: the dashboard reads the phone and display
+// name from /auth/me.
 type SettingsService struct {
-	repo  *repository.SettingsRepository
-	phone string
+	repo    *repository.SettingsRepository
+	sources *repository.SourceRepository
 }
 
-func NewSettingsService(repo *repository.SettingsRepository, phone string) *SettingsService {
-	return &SettingsService{repo: repo, phone: phone}
+func NewSettingsService(repo *repository.SettingsRepository, sources *repository.SourceRepository) *SettingsService {
+	return &SettingsService{repo: repo, sources: sources}
 }
 
 func (s *SettingsService) Get(ctx context.Context) (*response.SettingsData, error) {
@@ -263,24 +285,109 @@ func (s *SettingsService) Get(ctx context.Context) (*response.SettingsData, erro
 	if err != nil {
 		return nil, apperror.Internal("failed to load settings").Wrap(err)
 	}
-	return &response.SettingsData{IncomeHorizonDays: days, Phone: s.phone}, nil
+	photoSourceID, err := s.repo.GetPhotoDefaultSource(ctx)
+	if err != nil {
+		return nil, apperror.Internal("failed to load settings").Wrap(err)
+	}
+	name, err := s.photoDefaultSourceName(ctx, photoSourceID)
+	if err != nil {
+		return nil, err
+	}
+	hour, err := s.repo.GetReminderHour(ctx)
+	if err != nil {
+		return nil, apperror.Internal("failed to load settings").Wrap(err)
+	}
+	return &response.SettingsData{
+		IncomeHorizonDays:      days,
+		PhotoDefaultSourceID:   photoSourceID,
+		PhotoDefaultSourceName: name,
+		ReminderHour:           hour,
+	}, nil
 }
 
-func (s *SettingsService) Update(ctx context.Context, days int) (*response.SettingsData, error) {
+// Update writes the settings form. reminderHour is optional: a client
+// that predates the field leaves the digest hour alone instead of
+// silently resetting it to 08:00.
+func (s *SettingsService) Update(ctx context.Context, days int, photoDefaultSourceID *uuid.UUID, reminderHour *int) (*response.SettingsData, error) {
+	name, err := s.photoDefaultSourceName(ctx, photoDefaultSourceID)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.repo.UpdateIncomeHorizon(ctx, days); err != nil {
 		return nil, apperror.Internal("failed to update settings").Wrap(err)
 	}
-	return &response.SettingsData{IncomeHorizonDays: days, Phone: s.phone}, nil
+	if err := s.repo.SetPhotoDefaultSource(ctx, photoDefaultSourceID); err != nil {
+		return nil, apperror.Internal("failed to update settings").Wrap(err)
+	}
+	if reminderHour != nil {
+		if err := s.repo.SetReminderHour(ctx, *reminderHour); err != nil {
+			return nil, apperror.Internal("failed to update settings").Wrap(err)
+		}
+	}
+	hour, err := s.repo.GetReminderHour(ctx)
+	if err != nil {
+		return nil, apperror.Internal("failed to load settings").Wrap(err)
+	}
+	return &response.SettingsData{
+		IncomeHorizonDays:      days,
+		PhotoDefaultSourceID:   photoDefaultSourceID,
+		PhotoDefaultSourceName: name,
+		ReminderHour:           hour,
+	}, nil
+}
+
+// photoDefaultSourceName resolves the fallback id against the active
+// Sources. An archived or unknown Source is rejected rather than stored
+// silently: the bot would otherwise pay receipts from an account the
+// user has retired.
+func (s *SettingsService) photoDefaultSourceName(ctx context.Context, id *uuid.UUID) (*string, error) {
+	if id == nil {
+		return nil, nil
+	}
+	sources, err := s.sources.List(ctx, false)
+	if err != nil {
+		return nil, apperror.Internal("failed to load sources").Wrap(err)
+	}
+	for i := range sources {
+		if sources[i].ID == *id {
+			name := sources[i].Name
+			return &name, nil
+		}
+	}
+	return nil, apperror.Validation("settings validation failed").
+		WithDetails(apperror.FieldError{Field: "photo_default_source_id", Rule: "exists", Message: "source not found"})
+}
+
+// PendingOverrides are the edits a confirming surface may apply to a
+// parked draft before it is written. Nil pointer = keep what the bot
+// stored.
+type PendingOverrides struct {
+	AmountMinor         *int64
+	SourceID            *uuid.UUID
+	DestinationSourceID *uuid.UUID
+	CategoryID          *uuid.UUID
+	Merchant            *string
+	Note                *string
+	OccurredDate        *string
+}
+
+// PendingExecutor performs a confirmed pending action and returns every
+// transaction it wrote — one for a capture or refund, one per line for a
+// photographed receipt. Implemented by the bot harness; declared here so
+// the service layer does not depend on the bot package.
+type PendingExecutor interface {
+	Execute(ctx context.Context, p *entity.PendingAction, ov *PendingOverrides) ([]*entity.Transaction, error)
 }
 
 // HoldQueueService resolves parked pending actions from the dashboard
 // (ADR-0004).
 type HoldQueueService struct {
-	repo *repository.PendingActionRepository
+	repo     *repository.PendingActionRepository
+	executor PendingExecutor
 }
 
-func NewHoldQueueService(repo *repository.PendingActionRepository) *HoldQueueService {
-	return &HoldQueueService{repo: repo}
+func NewHoldQueueService(repo *repository.PendingActionRepository, executor PendingExecutor) *HoldQueueService {
+	return &HoldQueueService{repo: repo, executor: executor}
 }
 
 func (s *HoldQueueService) List(ctx context.Context) ([]entity.PendingAction, error) {
@@ -291,17 +398,31 @@ func (s *HoldQueueService) List(ctx context.Context) ([]entity.PendingAction, er
 	return items, nil
 }
 
-// Resolve confirms (execute) or discards a parked action. Confirming
-// execution of the parked tool call is the bot harness's job — the
-// dashboard only marks the decision; today's Now-tier has no parked
-// writes beyond the queue row itself.
-func (s *HoldQueueService) Resolve(ctx context.Context, id uuid.UUID, action string) error {
-	ok, err := s.repo.Resolve(ctx, id, action)
+// Resolve discards a parked action or executes it. Confirming runs the
+// same executor the chat uses, so a draft confirmed from the dashboard
+// writes exactly what answering the bot's question would have written —
+// with whatever the user corrected on the way.
+func (s *HoldQueueService) Resolve(ctx context.Context, id uuid.UUID, action string, ov *PendingOverrides) ([]*entity.Transaction, error) {
+	if action == "discard" {
+		ok, err := s.repo.Resolve(ctx, id, action)
+		if err != nil {
+			return nil, apperror.Internal("failed to resolve pending action").Wrap(err)
+		}
+		if !ok {
+			return nil, apperror.NotFound("pending action not found")
+		}
+		return nil, nil
+	}
+
+	item, err := s.repo.GetOpen(ctx, id)
 	if err != nil {
-		return apperror.Internal("failed to resolve pending action").Wrap(err)
+		return nil, apperror.Internal("failed to load pending action").Wrap(err)
 	}
-	if !ok {
-		return apperror.NotFound("pending action not found")
+	if item == nil {
+		return nil, apperror.NotFound("pending action not found")
 	}
-	return nil
+	if s.executor == nil {
+		return nil, apperror.Internal("no executor configured for pending actions")
+	}
+	return s.executor.Execute(ctx, item, ov)
 }

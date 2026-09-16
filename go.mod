@@ -1,10 +1,11 @@
 module github.com/glennprays/catet-backend
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/creasty/defaults v1.8.0
 	github.com/glennprays/log v0.2.0
+	github.com/glennprays/whatsapp-gateway-sdk-go v0.8.0
 	github.com/go-playground/validator/v10 v10.30.2
 	github.com/gofiber/fiber/v2 v2.52.10
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -15,6 +16,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/crypto v0.57.0
 )
 
 require (
@@ -49,10 +51,9 @@ require (
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

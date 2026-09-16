@@ -6,7 +6,10 @@ package infrastructure
 import (
 	"github.com/glennprays/catet-backend/config"
 	"github.com/glennprays/catet-backend/internal/auth"
+	"github.com/glennprays/catet-backend/internal/bot"
+	"github.com/glennprays/catet-backend/internal/gateway"
 	"github.com/glennprays/catet-backend/internal/handler"
+	"github.com/glennprays/catet-backend/internal/llm"
 	"github.com/glennprays/catet-backend/internal/repository"
 	"github.com/glennprays/catet-backend/internal/router"
 	"github.com/glennprays/catet-backend/internal/service"
@@ -18,6 +21,7 @@ var CoreSet = wire.NewSet(
 	config.Load,
 	logger.ProviderLogger,
 	ProvidePool,
+	gateway.Provide,
 )
 
 var RepositorySet = wire.NewSet(
@@ -25,11 +29,18 @@ var RepositorySet = wire.NewSet(
 	repository.NewTransactionRepository,
 	repository.NewCategoryRepository,
 	repository.NewBillRepository,
+	repository.NewBillPaymentRepository,
+	repository.NewBillReminderSendRepository,
 	repository.NewBudgetRepository,
 	repository.NewSettingsRepository,
 	repository.NewPendingActionRepository,
 	repository.NewAnalyticsRepository,
 	repository.NewOtpRepository,
+	repository.NewInboundMessageRepository,
+	repository.NewBotChatStateRepository,
+	repository.NewUserRepository,
+	repository.NewInviteRepository,
+	repository.NewPasswordResetRepository,
 	wire.Bind(new(auth.CodeStore), new(*repository.OtpRepository)),
 )
 
@@ -43,14 +54,17 @@ var ServiceSet = wire.NewSet(
 	service.NewOverviewService,
 	service.NewBadgesService,
 	service.NewSettingsService,
+	service.NewReminderService,
 	service.NewHoldQueueService,
-	provideSettingsService,
+	service.NewOnboardingService,
 )
 
 var AuthSet = wire.NewSet(
 	auth.ProvideTokenService,
 	auth.ProvideOtpSender,
 	auth.ProvideOtpService,
+	auth.ProvideAuthService,
+	auth.ProvideInviteService,
 	auth.ProvideRequireAuth,
 	auth.NewHandler,
 )
@@ -67,7 +81,16 @@ var ApiSet = wire.NewSet(
 	handler.NewAnalyticsHandler,
 	handler.NewHoldQueueHandler,
 	handler.NewSettingsHandler,
+	handler.NewUserHandler,
+	handler.NewWebhookHandler,
 	router.NewRouter,
+)
+
+var BotSet = wire.NewSet(
+	llm.Provide,
+	bot.NewHarness,
+	provideWebhookVerifier,
+	wire.Bind(new(service.PendingExecutor), new(*bot.Harness)),
 )
 
 // InitializeApp is the Wire injector; the compiled graph lives in
@@ -79,6 +102,7 @@ func InitializeApp() (*App, error) {
 		RepositorySet,
 		ServiceSet,
 		AuthSet,
+		BotSet,
 		ApiSet,
 		wire.Struct(new(App), "*"),
 	)
