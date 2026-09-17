@@ -70,8 +70,8 @@ func TestReceiptEval(t *testing.T) {
 		effective = model
 	}
 	t.Logf("model=%s timeout=%s fixtures=%d", effective, timeout, len(want))
-	t.Logf("%-16s %-8s %-10s %-10s %-22s %-12s %8s %12s",
-		"file", "legible", "has_total", "total", "merchant", "date", "ms", "tokens")
+	t.Logf("%-16s %-8s %-8s %-10s %-10s %-22s %-12s %8s %12s %s",
+		"file", "img_recv", "legible", "has_total", "total", "merchant", "date", "ms", "tokens", "served")
 
 	for _, exp := range want {
 		img, err := os.ReadFile(filepath.Join(fixtureDir, exp.File))
@@ -87,10 +87,19 @@ func TestReceiptEval(t *testing.T) {
 			continue
 		}
 
-		t.Logf("%-16s %-8t %-10t %-10d %-22s %-12s %8d %12s",
-			exp.File, read.Legible, read.HasTotalLine, read.TotalMinor,
+		t.Logf("%-16s %-8t %-8t %-10t %-10d %-22s %-12s %8d %12s %s",
+			exp.File, read.ImageReceived, read.Legible, read.HasTotalLine, read.TotalMinor,
 			truncate(read.Merchant, 22), read.Date, elapsed.Milliseconds(),
-			strconv.Itoa(read.PromptTokens)+"/"+strconv.Itoa(read.CompletionTokens))
+			strconv.Itoa(read.PromptTokens)+"/"+strconv.Itoa(read.CompletionTokens), read.ServedModel)
+
+		// A model that answers "I saw no image" on a fixture that plainly
+		// carried one is the outage this harness exists to catch: the bot
+		// answers photo_vision_down for it, so it must never be a
+		// misreading of a real photo.
+		if !read.ImageReceived {
+			t.Errorf("%s: image_received = false — the model denies seeing the attached photo (served %q)",
+				exp.File, read.ServedModel)
+		}
 
 		// An illegible photo must never come back with a number: a
 		// guessed total is worse than a refusal.
