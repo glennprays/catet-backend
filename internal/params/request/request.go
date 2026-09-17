@@ -188,8 +188,8 @@ type UpdateBudgetRequest struct {
 // ------------------------------------------------------------- hold queue
 
 // ResolveHoldRequest confirms (execute) or discards a parked action.
-// Overrides are the corrections the user made in the capture sheet
-// before confirming; they only apply to `confirm`.
+// Overrides are the corrections the user made in the capture or receipt
+// sheet before confirming; they only apply to `confirm`.
 type ResolveHoldRequest struct {
 	Action    string         `json:"action" validate:"required,oneof=confirm discard"`
 	Overrides *HoldOverrides `json:"overrides" validate:"omitempty"`
@@ -203,6 +203,19 @@ type HoldOverrides struct {
 	Merchant            *string    `json:"merchant"`
 	Note                *string    `json:"note"`
 	OccurredDate        *string    `json:"occurred_date" validate:"omitempty,yyyy-mm-date"`
+	// Collapse writes a receipt as one line at its printed total instead
+	// of one line per item.
+	Collapse *bool `json:"collapse"`
+	// Items are per-line corrections for a receipt, keyed by the line's
+	// `n`.
+	Items []HoldItemOverride `json:"items" validate:"omitempty,dive"`
+}
+
+// HoldItemOverride corrects one parked receipt line. N is the line's
+// 1-based `n` as parked, so the correction survives a re-render.
+type HoldItemOverride struct {
+	N          int        `json:"n" validate:"required,min=1"`
+	CategoryID *uuid.UUID `json:"category_id" validate:"omitempty,uuid"`
 }
 
 // --------------------------------------------------------------- settings

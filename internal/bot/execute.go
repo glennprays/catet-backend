@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
@@ -182,6 +183,8 @@ func (h *Harness) executeReceipt(
 	merchant := params.Merchant
 	var (
 		userCategory *uuid.UUID
+		lineCategory map[int]uuid.UUID
+		occurredDate *string
 		noteSuffix   string
 	)
 	if ov != nil {
@@ -216,6 +219,65 @@ func (h *Harness) executeReceipt(
 		if ov.Note != nil {
 			noteSuffix = *ov.Note
 		}
+		if ov.OccurredDate != nil && *ov.OccurredDate != "" {
+			occurredDate = ov.OccurredDate
+		}
+		// Collapsing writes a single line, so there is no line left for a
+		// per-line correction to name: the two overrides contradict.
+		if ov.Collapse != nil && *ov.Collapse && len(ov.Items) > 0 {
+			return nil, apperror.Validation("transaction validation failed").WithDetails(apperror.FieldError{
+				Field: "items", Rule: "conflict",
+				Message: "Rincian per baris tidak berlaku untuk satu baris",
+			})
+		}
+		// Per-line labels are keyed by the parked line's N, so a stale
+		// sheet cannot silently relabel the wrong line: an N the draft
+		// does not have is refused, never ignored.
+		for _, it := range ov.Items {
+			if it.CategoryID == nil {
+				continue
+			}
+			found := false
+			for j := range params.Items {
+				if params.Items[j].N == it.N {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, apperror.Validation("transaction validation failed").WithDetails(apperror.FieldError{
+					Field: "items", Rule: "unknown_line",
+					Message: fmt.Sprintf("Baris %d tidak ada", it.N),
+				})
+			}
+			if lineCategory == nil {
+				lineCategory = make(map[int]uuid.UUID, len(ov.Items))
+			}
+			lineCategory[it.N] = *it.CategoryID
+		}
+		// The dashboard's opt-out of the per-item split: one line at the
+		// printed total. N is 0 — no parked line ever uses it, so the
+		// collapsed write can never adopt a half-written per-line attempt.
+		if ov.Collapse != nil && *ov.Collapse && len(params.Items) > 1 {
+			id, conf := majorityLineCategory(params.Items)
+			label := ""
+			if id != nil {
+				for _, it := range params.Items {
+					if it.CategoryID != nil && *it.CategoryID == *id {
+						label = it.CategoryName
+						break
+					}
+				}
+			}
+			params.Items = []receiptItem{{
+				N:                  0,
+				Name:               merchant + " · " + strconv.Itoa(len(params.Items)) + " item",
+				AmountMinor:        params.TotalMinor,
+				CategoryID:         id,
+				CategoryConfidence: conf,
+				CategoryName:       label,
+			}}
+		}
 	}
 	if params.SourceID == nil {
 		return nil, apperror.Validation("transaction validation failed").WithDetails(apperror.FieldError{
@@ -249,9 +311,22 @@ func (h *Harness) executeReceipt(
 			ExternalID:          &externalID,
 			ContentHash:         &params.ContentHash,
 		}
+		// A backdate from the sheet moves the whole receipt: every line
+		// is the same purchase.
+		if occurredDate != nil {
+			in.OccurredAt = nil
+			in.OccurredDate = occurredDate
+		}
 		// A transfer has no category: both legs are the user's own money.
 		if params.Type != "transfer" {
+			lineID, hasLine := lineCategory[item.N]
 			switch {
+			case hasLine:
+				// The sheet labelled this exact line; it outranks a
+				// whole-receipt override and the model's own guess.
+				user := "user"
+				in.CategoryID = &lineID
+				in.CategorySource = &user
 			case userCategory != nil:
 				user := "user"
 				in.CategoryID = userCategory

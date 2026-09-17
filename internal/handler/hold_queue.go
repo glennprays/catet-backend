@@ -45,6 +45,14 @@ func (h *HoldQueueHandler) Resolve(c *fiber.Ctx) error {
 			Merchant:            req.Overrides.Merchant,
 			Note:                req.Overrides.Note,
 			OccurredDate:        req.Overrides.OccurredDate,
+			Collapse:            req.Overrides.Collapse,
+		}
+		if len(req.Overrides.Items) > 0 {
+			items := make([]service.PendingItemOverride, 0, len(req.Overrides.Items))
+			for _, it := range req.Overrides.Items {
+				items = append(items, service.PendingItemOverride{N: it.N, CategoryID: it.CategoryID})
+			}
+			overrides.Items = items
 		}
 	}
 	txs, err := h.svc.Resolve(c.UserContext(), id, req.Action, overrides)

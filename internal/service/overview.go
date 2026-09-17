@@ -369,6 +369,19 @@ type PendingOverrides struct {
 	Merchant            *string
 	Note                *string
 	OccurredDate        *string
+	// Collapse writes a receipt as one line at its printed total instead
+	// of one line per item.
+	Collapse *bool
+	// Items are per-line corrections for a receipt, keyed by the parked
+	// line's N.
+	Items []PendingItemOverride
+}
+
+// PendingItemOverride is one receipt line's correction: the line's
+// parked N and the Category the user chose for it.
+type PendingItemOverride struct {
+	N          int
+	CategoryID *uuid.UUID
 }
 
 // PendingExecutor performs a confirmed pending action and returns every
