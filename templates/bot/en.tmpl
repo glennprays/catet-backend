@@ -143,6 +143,10 @@ I can't see the TOTAL line yet. Send the bottom of the receipt — the part with
 Hmm, that doesn't look like a receipt or payment proof. Type the amount if you want me to record it.
 {{- end}}
 
+{{define "photo_vision_down" -}}
+I can't see photos right now, the receipt reader is having trouble. Try again later, or type the amount.
+{{- end}}
+
 {{define "photo_statement" -}}
 I can't read statements or bills that hold many transactions. Send the receipts one at a time.
 {{- end}}
@@ -164,7 +168,7 @@ Receipt reading is off right now. Just type the amount.
 {{- end}}
 
 {{define "receipt_summary" -}}
-{{if .Duplicate}}Possible duplicate · {{end}}{{if .Payment}}Payment proof {{.Merchant}} · {{.Total}}{{else}}Receipt {{.Merchant}} · {{.Date}} · {{.N}} items · {{.Total}}{{end}}{{if .Collapsed}} · breakdown inconsistent{{end}}
+{{if .Duplicate}}Possible duplicate · {{end}}{{if .Payment}}Payment proof {{.Merchant}} · {{.Total}}{{else}}Receipt {{.Merchant}} · {{.Date}} · {{.N}} items · {{.Total}}{{end}}{{if .Inconsistent}} · breakdown inconsistent{{end}}
 {{- end}}
 
 {{/* The Source line says how the Source was decided — see id.tmpl. */}}

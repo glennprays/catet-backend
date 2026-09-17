@@ -29,7 +29,7 @@ func contentServer(t *testing.T, content string, calls *int32, bodies *[]map[str
 			*bodies = append(*bodies, body)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":` + jsonString(content) + `}}]}`))
+		_, _ = w.Write([]byte(`{"model":"served-model","choices":[{"message":{"role":"assistant","content":` + jsonString(content) + `}}]}`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -322,6 +322,7 @@ func TestReadReceiptSendsAnInlineImageToTheVisionModel(t *testing.T) {
 	var calls int32
 	var bodies []map[string]any
 	srv := contentServer(t, `{
+		"image_received":true,
 		"document_type":"receipt","legible":true,"issues":[],
 		"merchant":" Indomaret ","date":"2026-09-13","currency":"idr",
 		"has_total_line":true,"total_minor":35000,"subtotal_minor":35000,
@@ -343,6 +344,8 @@ func TestReadReceiptSendsAnInlineImageToTheVisionModel(t *testing.T) {
 	messages, ok := bodies[0]["messages"].([]any)
 	require.True(t, ok)
 	require.Len(t, messages, 2)
+	assert.Contains(t, messages[0].(map[string]any)["content"], "image_received",
+		"the schema the model must answer carries the flag")
 	parts, ok := messages[1].(map[string]any)["content"].([]any)
 	require.True(t, ok, "the user message must be multimodal")
 	require.Len(t, parts, 2)
@@ -352,6 +355,8 @@ func TestReadReceiptSendsAnInlineImageToTheVisionModel(t *testing.T) {
 	assert.Equal(t, "image_url", image["type"])
 	url, _ := image["image_url"].(map[string]any)["url"].(string)
 	assert.True(t, strings.HasPrefix(url, "data:image/jpeg;base64,"), "url was %q", url)
+	assert.True(t, read.ImageReceived, "the model said it saw the image")
+	assert.Equal(t, "served-model", read.ServedModel, "the router's own model name is reported")
 
 	// Post-processing is the whitelist and the sanity clamp: an id we
 	// never offered is dropped, a confidence above 1 is clamped, a

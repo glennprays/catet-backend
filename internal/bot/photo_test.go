@@ -3,6 +3,7 @@ package bot_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -15,7 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glennprays/catet-backend/internal/apperror"
+	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/llm"
+	"github.com/glennprays/catet-backend/internal/service"
 	waga "github.com/glennprays/whatsapp-gateway-sdk-go"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -262,6 +266,32 @@ func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, open, 1, "a duplicate photo parks nothing new")
 	assert.NotEqual(t, first, f.sender.last())
+}
+
+// A read that failed on our side is not a judgement on the bytes: the
+// same photo sent again must be read again, never replayed as "already
+// sent".
+func TestPhotoFailedReadIsRetriedNotReplayedAsDuplicate(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+	fake.receipt = func() string { return "upstream hiccup" }
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Aduh, ada yang error"),
+		"reply was %q", f.sender.last())
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Nil(t, row.MediaSha256, "a failed read leaves no fingerprint behind")
+
+	fake.receipt = func() string { return twoLineReceipt(f) }
+	f.sendPhoto(t, "m2", url, size, "")
+
+	assert.Equal(t, 2, fake.calls(), "the resent photo reaches the model again")
+	assert.Contains(t, f.sender.last(), "Struk Indomaret")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Len(t, open, 1, "the retry parks the draft the failure never produced")
 }
 
 // A gateway that does not download media hands us WhatsApp's encrypted
@@ -551,5 +581,167 @@ func TestPhotoCaptionCategoryLabelsEveryLine(t *testing.T) {
 		require.NotNil(t, tx.CategorySource)
 		assert.Equal(t, "user", *tx.CategorySource, "a label the user gave is not a guess")
 		assert.Equal(t, "clean", tx.ReviewStatus)
+	}
+}
+
+// A vision model that reports it never received the image is our outage,
+// and the reply says so instead of blaming the photo.
+func TestPhotoVisionOutageIsNotCalledNotAReceipt(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(*botFixture) string {
+		return `{"image_received":false,"document_type":"other","legible":false,"issues":[],` +
+			`"merchant":"","date":"","currency":"","has_total_line":false,"total_minor":0,` +
+			`"subtotal_minor":0,"discount_minor":0,"tax_minor":0,"rounding_minor":0,` +
+			`"payment_method":"","direction":"","counterparty":"","items":[]}`
+	})
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Aku lagi nggak bisa lihat foto"),
+		"reply was %q", f.sender.last())
+	assert.Equal(t, 1, fake.calls())
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open, "an outage parks nothing")
+	assert.Empty(t, f.live(t))
+}
+
+// ------------------------------------------------ dashboard confirmation
+
+// ptr is the one-liner the override structs need: every correction is a
+// pointer, because "absent" and "cleared" are different answers.
+func ptr[T any](v T) *T { return &v }
+
+// parkedReceipt sends the cash receipt (2 lines, no Source the bot may
+// trust) and returns the parked draft the dashboard would confirm.
+func parkedReceipt(t *testing.T) (*botFixture, entity.PendingAction) {
+	t.Helper()
+	f, _, url, size := newPhotoFixture(t, func(f *botFixture) string {
+		return cashReceipt("Indomaret", f)
+	})
+	f.sendPhoto(t, "m1", url, size, "")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	require.Equal(t, "receipt", open[0].Kind)
+	return f, open[0]
+}
+
+// detailOf is how a bot test reads a field rule off a validation error.
+func detailOf(t *testing.T, err error) apperror.FieldError {
+	t.Helper()
+	var appErr *apperror.Error
+	require.True(t, errors.As(err, &appErr), "want an apperror, got %v", err)
+	require.Len(t, appErr.Details, 1)
+	return appErr.Details[0]
+}
+
+// The dashboard's Konfirmasi: it answers the Source question the chat
+// asked, and may relabel a single line without touching the others.
+func TestDashboardConfirmPicksSourceAndPerLineCategory(t *testing.T) {
+	f, hold := parkedReceipt(t)
+
+	txs, err := f.harness.Execute(f.ctx, &hold, &service.PendingOverrides{
+		SourceID: &f.gopay.ID,
+		Items:    []service.PendingItemOverride{{N: 2, CategoryID: &f.transpor.ID}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txs, 2, "one ledger line per receipt item")
+
+	live := f.live(t)
+	require.Len(t, live, 2)
+	for _, tx := range live {
+		assert.Equal(t, f.gopay.ID, legSourceID(t, tx.Legs), "the picked Source paid every line")
+	}
+	require.NotNil(t, live[0].CategoryID)
+	assert.Equal(t, f.makanan.ID, *live[0].CategoryID, "an untouched line keeps the model's label")
+	require.NotNil(t, live[0].CategorySource)
+	assert.Equal(t, "llm", *live[0].CategorySource)
+	require.NotNil(t, live[1].CategoryID)
+	assert.Equal(t, f.transpor.ID, *live[1].CategoryID)
+	require.NotNil(t, live[1].CategorySource)
+	assert.Equal(t, "user", *live[1].CategorySource, "a label the user picked is not a guess")
+	assert.Equal(t, "clean", live[1].ReviewStatus)
+
+	id := f.photoDefaultSource(t)
+	require.NotNil(t, id, "a Source picked in the dashboard teaches the fallback too")
+	assert.Equal(t, f.gopay.ID, *id)
+}
+
+// The opt-out: one line at the printed total, under an external_id no
+// per-line attempt can ever collide with.
+func TestDashboardConfirmCollapsesToOneLine(t *testing.T) {
+	f, hold := parkedReceipt(t)
+
+	txs, err := f.harness.Execute(f.ctx, &hold, &service.PendingOverrides{
+		SourceID: &f.bca.ID,
+		Collapse: ptr(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, txs, 1)
+
+	live := f.live(t)
+	require.Len(t, live, 1)
+	tx := live[0]
+	assert.Equal(t, int64(35_000), tx.AmountMinor, "the printed total, whole")
+	require.NotNil(t, tx.ExternalID)
+	assert.Equal(t, "m1#0", *tx.ExternalID, "no parked line uses N=0")
+	require.NotNil(t, tx.Note)
+	assert.Equal(t, "Indomaret · 2 item", *tx.Note)
+	require.NotNil(t, tx.CategoryID)
+	assert.Equal(t, f.makanan.ID, *tx.CategoryID, "the collapsed line inherits the majority label")
+	assert.Equal(t, f.bca.ID, legSourceID(t, tx.Legs))
+}
+
+// A correction naming a line the draft does not have is refused, never
+// silently dropped: the sheet and the draft must be talking about the
+// same receipt.
+func TestDashboardConfirmRejectsUnknownLine(t *testing.T) {
+	f, hold := parkedReceipt(t)
+
+	_, err := f.harness.Execute(f.ctx, &hold, &service.PendingOverrides{
+		SourceID: &f.bca.ID,
+		Items:    []service.PendingItemOverride{{N: 9, CategoryID: &f.makanan.ID}},
+	})
+
+	require.Error(t, err)
+	detail := detailOf(t, err)
+	assert.Equal(t, "items", detail.Field)
+	assert.Equal(t, "unknown_line", detail.Rule)
+	assert.Empty(t, f.live(t), "a refused confirmation writes nothing")
+}
+
+func TestDashboardCollapseRejectsItemOverrides(t *testing.T) {
+	f, hold := parkedReceipt(t)
+
+	_, err := f.harness.Execute(f.ctx, &hold, &service.PendingOverrides{
+		SourceID: &f.bca.ID,
+		Collapse: ptr(true),
+		Items:    []service.PendingItemOverride{{N: 1, CategoryID: &f.makanan.ID}},
+	})
+
+	require.Error(t, err)
+	detail := detailOf(t, err)
+	assert.Equal(t, "items", detail.Field)
+	assert.Equal(t, "conflict", detail.Rule)
+	assert.Empty(t, f.live(t))
+}
+
+// One receipt is one purchase: a corrected date moves every line.
+func TestDashboardConfirmBackdatesEveryLine(t *testing.T) {
+	f, hold := parkedReceipt(t)
+
+	_, err := f.harness.Execute(f.ctx, &hold, &service.PendingOverrides{
+		SourceID:     &f.bca.ID,
+		OccurredDate: ptr("2026-09-10"),
+	})
+	require.NoError(t, err)
+
+	want, err := service.JakartaNoon("2026-09-10")
+	require.NoError(t, err)
+	live := f.live(t)
+	require.Len(t, live, 2)
+	for _, tx := range live {
+		assert.True(t, want.Equal(tx.OccurredAt), "line %q dated %s, want %s",
+			*tx.Note, tx.OccurredAt, want)
 	}
 }

@@ -155,6 +155,10 @@ Baris TOTAL-nya belum kelihatan. Foto bagian bawah struknya ya — cukup yang ad
 Hmm, ini kayaknya bukan struk atau bukti bayar. Kalau mau kucatat, ketik nominalnya ya.
 {{- end}}
 
+{{define "photo_vision_down" -}}
+Aku lagi nggak bisa lihat foto sekarang, pembaca struknya bermasalah. Coba kirim lagi nanti, atau ketik nominalnya ya.
+{{- end}}
+
 {{define "photo_statement" -}}
 Mutasi atau tagihan yang isinya banyak transaksi belum bisa kubaca. Kirim struknya satu per satu ya.
 {{- end}}
@@ -177,7 +181,7 @@ Baca struk lagi nonaktif. Ketik nominalnya aja ya.
 
 {{/* The Hold Queue row label, also the first line of the question. */}}
 {{define "receipt_summary" -}}
-{{if .Duplicate}}Mungkin duplikat · {{end}}{{if .Payment}}Bukti bayar {{.Merchant}} · {{.Total}}{{else}}Struk {{.Merchant}} · {{.Date}} · {{.N}} item · {{.Total}}{{end}}{{if .Collapsed}} · rincian tidak konsisten{{end}}
+{{if .Duplicate}}Mungkin duplikat · {{end}}{{if .Payment}}Bukti bayar {{.Merchant}} · {{.Total}}{{else}}Struk {{.Merchant}} · {{.Date}} · {{.N}} item · {{.Total}}{{end}}{{if .Inconsistent}} · rincian tidak konsisten{{end}}
 {{- end}}
 
 {{/* The Source line says how the Source was decided: a remembered or

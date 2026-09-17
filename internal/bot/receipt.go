@@ -63,11 +63,11 @@ type receiptParams struct {
 	OriginalText        string        `json:"original_text"` // the caption, may be ""
 	ContentHash         string        `json:"content_hash"`
 	DuplicateOf         *uuid.UUID    `json:"duplicate_of,omitempty"`
-	// Collapsed marks a draft whose printed breakdown did not add up to
-	// the printed total: the money is one line at the total instead of a
-	// per-item split nobody can trust.
-	Collapsed bool     `json:"collapsed"`
-	Missing   []string `json:"missing"`
+	// Inconsistent marks a draft whose printed breakdown missed the
+	// printed total by more than `receiptTolerance`: the lines are
+	// proportional shares of the total, never the printed item prices.
+	Inconsistent bool     `json:"inconsistent"`
+	Missing      []string `json:"missing"`
 	// Payments is the split of one bill across several Sources. Empty
 	// means the ordinary case: SourceID paid all of it.
 	Payments []receiptPayment `json:"payments,omitempty"`
@@ -104,7 +104,7 @@ type receiptReject struct {
 const taxLineName = "Pajak & biaya layanan"
 
 // receiptTolerance is how far the printed breakdown may miss the printed
-// total before the draft collapses to a single line: one thousand rupiah
+// total before the draft is flagged inconsistent: one thousand rupiah
 // or one percent, whichever is larger. Below that the gap is rounding and
 // unreadable small print; above it the item list means something else.
 func receiptTolerance(total int64) int64 {
@@ -120,6 +120,16 @@ func receiptTolerance(total int64) int64 {
 func buildReceiptDraft(r *llm.ReceiptRead, in receiptInput) (*receiptParams, *receiptReject) {
 	if r == nil {
 		return nil, &receiptReject{Template: "photo_not_receipt"}
+	}
+
+	// A model that never saw the photo says so and then has nothing to
+	// report. That is our outage — a text-only model or a router that
+	// dropped the image — never the user's photo, so it must not be
+	// answered as "not a receipt". The guard is conjunctive on purpose:
+	// a model that read a merchant or a total is believed even if it
+	// forgot the flag.
+	if !r.ImageReceived && r.DocumentType == "other" && !r.Legible && r.TotalMinor == 0 && len(r.Items) == 0 {
+		return nil, &receiptReject{Template: "photo_vision_down"}
 	}
 
 	switch {
@@ -181,7 +191,7 @@ func buildReceiptDraft(r *llm.ReceiptRead, in receiptInput) (*receiptParams, *re
 		p.Items[0].CategoryID, p.Items[0].CategoryConfidence = majorityCategory(r.Items)
 		p.Items[0].CategoryName = categoryName(derefID(p.Items[0].CategoryID), in.Cats)
 	} else {
-		p.Items, p.Collapsed = receiptLines(r, in.Cats)
+		p.Items, p.Inconsistent = receiptLines(r, in.Cats)
 	}
 	if p.Merchant == "" {
 		p.Merchant = "Struk"
@@ -197,7 +207,10 @@ func buildReceiptDraft(r *llm.ReceiptRead, in receiptInput) (*receiptParams, *re
 // receiptLines splits the printed total into ledger lines. It trusts the
 // item list only as *weights*: the amounts themselves are always shares
 // of the printed total, so the lines can never sum to something the
-// receipt does not say.
+// receipt does not say. The second return reports that the printed
+// breakdown did not reconcile with the printed total; the lines are kept
+// anyway — proportional shares of the total — because every receipt is a
+// Hold, so the split is confirmed explicitly and never invented silently.
 func receiptLines(r *llm.ReceiptRead, cats []entity.Category) ([]receiptItem, bool) {
 	total := r.TotalMinor
 
@@ -210,16 +223,9 @@ func receiptLines(r *llm.ReceiptRead, cats []entity.Category) ([]receiptItem, bo
 		}
 		sum += it.AmountMinor
 	}
-	// The consistency check: does the printed breakdown explain the
-	// printed total? A miss larger than the tolerance means we misread
-	// the lines, the discount or the tax — collapse instead of inventing
-	// a split (ADR-0003).
-	if usable {
-		expected := sum - r.DiscountMinor + r.TaxMinor + r.RoundingMinor
-		if abs64(expected-total) > receiptTolerance(total) {
-			usable = false
-		}
-	}
+	// Without usable weights there is nothing to split by: one line at
+	// the printed total. Items that were read but unpriced still mean the
+	// breakdown failed; a receipt with no items at all is simply a total.
 	if !usable {
 		id, conf := majorityCategory(r.Items)
 		name := strconv.Itoa(len(r.Items)) + " item"
@@ -230,15 +236,25 @@ func receiptLines(r *llm.ReceiptRead, cats []entity.Category) ([]receiptItem, bo
 			N: 1, Name: strings.TrimSpace(r.Merchant + " · " + name),
 			AmountMinor: total, CategoryID: id, CategoryConfidence: conf,
 			CategoryName: categoryName(derefID(id), cats),
-		}}, true
+		}}, len(r.Items) > 0
 	}
+
+	// The consistency check: does the printed breakdown explain the
+	// printed total? A miss larger than the tolerance means we misread
+	// the lines, the discount or the tax (ADR-0003). The item list is
+	// still the best weighting we have, so the lines survive as
+	// proportional shares — flagged, for the user to confirm or collapse.
+	expected := sum - r.DiscountMinor + r.TaxMinor + r.RoundingMinor
+	inconsistent := abs64(expected-total) > receiptTolerance(total)
 
 	// Tax and service charge are one visible line when they add to the
 	// bill; a negative rounding adjustment is absorbed by the shares
-	// instead of becoming a line of its own.
+	// instead of becoming a line of its own. An inconsistent read gets no
+	// synthetic line at all: those very figures are what failed to
+	// reconcile, so they are not trusted as money.
 	extra := r.TaxMinor + r.RoundingMinor
 	itemsTarget := total
-	if extra > 0 && extra < total {
+	if !inconsistent && extra > 0 && extra < total {
 		itemsTarget = total - extra
 	} else {
 		extra = 0
@@ -271,7 +287,7 @@ func receiptLines(r *llm.ReceiptRead, cats []entity.Category) ([]receiptItem, bo
 			CategoryName: categoryName(derefID(id), cats),
 		})
 	}
-	return lines, false
+	return lines, inconsistent
 }
 
 // allocate splits total across weights with largest-remainder rounding,
@@ -315,24 +331,35 @@ func allocate(total int64, weights []int64) []int64 {
 	return out
 }
 
-// majorityCategory is the label a collapsed or synthetic line inherits:
-// the most frequent category among the read items, or none when the
-// items disagree evenly.
-func majorityCategory(items []llm.ReceiptItem) (*uuid.UUID, *float64) {
-	counts := map[uuid.UUID]int{}
-	confs := map[uuid.UUID]float64{}
-	for _, it := range items {
-		if it.CategoryID == nil {
-			continue
-		}
-		counts[*it.CategoryID]++
-		if it.CategoryConfidence > confs[*it.CategoryID] {
-			confs[*it.CategoryID] = it.CategoryConfidence
-		}
+// categoryTally holds the majority rule in one place: the most frequent
+// Category among a receipt's lines wins, an even disagreement wins
+// nothing, and the winner keeps the highest confidence seen for it.
+type categoryTally struct {
+	counts map[uuid.UUID]int
+	confs  map[uuid.UUID]float64
+}
+
+func newCategoryTally(n int) categoryTally {
+	return categoryTally{
+		counts: make(map[uuid.UUID]int, n),
+		confs:  make(map[uuid.UUID]float64, n),
 	}
+}
+
+func (t categoryTally) add(id *uuid.UUID, conf float64) {
+	if id == nil {
+		return
+	}
+	t.counts[*id]++
+	if conf > t.confs[*id] {
+		t.confs[*id] = conf
+	}
+}
+
+func (t categoryTally) winner() (*uuid.UUID, *float64) {
 	var winner uuid.UUID
 	best, tied := 0, false
-	for id, n := range counts {
+	for id, n := range t.counts {
 		switch {
 		case n > best:
 			winner, best, tied = id, n, false
@@ -343,8 +370,33 @@ func majorityCategory(items []llm.ReceiptItem) (*uuid.UUID, *float64) {
 	if best == 0 || tied {
 		return nil, nil
 	}
-	id, conf := winner, confs[winner]
+	id, conf := winner, t.confs[winner]
 	return &id, &conf
+}
+
+// majorityCategory is the label a synthetic line inherits: the most
+// frequent category among the read items, or none when the items
+// disagree evenly.
+func majorityCategory(items []llm.ReceiptItem) (*uuid.UUID, *float64) {
+	tally := newCategoryTally(len(items))
+	for _, it := range items {
+		tally.add(it.CategoryID, it.CategoryConfidence)
+	}
+	return tally.winner()
+}
+
+// majorityLineCategory is majorityCategory over parked lines: the label
+// a collapsed receipt inherits from the split it replaces.
+func majorityLineCategory(items []receiptItem) (*uuid.UUID, *float64) {
+	tally := newCategoryTally(len(items))
+	for _, it := range items {
+		conf := 0.0
+		if it.CategoryConfidence != nil {
+			conf = *it.CategoryConfidence
+		}
+		tally.add(it.CategoryID, conf)
+	}
+	return tally.winner()
 }
 
 // receiptSummaryData is the Hold Queue row label's slots. The copy that
@@ -358,13 +410,13 @@ func receiptSummaryData(p *receiptParams, lang string) map[string]any {
 		}
 	}
 	return map[string]any{
-		"Payment":   p.DocumentType == "payment_screenshot",
-		"Merchant":  p.Merchant,
-		"Date":      date,
-		"N":         len(p.Items),
-		"Total":     money.FormatIDR(p.TotalMinor),
-		"Duplicate": p.DuplicateOf != nil,
-		"Collapsed": p.Collapsed,
+		"Payment":      p.DocumentType == "payment_screenshot",
+		"Merchant":     p.Merchant,
+		"Date":         date,
+		"N":            len(p.Items),
+		"Total":        money.FormatIDR(p.TotalMinor),
+		"Duplicate":    p.DuplicateOf != nil,
+		"Inconsistent": p.Inconsistent,
 	}
 }
 

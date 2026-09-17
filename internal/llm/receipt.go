@@ -25,6 +25,16 @@ type ReceiptItem struct {
 // breakdown is consistent with the printed total before anything becomes
 // a ledger line (ADR-0003).
 type ReceiptRead struct {
+	// ImageReceived is the model's own statement that an image was
+	// attached and visible to it. A text-only model, or a router that
+	// strips the image part, answers false — that is an outage, not a
+	// non-receipt.
+	ImageReceived bool
+	// ServedModel is the model name the provider reports in its reply; a
+	// router may alias the configured name to something else, and the
+	// photo log needs the real one.
+	ServedModel string
+
 	DocumentType  string // receipt | payment_screenshot | statement | other
 	Legible       bool
 	Issues        []string // blur | glare | cropped | too_small | not_a_receipt
@@ -61,6 +71,7 @@ const receiptSystem = "You read one photo of a store receipt, restaurant bill or
 	"For a payment-app screenshot (GoPay, OVO, DANA, BCA, QRIS, etc.) set `document_type=payment_screenshot`, one item named after the merchant/counterparty with the paid amount, " +
 	"`direction=out` for money leaving, `in` for money received, `counterparty` = the displayed other party. " +
 	"A bank statement, e-wallet history list, or BNPL/paylater bill with several transactions is `document_type=statement`. " +
+	"Set `image_received=true` only when an image is attached to the message and you can see it; if there is no image or you cannot process images set `image_received=false`, `document_type=other`, `legible=false`, `total_minor=0` and `items=[]`. " +
 	"Anything that is not money-related is `other`."
 
 // isoDate is the only date shape accepted from the model; anything else
@@ -86,6 +97,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 	}
 
 	schema := objectSchema(map[string]any{
+		"image_received": map[string]any{"type": "boolean"},
 		"document_type":  map[string]any{"type": "string", "enum": []string{"receipt", "payment_screenshot", "statement", "other"}},
 		"legible":        map[string]any{"type": "boolean"},
 		"issues":         map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"blur", "glare", "cropped", "too_small", "not_a_receipt"}}},
@@ -112,6 +124,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 			}, "name", "qty", "amount_minor", "category_id", "category_confidence"),
 		},
 	},
+		"image_received",
 		"document_type", "legible", "issues", "merchant", "date", "currency",
 		"has_total_line", "total_minor", "subtotal_minor", "discount_minor",
 		"tax_minor", "rounding_minor", "payment_method", "direction",
@@ -119,6 +132,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 	)
 
 	var out struct {
+		ImageReceived bool     `json:"image_received"`
 		DocumentType  string   `json:"document_type"`
 		Legible       bool     `json:"legible"`
 		Issues        []string `json:"issues"`
@@ -156,6 +170,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 	}
 
 	read := &ReceiptRead{
+		ImageReceived:    out.ImageReceived,
 		DocumentType:     normalizeDocumentType(out.DocumentType),
 		Legible:          out.Legible,
 		Issues:           normalizeIssues(out.Issues),
@@ -172,6 +187,7 @@ func (c *Client) ReadReceipt(ctx context.Context, img []byte, mime, caption stri
 		Counterparty:     strings.TrimSpace(out.Counterparty),
 		PromptTokens:     used.PromptTokens,
 		CompletionTokens: used.CompletionTokens,
+		ServedModel:      used.Model,
 	}
 	if d := strings.TrimSpace(out.Date); isoDate.MatchString(d) {
 		read.Date = d

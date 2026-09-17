@@ -54,6 +54,7 @@ var names = []string{
 	"photo_unreadable",
 	"photo_no_total",
 	"photo_not_receipt",
+	"photo_vision_down",
 	"photo_statement",
 	"photo_currency",
 	"photo_too_large",

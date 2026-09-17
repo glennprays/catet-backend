@@ -301,6 +301,7 @@ type chatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+	Model string `json:"model"`
 	Usage *usage `json:"usage"`
 }
 
@@ -309,6 +310,9 @@ type chatResponse struct {
 type usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	// Model is what the provider says it served; filled by attempt, not
+	// decoded.
+	Model string `json:"-"`
 }
 
 // complete runs one guarded text call against the text model, ignoring
@@ -412,8 +416,9 @@ func extractJSONObject(content string) (string, bool) {
 
 // attempt performs a single request. The bool reports whether the
 // failure is worth one more try: network faults, timeouts and 5xx are;
-// a 4xx is our own fault and never is. The usage is nil unless the
-// provider reported it.
+// a 4xx is our own fault and never is. The usage is never nil on
+// success: token counts are zero when the provider reports none, and
+// Model is whatever it named.
 func (c *Client) attempt(budget context.Context, settings resolved, timeout time.Duration, body []byte) (string, *usage, bool, error) {
 	ctx, cancel := context.WithTimeout(budget, timeout)
 	defer cancel()
@@ -452,7 +457,12 @@ func (c *Client) attempt(budget context.Context, settings resolved, timeout time
 	if len(parsed.Choices) == 0 {
 		return "", parsed.Usage, false, errors.New("llm: empty choices")
 	}
-	return parsed.Choices[0].Message.Content, parsed.Usage, false, nil
+	u := parsed.Usage
+	if u == nil {
+		u = &usage{}
+	}
+	u.Model = parsed.Model
+	return parsed.Choices[0].Message.Content, u, false, nil
 }
 
 // Ping is the admin's connection test: one minimal completion against

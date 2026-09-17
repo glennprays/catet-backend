@@ -128,6 +128,7 @@ var fixtures = map[string]struct {
 	"photo_unreadable":  {data: map[string]any{"Issue": "blur"}},
 	"photo_no_total":    {data: nil},
 	"photo_not_receipt": {data: nil},
+	"photo_vision_down": {data: nil},
 	"photo_statement":   {data: nil},
 	"photo_currency":    {data: map[string]any{"Currency": "MYR"}},
 	"photo_too_large":   {data: nil},
@@ -139,7 +140,7 @@ var fixtures = map[string]struct {
 	"receipt_summary": {
 		data: map[string]any{
 			"Payment": false, "Merchant": "Indomaret", "Date": "14 Sep", "N": 3,
-			"Total": "Rp45.000", "Duplicate": false, "Collapsed": false,
+			"Total": "Rp45.000", "Duplicate": false, "Inconsistent": false,
 		},
 		wantMoney: []string{"Rp45.000"},
 	},

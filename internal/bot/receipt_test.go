@@ -69,7 +69,7 @@ func TestReceiptItemsMatchingTotalBecomeOneLineEach(t *testing.T) {
 
 	p := buildOK(t, r)
 
-	assert.False(t, p.Collapsed)
+	assert.False(t, p.Inconsistent)
 	require.Len(t, p.Items, 3)
 	assert.Equal(t, int64(110_000), sumLines(p))
 	assert.Equal(t, []int{1, 2, 3}, []int{p.Items[0].N, p.Items[1].N, p.Items[2].N})
@@ -97,7 +97,7 @@ func TestReceiptDiscountAndRoundingStillSumToTotal(t *testing.T) {
 
 	p := buildOK(t, r)
 
-	assert.False(t, p.Collapsed)
+	assert.False(t, p.Inconsistent)
 	require.Len(t, p.Items, 2)
 	assert.Equal(t, int64(6_030), sumLines(p))
 	for _, it := range p.Items {
@@ -116,7 +116,7 @@ func TestReceiptTaxBecomesItsOwnLine(t *testing.T) {
 
 	p := buildOK(t, r)
 
-	assert.False(t, p.Collapsed)
+	assert.False(t, p.Inconsistent)
 	require.Len(t, p.Items, 4)
 	assert.Equal(t, taxLineName, p.Items[3].Name)
 	assert.Equal(t, int64(6_000), p.Items[3].AmountMinor)
@@ -125,7 +125,7 @@ func TestReceiptTaxBecomesItsOwnLine(t *testing.T) {
 	assert.Equal(t, int64(66_000), sumLines(p))
 }
 
-func TestReceiptInconsistentBreakdownCollapsesToTheTotal(t *testing.T) {
+func TestReceiptInconsistentBreakdownKeepsProportionalLines(t *testing.T) {
 	r := legibleRead(
 		item("Beras", 10_000, &testRumah),
 		item("Gula", 10_000, &testRumah),
@@ -135,36 +135,45 @@ func TestReceiptInconsistentBreakdownCollapsesToTheTotal(t *testing.T) {
 
 	p := buildOK(t, r)
 
-	assert.True(t, p.Collapsed, "money never comes from an inconsistent breakdown")
-	require.Len(t, p.Items, 1)
-	assert.Equal(t, int64(60_000), p.Items[0].AmountMinor)
-	assert.Equal(t, "Toko Maju · 3 item", p.Items[0].Name)
+	assert.True(t, p.Inconsistent, "the printed breakdown did not reconcile")
+	require.Len(t, p.Items, 3, "the read lines survive as proportional shares")
+	assert.Equal(t, []int{1, 2, 3}, []int{p.Items[0].N, p.Items[1].N, p.Items[2].N})
+	assert.Equal(t,
+		[]string{"Beras", "Gula", "Kopi"},
+		[]string{p.Items[0].Name, p.Items[1].Name, p.Items[2].Name})
+	for _, it := range p.Items {
+		assert.Equal(t, int64(20_000), it.AmountMinor, "line %q is a share of the printed total", it.Name)
+	}
+	assert.Equal(t, int64(60_000), sumLines(p), "the lines still sum to the printed total")
 	require.NotNil(t, p.Items[0].CategoryID)
-	assert.Equal(t, testRumah, *p.Items[0].CategoryID, "2 of 3 lines are Rumah Tangga")
+	assert.Equal(t, testRumah, *p.Items[0].CategoryID)
+	require.NotNil(t, p.Items[2].CategoryID)
+	assert.Equal(t, testMakanan, *p.Items[2].CategoryID)
 }
 
-func TestReceiptTiedCategoriesCollapseWithoutALabel(t *testing.T) {
+func TestReceiptItemWithoutPriceIsOneLineAtTheTotal(t *testing.T) {
 	r := legibleRead(
 		item("Beras", 10_000, &testRumah),
-		item("Kopi", 10_000, &testMakanan),
+		item("Kopi", 0, &testMakanan),
 	)
-	r.TotalMinor = 90_000
+	r.TotalMinor = 45_000
 
 	p := buildOK(t, r)
 
-	require.Len(t, p.Items, 1)
-	assert.True(t, p.Collapsed)
-	assert.Nil(t, p.Items[0].CategoryID, "a tie is not a majority")
+	require.Len(t, p.Items, 1, "an unpriced item is no weight to split by")
+	assert.True(t, p.Inconsistent)
+	assert.Equal(t, int64(45_000), p.Items[0].AmountMinor)
+	assert.Equal(t, "Toko Maju · 2 item", p.Items[0].Name)
 }
 
-func TestReceiptWithoutItemsCollapsesToTheTotal(t *testing.T) {
+func TestReceiptWithoutItemsIsOneLineAtTheTotal(t *testing.T) {
 	r := legibleRead()
 	r.TotalMinor = 45_000
 
 	p := buildOK(t, r)
 
 	require.Len(t, p.Items, 1)
-	assert.True(t, p.Collapsed)
+	assert.False(t, p.Inconsistent, "no printed breakdown is not an inconsistent one")
 	assert.Equal(t, int64(45_000), p.Items[0].AmountMinor)
 }
 
@@ -230,6 +239,41 @@ func TestStatementAndNonReceiptAreRefused(t *testing.T) {
 	}
 }
 
+// A model that reports it never got the image is an outage of ours, not
+// a verdict on the user's photo.
+func TestVisionModelThatSawNoImageIsAnOutageNotARefusal(t *testing.T) {
+	p, reject := buildReceiptDraft(&llm.ReceiptRead{DocumentType: "other", Legible: false},
+		receiptInput{MessageID: "m1", Now: testNow, Cats: testCats})
+
+	assert.Nil(t, p)
+	require.NotNil(t, reject)
+	assert.Equal(t, "photo_vision_down", reject.Template)
+}
+
+// The model saw a cat: that is still a refusal, in the old words.
+func TestNonReceiptPhotoIsStillRefusedAsNotAReceipt(t *testing.T) {
+	p, reject := buildReceiptDraft(&llm.ReceiptRead{ImageReceived: true, DocumentType: "other", Legible: false},
+		receiptInput{MessageID: "m1", Now: testNow, Cats: testCats})
+
+	assert.Nil(t, p)
+	require.NotNil(t, reject)
+	assert.Equal(t, "photo_not_receipt", reject.Template)
+}
+
+// A model that forgot the flag but read the paper is trusted: the guard
+// is conjunctive, so money on the page wins.
+func TestReadWithoutTheFlagButWithMoneyIsBelieved(t *testing.T) {
+	r := legibleRead(item("Beras", 10_000, nil))
+	r.TotalMinor = 10_000
+
+	p, reject := buildReceiptDraft(r, receiptInput{MessageID: "m1", Now: testNow, Cats: testCats})
+
+	assert.Nil(t, reject)
+	require.NotNil(t, p)
+	assert.False(t, r.ImageReceived)
+	require.Len(t, p.Items, 1)
+}
+
 func TestReceiptDateOutsideTheWindowIsDropped(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -276,7 +320,7 @@ func TestPaymentScreenshotIsOneLineNamedAfterTheCounterparty(t *testing.T) {
 	assert.Equal(t, "Warung Bu Sri", p.Items[0].Name)
 	assert.Equal(t, "Warung Bu Sri", p.Merchant)
 	assert.Equal(t, int64(35_000), p.Items[0].AmountMinor)
-	assert.False(t, p.Collapsed)
+	assert.False(t, p.Inconsistent)
 	assert.Equal(t, "payment_screenshot", p.DocumentType)
 }
 

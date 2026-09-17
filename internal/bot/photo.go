@@ -64,11 +64,6 @@ func (h *Harness) readPhoto(
 		}
 	}
 
-	// The bytes' own fingerprint: a forwarded duplicate must replay the
-	// earlier answer instead of paying for a second vision call.
-	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
-		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
-	}
 	prev, err := h.inbound.FindRepliedByMediaSha256(ctx, sha, time.Now().UTC().Add(-photoDuplicateWindow))
 	if err != nil {
 		return "", nil, "", fmt.Errorf("find duplicate photo: %w", err)
@@ -100,9 +95,19 @@ func (h *Harness) readPhoto(
 		h.log.Warn(traceOf(ctx), "photo read failed", map[string]any{"error": err.Error()})
 		return tmpl.Render(lang, "error_generic", nil), nil, reactRejected, nil
 	}
+
+	// The bytes' own fingerprint: a forwarded duplicate must replay the
+	// earlier answer instead of paying for a second vision call.
+	// Recorded only once the model answered: a read that failed on our
+	// side must be retryable, not replayed as "already sent".
+	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
+		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
+	}
+
 	h.log.Info(traceOf(ctx), "photo read", map[string]any{
 		"merchant": read.Merchant, "total_minor": read.TotalMinor, "items": len(read.Items),
 		"legible": read.Legible, "document_type": read.DocumentType,
+		"image_received": read.ImageReceived, "served_model": read.ServedModel,
 		"prompt_tokens": read.PromptTokens, "completion_tokens": read.CompletionTokens,
 		"latency_ms": time.Since(started).Milliseconds(),
 	})
@@ -112,6 +117,11 @@ func (h *Harness) readPhoto(
 		Now: service.JakartaNow(), Cats: cats,
 	})
 	if reject != nil {
+		if reject.Template == "photo_vision_down" {
+			h.log.Warn(traceOf(ctx), "vision model saw no image", map[string]any{
+				"served_model": read.ServedModel, "prompt_tokens": read.PromptTokens,
+			})
+		}
 		return tmpl.Render(lang, reject.Template, reject.Data), nil, reactRejected, nil
 	}
 	params.Chat = p.Chat
