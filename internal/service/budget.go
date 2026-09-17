@@ -81,6 +81,10 @@ func (s *BudgetService) Create(ctx context.Context, categoryID uuid.UUID, period
 		return nil, apperror.Validation("budget validation failed").
 			WithDetails(apperror.FieldError{Field: "category_id", Rule: "exists", Message: "category not found"})
 	}
+	if cat.ArchivedAt != nil {
+		return nil, apperror.Validation("budget validation failed").
+			WithDetails(apperror.FieldError{Field: "category_id", Rule: "archived", Message: "category is archived"})
+	}
 
 	row := &entity.BudgetRow{CategoryID: categoryID, AmountMinor: amountMinor}
 	created, err := s.repo.Create(ctx, row, period, false)

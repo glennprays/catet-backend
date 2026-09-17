@@ -74,6 +74,10 @@ _Avoid_: classification score
 Provenance stamped on every transaction: how its category got assigned (rules, llm, user, import).
 _Avoid_: tagged-by, origin
 
+**Archived category**:
+`archived_at` set. Archiving is transitive: a category and its whole subtree archive together, so a live category never has an archived ancestor. Archived categories keep their history (rows, budgets, analytics) but accept no new parent, child, transaction or budget, and are not edited. There is no restore.
+_Avoid_: deleted category, hidden category
+
 **Needs-Review Queue**:
 Async list of written transactions whose Category Confidence was low. Reviewing never blocks capture.
 _Avoid_: hold queue (different thing)

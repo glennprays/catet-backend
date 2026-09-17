@@ -205,6 +205,8 @@ func (s *TransactionService) Create(ctx context.Context, in CreateInput) (*entit
 		}
 		if cat == nil {
 			fe.add("category_id", "exists", "category not found")
+		} else if cat.ArchivedAt != nil {
+			fe.add("category_id", "archived", "category is archived")
 		}
 	}
 
@@ -506,6 +508,10 @@ func (s *TransactionService) Update(ctx context.Context, id uuid.UUID, in Update
 		if cat == nil {
 			return nil, apperror.Validation("transaction validation failed").
 				WithDetails(apperror.FieldError{Field: "category_id", Rule: "exists", Message: "category not found"})
+		}
+		if cat.ArchivedAt != nil {
+			return nil, apperror.Validation("transaction validation failed").
+				WithDetails(apperror.FieldError{Field: "category_id", Rule: "archived", Message: "category is archived"})
 		}
 	}
 

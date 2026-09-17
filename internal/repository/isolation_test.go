@@ -284,6 +284,9 @@ func TestTenantIsolation(t *testing.T) {
 		isolated("categories.Get", func(ctx context.Context) (*entity.Category, error) {
 			return r.cats.Get(ctx, rows.category)
 		}),
+		isolated("categories.Subtree", func(ctx context.Context) ([]uuid.UUID, error) {
+			return r.cats.Subtree(ctx, rows.category)
+		}),
 
 		isolated("transactions.List", func(ctx context.Context) ([]repository.LedgerRow, error) {
 			return r.txs.List(ctx, repository.ListFilter{Limit: 50})

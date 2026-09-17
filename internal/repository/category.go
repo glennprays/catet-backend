@@ -111,31 +111,76 @@ func (r *CategoryRepository) Update(ctx context.Context, id uuid.UUID, name *str
 	))
 }
 
-// Archive soft-deletes a category. Returns nil when missing or already
-// archived.
-func (r *CategoryRepository) Archive(ctx context.Context, id uuid.UUID) (*entity.Category, error) {
+// Subtree returns the category and every descendant, root first, live or
+// archived. The depth cap is a belt against a cycle that slipped past
+// guardCycle; it never fires on a well-formed tree.
+func (r *CategoryRepository) Subtree(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return scanCategory(r.db.QueryRow(ctx,
-		`UPDATE categories SET archived_at = now() WHERE id = $1 AND user_id = $2 AND archived_at IS NULL
-		 RETURNING `+categoryColumns,
+	rows, err := r.db.Query(ctx,
+		`WITH RECURSIVE tree AS (
+			SELECT id, 0 AS depth FROM categories WHERE id = $1 AND user_id = $2
+			UNION ALL
+			SELECT c.id, t.depth + 1 FROM categories c
+			JOIN tree t ON c.parent_id = t.id
+			WHERE c.user_id = $2 AND t.depth < 32
+		)
+		SELECT id FROM tree ORDER BY depth, id`,
 		id, uid,
-	))
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []uuid.UUID{}
+	for rows.Next() {
+		var got uuid.UUID
+		if err := rows.Scan(&got); err != nil {
+			return nil, err
+		}
+		out = append(out, got)
+	}
+	return out, rows.Err()
 }
 
-// HasBudgetInPeriod reports whether a budget exists for the category
-// in the given YYYY-MM period (archive guard).
-func (r *CategoryRepository) HasBudgetInPeriod(ctx context.Context, id uuid.UUID, period string) (bool, error) {
+// ArchiveMany soft-deletes every listed live category of the caller in one
+// statement and reports how many rows changed (0 = all were already
+// archived or none were theirs).
+func (r *CategoryRepository) ArchiveMany(ctx context.Context, ids []uuid.UUID) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := r.db.Exec(ctx,
+		`UPDATE categories SET archived_at = now() WHERE id = ANY($1) AND user_id = $2 AND archived_at IS NULL`,
+		ids, uid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// HasBudgetInPeriod reports whether a budget exists for any of the
+// categories in the given YYYY-MM period (archive guard).
+func (r *CategoryRepository) HasBudgetInPeriod(ctx context.Context, ids []uuid.UUID, period string) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return false, err
 	}
 	var exists bool
 	err = r.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM budgets WHERE category_id = $1 AND period = $2 AND user_id = $3)`,
-		id, period, uid,
+		`SELECT EXISTS(SELECT 1 FROM budgets WHERE category_id = ANY($1) AND period = $2 AND user_id = $3)`,
+		ids, period, uid,
 	).Scan(&exists)
 	return exists, err
 }

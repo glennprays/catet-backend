@@ -365,3 +365,50 @@ func TestCategorizeUncategorizedExpense(t *testing.T) {
 	assert.Equal(t, makanan.ID, *updated.Legs[1].CategoryID)
 	assert.Equal(t, int64(490_000), f.balances(t)[bca.ID])
 }
+
+// TestArchivedCategoryRefusedOnWrites: an archived category still labels
+// the history that already points at it, but no new or edited
+// transaction may be filed under one.
+func TestArchivedCategoryRefusedOnWrites(t *testing.T) {
+	f := newLedgerFixture(t)
+
+	bca := f.createSource(t, "BCA", "bank", false)
+	f.adjust(t, bca.ID, 500_000, "saldo awal")
+	live := f.createCategory(t, "Makanan")
+	gone := f.createCategory(t, "Langganan Lama")
+	existing := f.createExpense(t, bca.ID, live.ID, 10_000, "warteg")
+
+	require.NoError(t, service.NewCategoryService(f.catRepo).Archive(f.ctx, gone.ID))
+
+	assertArchivedCategory := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		var ae *apperror.Error
+		require.True(t, errors.As(err, &ae))
+		assert.Equal(t, apperror.KindValidation, ae.Kind)
+		require.Len(t, ae.Details, 1)
+		assert.Equal(t, "category_id", ae.Details[0].Field)
+		assert.Equal(t, "archived", ae.Details[0].Rule)
+	}
+
+	merchant := "netflix"
+	_, err := f.tx.Create(f.ctx, service.CreateInput{
+		Type:        "expense",
+		OccurredAt:  timePtr(time.Now()),
+		AmountMinor: 54_000,
+		SourceID:    bca.ID,
+		CategoryID:  &gone.ID,
+		Merchant:    &merchant,
+		Origin:      "dashboard_manual",
+	})
+	assertArchivedCategory(t, err)
+
+	_, err = f.tx.Update(f.ctx, existing.ID, service.UpdateInput{CategoryID: &gone.ID})
+	assertArchivedCategory(t, err)
+
+	// The row keeps the category it had.
+	unchanged, err := f.tx.Get(f.ctx, existing.ID)
+	require.NoError(t, err)
+	require.NotNil(t, unchanged.CategoryID)
+	assert.Equal(t, live.ID, *unchanged.CategoryID)
+}

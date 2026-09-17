@@ -45,6 +45,10 @@ func (s *CategoryService) Create(ctx context.Context, in CreateCategoryInput) (*
 			return nil, apperror.Validation("category validation failed").
 				WithDetails(apperror.FieldError{Field: "parent_id", Rule: "exists", Message: "parent category not found"})
 		}
+		if parent.ArchivedAt != nil {
+			return nil, apperror.Validation("category validation failed").
+				WithDetails(apperror.FieldError{Field: "parent_id", Rule: "archived", Message: "parent category is archived"})
+		}
 	}
 	created, err := s.repo.Create(ctx, &entity.Category{
 		ID:        uuid.New(),
@@ -75,8 +79,23 @@ func (s *CategoryService) Update(ctx context.Context, id uuid.UUID, in UpdateCat
 	if existing == nil {
 		return nil, apperror.NotFound("category not found")
 	}
+	if existing.ArchivedAt != nil {
+		return nil, apperror.Conflict("archived categories cannot be edited")
+	}
 	// Guard re-parent cycles: walk up the (new) parent chain.
 	if in.ParentID != nil && *in.ParentID != nil {
+		parent, err := s.repo.Get(ctx, **in.ParentID)
+		if err != nil {
+			return nil, apperror.Internal("failed to load parent category").Wrap(err)
+		}
+		if parent == nil {
+			return nil, apperror.Validation("category validation failed").
+				WithDetails(apperror.FieldError{Field: "parent_id", Rule: "exists", Message: "parent category not found"})
+		}
+		if parent.ArchivedAt != nil {
+			return nil, apperror.Validation("category validation failed").
+				WithDetails(apperror.FieldError{Field: "parent_id", Rule: "archived", Message: "parent category is archived"})
+		}
 		if err := s.guardCycle(ctx, id, **in.ParentID); err != nil {
 			return nil, err
 		}
@@ -107,8 +126,10 @@ func (s *CategoryService) guardCycle(ctx context.Context, id, newParent uuid.UUI
 	return nil
 }
 
-// Archive soft-deletes; blocked while a budget in the current Jakarta
-// month references the category.
+// Archive soft-deletes the category and its whole subtree; an archived
+// parent with live children would be a tree the dashboard cannot draw.
+// Blocked while a budget in the current Jakarta month references the
+// category or any of its sub-categories.
 func (s *CategoryService) Archive(ctx context.Context, id uuid.UUID) error {
 	existing, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -117,15 +138,22 @@ func (s *CategoryService) Archive(ctx context.Context, id uuid.UUID) error {
 	if existing == nil {
 		return apperror.NotFound("category not found")
 	}
+	if existing.ArchivedAt != nil {
+		return nil
+	}
+	ids, err := s.repo.Subtree(ctx, id)
+	if err != nil {
+		return apperror.Internal("failed to load category subtree").Wrap(err)
+	}
 	period := JakartaMonthPeriod(JakartaNow())
-	hasBudget, err := s.repo.HasBudgetInPeriod(ctx, id, period)
+	hasBudget, err := s.repo.HasBudgetInPeriod(ctx, ids, period)
 	if err != nil {
 		return apperror.Internal("failed to check budgets").Wrap(err)
 	}
 	if hasBudget {
-		return apperror.Conflict("category is used by a budget in the current period")
+		return apperror.Conflict("category or one of its sub-categories is used by a budget in the current period")
 	}
-	if _, err := s.repo.Archive(ctx, id); err != nil {
+	if _, err := s.repo.ArchiveMany(ctx, ids); err != nil {
 		return apperror.Internal("failed to archive category").Wrap(err)
 	}
 	return nil
