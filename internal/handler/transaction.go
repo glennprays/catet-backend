@@ -41,13 +41,19 @@ func (h *TransactionHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	merchantID, err := parseID("merchant_id")
+	if err != nil {
+		return err
+	}
 	in.SourceID = sourceID
 	in.CategoryID = categoryID
+	in.MerchantID = merchantID
 	in.ReviewStatus = qptr(c, "review_status")
 	in.Query = qptr(c, "q")
 	in.FromDate = qptr(c, "from")
 	in.ToDate = qptr(c, "to")
 	in.Direction = qptr(c, "direction")
+	in.Voided = qptr(c, "voided")
 	in.Cursor = qptr(c, "cursor")
 
 	page, err := h.svc.List(c.UserContext(), in)

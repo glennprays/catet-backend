@@ -26,6 +26,7 @@ type Router struct {
 	SourceHandler      *handler.SourceHandler
 	TransactionHandler *handler.TransactionHandler
 	CategoryHandler    *handler.CategoryHandler
+	MerchantHandler    *handler.MerchantHandler
 	BillHandler        *handler.BillHandler
 	BudgetHandler      *handler.BudgetHandler
 	OverviewHandler    *handler.OverviewHandler
@@ -48,6 +49,7 @@ func NewRouter(
 	sourceHandler *handler.SourceHandler,
 	transactionHandler *handler.TransactionHandler,
 	categoryHandler *handler.CategoryHandler,
+	merchantHandler *handler.MerchantHandler,
 	billHandler *handler.BillHandler,
 	budgetHandler *handler.BudgetHandler,
 	overviewHandler *handler.OverviewHandler,
@@ -69,6 +71,7 @@ func NewRouter(
 		SourceHandler:      sourceHandler,
 		TransactionHandler: transactionHandler,
 		CategoryHandler:    categoryHandler,
+		MerchantHandler:    merchantHandler,
 		BillHandler:        billHandler,
 		BudgetHandler:      budgetHandler,
 		OverviewHandler:    overviewHandler,
@@ -130,6 +133,7 @@ func (r *Router) Setup(app *fiber.App) {
 	r.setupSourceRoutes(protected)
 	r.setupTransactionRoutes(protected)
 	r.setupCategoryRoutes(protected)
+	r.setupMerchantRoutes(protected)
 	r.setupBillRoutes(protected)
 	r.setupBudgetRoutes(protected)
 	r.setupOverviewRoutes(protected)
@@ -206,6 +210,12 @@ func (r *Router) setupTransactionRoutes(group fiber.Router) {
 	group.Patch("/transactions/:id", r.TransactionHandler.Update)
 	group.Delete("/transactions/:id", r.TransactionHandler.Void)
 	group.Post("/transactions/:id/reversals", r.TransactionHandler.Reverse)
+}
+
+func (r *Router) setupMerchantRoutes(group fiber.Router) {
+	group.Get("/merchants", r.MerchantHandler.List)
+	group.Patch("/merchants/:id", r.MerchantHandler.Rename)
+	group.Post("/merchants/:id/merge", r.MerchantHandler.Merge)
 }
 
 func (r *Router) setupCategoryRoutes(group fiber.Router) {

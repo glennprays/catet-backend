@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/glennprays/catet-backend/internal/apperror"
@@ -23,6 +24,9 @@ type TransactionService struct {
 	repo       *repository.TransactionRepository
 	sources    *repository.SourceRepository
 	categories *repository.CategoryRepository
+	// merchants canonicalises the free text every capture surface sends,
+	// so "kopi kenangan tp" and "Kopi Kenangan" are one entity.
+	merchants *MerchantService
 	// Bill links are repository-level deps, not a BillService: the
 	// ledger must be able to rewind a bill on void without depending on
 	// the service that pays it (BillService already depends on this one).
@@ -35,6 +39,7 @@ func NewTransactionService(
 	repo *repository.TransactionRepository,
 	sources *repository.SourceRepository,
 	categories *repository.CategoryRepository,
+	merchants *MerchantService,
 	billPayments *repository.BillPaymentRepository,
 	bills *repository.BillRepository,
 	logger *log.Logger,
@@ -43,10 +48,54 @@ func NewTransactionService(
 		repo:         repo,
 		sources:      sources,
 		categories:   categories,
+		merchants:    merchants,
 		billPayments: billPayments,
 		bills:        bills,
 		log:          logger,
 	}
+}
+
+// resolveMerchant settles the three ways a capture can name a merchant:
+// a pinned id (dashboard picked an existing one), free text (resolved —
+// and tidied — through the merchant service), or nothing at all. It
+// returns the display name, the entity id and the note to store: when
+// the canonical name no longer contains what the user typed, the raw
+// phrase survives as the note rather than being lost.
+func (s *TransactionService) resolveMerchant(ctx context.Context, in CreateInput) (*uuid.UUID, *string, *string, error) {
+	note := in.Note
+	if in.MerchantID != nil {
+		m, err := s.merchants.Get(ctx, *in.MerchantID)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		name := m.Name
+		return &m.ID, &name, note, nil
+	}
+	if in.Merchant == nil || strings.TrimSpace(*in.Merchant) == "" {
+		return nil, in.Merchant, note, nil
+	}
+	raw := *in.Merchant
+	m, err := s.merchants.Resolve(ctx, raw, derefOr(in.Note, ""))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if m == nil {
+		return nil, in.Merchant, note, nil
+	}
+	if repository.AliasKey(raw) != repository.AliasKey(m.Name) &&
+		(note == nil || strings.TrimSpace(*note) == "") {
+		phrase := raw
+		note = &phrase
+	}
+	name := m.Name
+	return &m.ID, &name, note, nil
+}
+
+func derefOr(s *string, alt string) string {
+	if s == nil {
+		return alt
+	}
+	return *s
 }
 
 // ---------------------------------------------------------------- create
@@ -64,6 +113,9 @@ type CreateInput struct {
 	CategoryID          *uuid.UUID
 	Note                *string
 	Merchant            *string
+	// MerchantID pins the canonical merchant directly (the dashboard's
+	// datalist picked one); when set the Merchant text is ignored.
+	MerchantID *uuid.UUID
 
 	// Provenance. Origin is required ("dashboard_manual" | "whatsapp_text");
 	// CategorySource defaults to "user" when a category is set.
@@ -193,6 +245,11 @@ func (s *TransactionService) Create(ctx context.Context, in CreateInput) (*entit
 		return nil, err
 	}
 
+	merchantID, merchantName, note, err := s.resolveMerchant(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+
 	categorySource := in.CategorySource
 	if in.CategoryID != nil && categorySource == nil {
 		cs := "user"
@@ -216,8 +273,9 @@ func (s *TransactionService) Create(ctx context.Context, in CreateInput) (*entit
 		OccurredAt:         occurredAt,
 		Origin:             in.Origin,
 		Type:               in.Type,
-		Merchant:           in.Merchant,
-		Note:               in.Note,
+		Merchant:           merchantName,
+		MerchantID:         merchantID,
+		Note:               note,
 		AmountMinor:        abs64(in.AmountMinor),
 		CategoryID:         in.CategoryID,
 		CategorySource:     categorySource,
@@ -303,8 +361,11 @@ type ListInput struct {
 	FromDate     *string
 	ToDate       *string
 	Direction    *string
-	Limit        int
-	Cursor       *string
+	// Voided is "exclude" (default), "include" or "only".
+	Voided     *string
+	MerchantID *uuid.UUID
+	Limit      int
+	Cursor     *string
 }
 
 // ListPage is one keyset page plus its continuation cursor.
@@ -320,6 +381,7 @@ func (s *TransactionService) List(ctx context.Context, in ListInput) (*ListPage,
 	f := repository.ListFilter{
 		SourceID:   in.SourceID,
 		CategoryID: in.CategoryID,
+		MerchantID: in.MerchantID,
 	}
 
 	if in.FromDate != nil && *in.FromDate != "" {
@@ -351,6 +413,18 @@ func (s *TransactionService) List(ctx context.Context, in ListInput) (*ListPage,
 	if in.Query != nil && *in.Query != "" {
 		f.Query = in.Query
 	}
+	if in.Voided != nil && *in.Voided != "" {
+		switch *in.Voided {
+		case "exclude", "include", "only":
+			f.Voided = *in.Voided
+		default:
+			return nil, apperror.Validation("invalid filter").
+				WithDetails(apperror.FieldError{Field: "voided", Rule: "enum", Message: "voided must be exclude, include or only"})
+		}
+	}
+	// The review queue asks about money that still stands: an original a
+	// live reversal has cancelled is settled business, not a question.
+	f.ExcludeReversed = in.ReviewStatus != nil && *in.ReviewStatus == "needs_review"
 
 	f.Limit = in.Limit
 	if f.Limit <= 0 {
@@ -453,8 +527,21 @@ func (s *TransactionService) Update(ctx context.Context, id uuid.UUID, in Update
 		tx.Note = editableString(in.Note)
 	}
 	if in.Merchant != nil {
+		// Text the user chose on purpose is authoritative as typed; the
+		// merchant entity follows it so the row keeps pointing at one
+		// canonical name.
+		m, err := s.merchants.ResolveUser(ctx, *in.Merchant)
+		if err != nil {
+			return nil, err
+		}
 		record("merchant", tx.Merchant, *in.Merchant)
-		tx.Merchant = editableString(in.Merchant)
+		if m == nil {
+			tx.Merchant = editableString(in.Merchant)
+			tx.MerchantID = nil
+		} else {
+			tx.Merchant = &m.Name
+			tx.MerchantID = &m.ID
+		}
 	}
 	if in.CategoryID != nil {
 		record("category_id", tx.CategoryID, *in.CategoryID)
@@ -605,6 +692,7 @@ func (s *TransactionService) Reverse(ctx context.Context, id uuid.UUID, note *st
 		Origin:                origin,
 		Type:                  tx.Type,
 		Merchant:              tx.Merchant,
+		MerchantID:            tx.MerchantID,
 		Note:                  note,
 		AmountMinor:           tx.AmountMinor,
 		CategoryID:            tx.CategoryID,

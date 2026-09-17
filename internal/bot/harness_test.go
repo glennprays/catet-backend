@@ -164,7 +164,8 @@ func newBotFixture(t *testing.T, llmClient *llm.Client) *botFixture {
 	userRepo := repository.NewUserRepository(pool)
 	inviteRepo := repository.NewInviteRepository(pool)
 
-	txSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, billPaymentRepo, billRepo, logger)
+	merchantSvc := service.NewMerchantService(repository.NewMerchantRepository(pool), llmClient, logger)
+	txSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, merchantSvc, billPaymentRepo, billRepo, logger)
 	billSvc := service.NewBillService(billRepo, billPaymentRepo, txSvc, sourceRepo)
 	analyticsSvc := service.NewAnalyticsService(analyticsRepo, categoryRepo, sourceRepo, billRepo, settingsRepo)
 	overviewSvc := service.NewOverviewService(sourceRepo, billRepo, settingsRepo, analyticsRepo, pendingRepo, txSvc)
@@ -174,7 +175,7 @@ func newBotFixture(t *testing.T, llmClient *llm.Client) *botFixture {
 	cfg := &config.Config{Env: config.DEV}
 	harness := bot.NewHarness(
 		cfg, logger, sender, llmClient,
-		txSvc, overviewSvc, analyticsSvc, billSvc,
+		txSvc, merchantSvc, overviewSvc, analyticsSvc, billSvc,
 		sourceRepo, categoryRepo, transactionRepo, pendingRepo,
 		inboundRepo, chatRepo, analyticsRepo, settingsRepo,
 		userRepo, billRepo, reminderSendRepo, inviteSvc,
@@ -303,7 +304,9 @@ func TestCaptureWritesExpenseAndReplaysDuplicate(t *testing.T) {
 	require.NotNil(t, txs[0].ExternalID)
 	assert.Equal(t, "m1#1", *txs[0].ExternalID)
 	require.NotNil(t, txs[0].Merchant)
-	assert.Equal(t, "kopi", *txs[0].Merchant)
+	// The stored merchant is the canonical entity's name, tidied offline
+	// because no model is configured in this fixture.
+	assert.Equal(t, "Kopi", *txs[0].Merchant)
 	// No LLM configured: the label is unknown, so a human must look.
 	assert.Nil(t, txs[0].CategoryID)
 	assert.Equal(t, "needs_review", txs[0].ReviewStatus)
@@ -624,6 +627,7 @@ func TestMerchantMemoryBeatsTheModel(t *testing.T) {
 		repository.NewTransactionRepository(f.pool),
 		repository.NewSourceRepository(f.pool),
 		repository.NewCategoryRepository(f.pool),
+		service.NewMerchantService(repository.NewMerchantRepository(f.pool), nil, f.logger),
 		repository.NewBillPaymentRepository(f.pool),
 		repository.NewBillRepository(f.pool),
 		f.logger,
@@ -774,17 +778,17 @@ func TestTwoUsersLedgersAreIsolated(t *testing.T) {
 	owner := f.liveFor(t, f.userID)
 	require.Len(t, owner, 1, "the owner sees only their own capture")
 	require.NotNil(t, owner[0].Merchant)
-	assert.Equal(t, "kopi", *owner[0].Merchant)
+	assert.Equal(t, "Kopi", *owner[0].Merchant)
 
 	second := f.liveFor(t, secondID)
 	require.Len(t, second, 1, "the second account sees only its own capture")
 	require.NotNil(t, second[0].Merchant)
-	assert.Equal(t, "bakso", *second[0].Merchant)
+	assert.Equal(t, "Bakso", *second[0].Merchant)
 
 	// A summary is the easiest place for a leak to hide: it aggregates
 	// across the whole week rather than naming a row.
 	f.sayAs(t, secondPhone, "m3", "rekap minggu")
 	recap := f.sender.last()
-	assert.Contains(t, recap, "bakso", "the second account's own merchant is missing: %q", recap)
+	assert.Contains(t, recap, "Bakso", "the second account's own merchant is missing: %q", recap)
 	assert.NotContains(t, recap, "kopi", "another account's merchant leaked into the recap")
 }

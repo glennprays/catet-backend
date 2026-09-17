@@ -202,16 +202,20 @@ func (s *AnalyticsService) IncomeExpense(ctx context.Context, from, to time.Time
 	return &response.IncomeExpenseData{Buckets: buckets}, nil
 }
 
+// stsTrendMaxSpan bounds the per-day runway loop: a year of points is
+// already more than a chart can show, and each point walks a 30-day
+// window.
+const stsTrendMaxSpan = 366 * 24 * time.Hour
+
 // StsTrend plots the now Safe-to-Spend as a flat line with per-day
 // runway from the trailing-30d burn ending at that day (spec: STS is a
-// now-value, never replayed; burn history moves the curve). The final
-// point matches /overview exactly.
-func (s *AnalyticsService) StsTrend(ctx context.Context, days int) (*response.StsTrendData, error) {
-	if days <= 0 {
-		days = 30
-	}
-	if days > 365 {
-		days = 365
+// now-value, never replayed; burn history moves the curve). The range is
+// [from, to) as ResolveRange returns it; the final point matches
+// /overview exactly when the range ends today.
+func (s *AnalyticsService) StsTrend(ctx context.Context, from, to time.Time) (*response.StsTrendData, error) {
+	if to.Sub(from) > stsTrendMaxSpan {
+		return nil, apperror.Validation("invalid range").
+			WithDetails(apperror.FieldError{Field: "to", Rule: "max_span", Message: "range may not exceed 366 days"})
 	}
 
 	// Current STS from the pinned formulas.
@@ -241,10 +245,10 @@ func (s *AnalyticsService) StsTrend(ctx context.Context, days int) (*response.St
 	reserved := ReservedBetween(activeBills, today, today.AddDate(0, 0, horizon), true)
 	sts := available - reserved
 
-	// Daily expenses over [today−(days−1)−30, today+1).
-	rangeStart := today.AddDate(0, 0, -(days-1)-30)
-	rangeEnd := today.AddDate(0, 0, 1)
-	_, expense, err := s.analytics.DailyFlows(ctx, rangeStart, rangeEnd)
+	// Daily expenses over [from−30, to): each point's runway needs the
+	// 30 days of burn ending on it.
+	rangeStart := from.AddDate(0, 0, -30)
+	_, expense, err := s.analytics.DailyFlows(ctx, rangeStart, to)
 	if err != nil {
 		return nil, apperror.Internal("failed to compute daily flows").Wrap(err)
 	}
@@ -256,9 +260,8 @@ func (s *AnalyticsService) StsTrend(ctx context.Context, days int) (*response.St
 		return sum
 	}
 
-	points := make([]response.StsPoint, 0, days)
-	for i := days - 1; i >= 0; i-- {
-		day := today.AddDate(0, 0, -i)
+	points := []response.StsPoint{}
+	for day := from; day.Before(to); day = day.AddDate(0, 0, 1) {
 		windowEnd := day.AddDate(0, 0, 1)
 		windowStart := windowEnd.AddDate(0, 0, -30)
 		sum30 := sumBetween(windowStart, windowEnd)
@@ -269,7 +272,7 @@ func (s *AnalyticsService) StsTrend(ctx context.Context, days int) (*response.St
 			IncomeHorizonDays: int64(horizon),
 		})
 		points = append(points, response.StsPoint{
-			Date:       day.Format("2006-01-02"),
+			Date:       day.In(jakartaLoc).Format("2006-01-02"),
 			StsMinor:   sts,
 			RunwayDays: out.RunwayDays,
 		})
@@ -336,6 +339,7 @@ func (s *AnalyticsService) TopMerchants(ctx context.Context, from, to time.Time,
 	merchants := make([]response.TopMerchant, 0, len(rows))
 	for _, row := range rows {
 		merchants = append(merchants, response.TopMerchant{
+			MerchantID:  row.ID,
 			Name:        row.Name,
 			AmountMinor: row.AmountMinor,
 			TxCount:     row.TxCount,

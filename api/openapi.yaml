@@ -655,7 +655,15 @@ paths:
           schema: { type: string, format: uuid }
         - name: review_status
           in: query
+          description: "`needs_review` also hides originals that have a live reversal."
           schema: { type: string, enum: [clean, needs_review] }
+        - name: voided
+          in: query
+          description: Soft-deleted rows; `exclude` (default) hides them, `only` is the Di-void bin.
+          schema: { type: string, enum: [exclude, include, only], default: exclude }
+        - name: merchant_id
+          in: query
+          schema: { type: string, format: uuid }
         - name: q
           in: query
           schema: { type: string }
@@ -709,6 +717,7 @@ paths:
                 category_id: { type: string, format: uuid }
                 note: { type: string }
                 merchant: { type: string }
+                merchant_id: { type: string, format: uuid, description: canonical merchant; when present the merchant text is ignored }
       responses:
         '200':
           description: Created transaction
@@ -830,6 +839,91 @@ paths:
           $ref: '#/components/responses/ErrorResponse'
 
   # ------------------------------------------------------------ categories
+  # ------------------------------------------------------------ merchants
+  /api/v1/merchants:
+    get:
+      summary: List canonical merchants with their live expense volume
+      operationId: listMerchants
+      tags: [Merchants]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Merchants, biggest spend first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantListEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/merchants/{id}:
+    patch:
+      summary: Rename a merchant (rewrites the display text on its rows)
+      operationId: renameMerchant
+      tags: [Merchants]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        '200':
+          description: Renamed merchant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: CONFLICT — a merchant of that name already exists; merge instead
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/v1/merchants/{id}/merge:
+    post:
+      summary: Merge this merchant into another one
+      description: Rows, aliases and the old name follow the survivor; the path merchant is deleted.
+      operationId: mergeMerchant
+      tags: [Merchants]
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [into_merchant_id]
+              properties:
+                into_merchant_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Merged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MergedMerchantEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
   /api/v1/categories:
     get:
       summary: List categories (flat; tree built client-side)
@@ -1281,16 +1375,17 @@ paths:
       tags: [Analytics]
       security: [{ bearerAuth: [] }]
       parameters:
-        - name: days
-          in: query
-          schema: { type: integer, default: 30, maximum: 365 }
+        - { $ref: '#/components/parameters/From' }
+        - { $ref: '#/components/parameters/To' }
       responses:
         '200':
-          description: Trend points
+          description: Trend points, one per day in range (max span 366 days)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/StsTrendEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '500':
@@ -1997,7 +2092,8 @@ components:
         transaction_id: { type: string, format: uuid }
         occurred_at: { type: string, format: date-time }
         type: { type: string, enum: [expense, income, transfer, adjustment] }
-        merchant: { type: string, nullable: true }
+        merchant: { type: string, nullable: true, description: display copy of the canonical merchant name }
+        merchant_id: { type: string, format: uuid, nullable: true }
         note: { type: string, nullable: true }
         amount_minor: { type: integer, format: int64, description: user-perspective signed (expense −, income +, transfer −) }
         category_id: { type: string, format: uuid, nullable: true }
@@ -2053,7 +2149,8 @@ components:
         occurred_at: { type: string, format: date-time }
         origin: { type: string, enum: [whatsapp_text, whatsapp_photo, dashboard_manual, import] }
         type: { type: string, enum: [expense, income, transfer, adjustment] }
-        merchant: { type: string, nullable: true }
+        merchant: { type: string, nullable: true, description: display copy of the canonical merchant name }
+        merchant_id: { type: string, format: uuid, nullable: true }
         note: { type: string, nullable: true }
         amount_minor: { type: integer, format: int64, description: unsigned base amount }
         category_id: { type: string, format: uuid, nullable: true }
@@ -2111,6 +2208,58 @@ components:
         essential: { type: boolean }
         archived_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
+    Merchant:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    MerchantSummary:
+      type: object
+      required: [id, name, tx_count, total_minor]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        tx_count: { type: integer, format: int64, description: live expense rows pointing at this merchant }
+        total_minor: { type: integer, format: int64, description: live expense outflow, positive magnitude }
+        last_used_at: { type: string, format: date-time, nullable: true }
+    MerchantListEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [merchants]
+          properties:
+            merchants:
+              type: array
+              items:
+                $ref: '#/components/schemas/MerchantSummary'
+        trace_id: { type: string, format: uuid }
+    MerchantEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [merchant]
+          properties:
+            merchant:
+              $ref: '#/components/schemas/Merchant'
+        trace_id: { type: string, format: uuid }
+    MergedMerchantEnvelope:
+      type: object
+      required: [data, trace_id]
+      properties:
+        data:
+          type: object
+          required: [merged, into_merchant_id]
+          properties:
+            merged: { type: boolean }
+            into_merchant_id: { type: string, format: uuid }
+        trace_id: { type: string, format: uuid }
     CategoriesEnvelope:
       type: object
       required: [data, trace_id]
@@ -2440,8 +2589,9 @@ components:
         trace_id: { type: string, format: uuid }
     TopMerchant:
       type: object
-      required: [name, amount_minor, tx_count]
+      required: [merchant_id, name, amount_minor, tx_count]
       properties:
+        merchant_id: { type: string, format: uuid }
         name: { type: string }
         amount_minor: { type: integer, format: int64 }
         tx_count: { type: integer, format: int64 }
@@ -2645,6 +2795,8 @@ tags:
     description: Two-leg ledger journals
   - name: Categories
     description: Category hierarchy
+  - name: Merchants
+    description: Canonical merchants and their alias memory
   - name: Bills
     description: Recurring obligations
   - name: Budgets

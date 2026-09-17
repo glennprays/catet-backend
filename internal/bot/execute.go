@@ -85,6 +85,7 @@ func (h *Harness) executeCapture(ctx context.Context, p *entity.PendingAction, o
 		merchant := params.Merchant
 		in.Merchant = &merchant
 	}
+	in.MerchantID = params.MerchantID
 	if params.Note != "" && (ov == nil || ov.Note == nil) {
 		note := params.Note
 		in.Note = &note
@@ -114,7 +115,17 @@ func (h *Harness) executeCapture(ctx context.Context, p *entity.PendingAction, o
 			in.ReviewStatus = "clean"
 		}
 		if ov.Merchant != nil {
+			// A human typed this name in the dashboard: it is authoritative
+			// as written, and it re-points the row's merchant entity.
 			in.Merchant = ov.Merchant
+			in.MerchantID = nil
+			m, err := h.merchants.ResolveUser(ctx, *ov.Merchant)
+			if err != nil {
+				return nil, err
+			}
+			if m != nil {
+				in.MerchantID = &m.ID
+			}
 		}
 		if ov.Note != nil {
 			in.Note = ov.Note
@@ -138,7 +149,7 @@ func (h *Harness) executeCapture(ctx context.Context, p *entity.PendingAction, o
 		if in.Merchant != nil {
 			merchant = *in.Merchant
 		}
-		verdict := h.resolveCategory(ctx, merchant, params.Note, in.Type, cats)
+		verdict := h.resolveCategory(ctx, in.MerchantID, merchant, params.Note, in.Type, cats)
 		in.CategoryID = verdict.ID
 		in.CategorySource = verdict.Source
 		in.CategoryConfidence = verdict.Confidence

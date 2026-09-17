@@ -300,7 +300,18 @@ func (h *Harness) answerReceipt(
 		}))
 	}
 	if edits.Merchant != nil {
+		// The user named the shop on purpose: authoritative as typed, and
+		// the draft now points at that canonical merchant.
+		m, err := h.merchants.ResolveUser(ctx, *edits.Merchant)
+		if err != nil {
+			return "", nil, false, err
+		}
 		params.Merchant = *edits.Merchant
+		params.MerchantID = nil
+		if m != nil {
+			params.Merchant = m.Name
+			params.MerchantID = &m.ID
+		}
 		changes = append(changes, tmpl.Render(lang, "receipt_change_merchant", map[string]any{
 			"Merchant": params.Merchant,
 		}))
@@ -455,7 +466,16 @@ func (h *Harness) answerCapture(
 		}))
 	}
 	if edits.Merchant != nil {
+		m, err := h.merchants.ResolveUser(ctx, *edits.Merchant)
+		if err != nil {
+			return "", nil, false, err
+		}
 		params.Merchant = strings.ToLower(strings.TrimSpace(*edits.Merchant))
+		params.MerchantID = nil
+		if m != nil {
+			params.Merchant = m.Name
+			params.MerchantID = &m.ID
+		}
 		changes = append(changes, tmpl.Render(lang, "receipt_change_merchant", map[string]any{
 			"Merchant": params.Merchant,
 		}))
@@ -534,7 +554,17 @@ func (h *Harness) startRefund(
 	if merchant == "" {
 		return tmpl.Render(lang, "refund_no_target", map[string]any{"Merchant": ""}), true, nil
 	}
-	target, err := h.txRepo.LatestExpenseByMerchant(ctx, merchant, time.Now().UTC().Add(-refundLookback))
+	// Refund targets are found through the merchant the ledger actually
+	// recorded, so "gojek" reaches rows written as "Gojek". Memory only:
+	// asking the model to invent a merchant here would invent a target.
+	canonical, err := h.merchants.Lookup(ctx, merchant)
+	if err != nil {
+		return "", false, fmt.Errorf("look up refund merchant: %w", err)
+	}
+	if canonical == nil {
+		return tmpl.Render(lang, "refund_no_target", map[string]any{"Merchant": merchant}), true, nil
+	}
+	target, err := h.txRepo.LatestExpenseByMerchant(ctx, canonical.ID, time.Now().UTC().Add(-refundLookback))
 	if err != nil {
 		return "", false, fmt.Errorf("find refund target: %w", err)
 	}

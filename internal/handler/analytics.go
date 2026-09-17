@@ -40,7 +40,11 @@ func (h *AnalyticsHandler) IncomeExpense(c *fiber.Ctx) error {
 }
 
 func (h *AnalyticsHandler) StsTrend(c *fiber.Ctx) error {
-	data, err := h.svc.StsTrend(c.UserContext(), c.QueryInt("days", 30))
+	from, to, err := service.ResolveRange(qptr(c, "from"), qptr(c, "to"))
+	if err != nil {
+		return err
+	}
+	data, err := h.svc.StsTrend(c.UserContext(), from, to)
 	if err != nil {
 		return err
 	}

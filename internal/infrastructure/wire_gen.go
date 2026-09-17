@@ -42,6 +42,7 @@ func InitializeApp() (*App, error) {
 	sourceRepo := repository.NewSourceRepository(pool)
 	transactionRepo := repository.NewTransactionRepository(pool)
 	categoryRepo := repository.NewCategoryRepository(pool)
+	merchantRepo := repository.NewMerchantRepository(pool)
 	billRepo := repository.NewBillRepository(pool)
 	billPaymentRepo := repository.NewBillPaymentRepository(pool)
 	reminderSendRepo := repository.NewBillReminderSendRepository(pool)
@@ -58,8 +59,13 @@ func InitializeApp() (*App, error) {
 	resetRepo := repository.NewPasswordResetRepository(pool)
 	otpRepo := repository.NewOtpRepository(pool)
 
-	// Services.
-	transactionSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, billPaymentRepo, billRepo, logger)
+	// Services. The LLM client is built first: merchant canonicalisation
+	// is a write-path dependency, so the ledger service needs it before
+	// anything can be captured.
+	llmProviderSvc := service.NewLLMProviderService(llmProviderRepo, cfg, provideSecretBox(cfg), logger)
+	llmClient := provideLLMClient(llmProviderSvc)
+	merchantSvc := service.NewMerchantService(merchantRepo, llmClient, logger)
+	transactionSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, merchantSvc, billPaymentRepo, billRepo, logger)
 	sourceSvc := service.NewSourceService(sourceRepo, transactionSvc)
 	categorySvc := service.NewCategoryService(categoryRepo)
 	billSvc := service.NewBillService(billRepo, billPaymentRepo, transactionSvc, sourceRepo)
@@ -68,7 +74,6 @@ func InitializeApp() (*App, error) {
 	overviewSvc := service.NewOverviewService(sourceRepo, billRepo, settingsRepo, analyticsRepo, pendingRepo, transactionSvc)
 	badgesSvc := service.NewBadgesService(analyticsRepo, pendingRepo, billRepo)
 	settingsSvc := service.NewSettingsService(settingsRepo, sourceRepo)
-	llmProviderSvc := service.NewLLMProviderService(llmProviderRepo, cfg, provideSecretBox(cfg), logger)
 	onboardingSvc := service.NewOnboardingService(categoryRepo, sourceRepo)
 
 	// Auth. The invite service is built before the bot: the harness
@@ -85,10 +90,9 @@ func InitializeApp() (*App, error) {
 	// WhatsApp bot. The harness is also the Hold Queue's executor, so a
 	// draft confirmed from the dashboard runs the same write path as one
 	// confirmed in chat.
-	llmClient := provideLLMClient(llmProviderSvc)
 	botHarness := bot.NewHarness(
 		cfg, logger, waSender, llmClient,
-		transactionSvc, overviewSvc, analyticsSvc, billSvc,
+		transactionSvc, merchantSvc, overviewSvc, analyticsSvc, billSvc,
 		sourceRepo, categoryRepo, transactionRepo, pendingRepo,
 		inboundRepo, chatStateRepo, analyticsRepo, settingsRepo,
 		userRepo, billRepo, reminderSendRepo, inviteSvc,
@@ -99,6 +103,7 @@ func InitializeApp() (*App, error) {
 	sourceHandler := handler.NewSourceHandler(sourceSvc)
 	transactionHandler := handler.NewTransactionHandler(transactionSvc)
 	categoryHandler := handler.NewCategoryHandler(categorySvc)
+	merchantHandler := handler.NewMerchantHandler(merchantSvc)
 	billHandler := handler.NewBillHandler(billSvc)
 	budgetHandler := handler.NewBudgetHandler(budgetSvc)
 	overviewHandler := handler.NewOverviewHandler(overviewSvc, badgesSvc)
@@ -126,6 +131,7 @@ func InitializeApp() (*App, error) {
 		sourceHandler,
 		transactionHandler,
 		categoryHandler,
+		merchantHandler,
 		billHandler,
 		budgetHandler,
 		overviewHandler,

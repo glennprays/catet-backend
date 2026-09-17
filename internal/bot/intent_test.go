@@ -25,6 +25,7 @@ type scriptedLLM struct {
 	intent   string
 	category string
 	source   string
+	merchant string
 	calls    map[string]int
 	prompts  []string
 }
@@ -34,6 +35,9 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 	s := &scriptedLLM{
 		category: `{"category_id":null,"confidence":0}`,
 		source:   `{"source_id":null}`,
+		// Default: the model returns the phrase untouched, so a test that
+		// is not about naming reads exactly what it typed.
+		merchant: `{"merchant_id":null,"name":"","confidence":0}`,
 		calls:    map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,11 +58,14 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 			kind = "category_pick"
 		case strings.Contains(body.Messages[0].Content, "(source_pick)"):
 			kind = "source_pick"
+		case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
+			kind = "merchant_pick"
 		}
 		s.calls[kind]++
 		s.prompts = append(s.prompts, body.Messages[1].Content)
 		content := map[string]string{
 			"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
+			"merchant_pick": s.merchant,
 		}[kind]
 		s.mu.Unlock()
 
@@ -76,6 +83,12 @@ func (s *scriptedLLM) setIntent(body string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.intent = body
+}
+
+func (s *scriptedLLM) setMerchant(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.merchant = body
 }
 
 func (s *scriptedLLM) setCategory(body string) {
@@ -162,7 +175,7 @@ func TestCorrectionRelabelsTheLastTransaction(t *testing.T) {
 	f.say(t, "m2", "itu kategori makanan & minuman")
 
 	// The router saw the batch it is correcting.
-	assert.Contains(t, script.lastPrompt(), "ayam crispi")
+	assert.Contains(t, script.lastPrompt(), "Ayam Crispi")
 
 	txs := f.live(t)
 	require.Len(t, txs, 1, "a correction edits in place, it does not write a second row")
@@ -174,7 +187,7 @@ func TestCorrectionRelabelsTheLastTransaction(t *testing.T) {
 	assert.Equal(t, "clean", txs[0].ReviewStatus)
 	assert.Equal(t, 0, f.openActions(t), "a correction parks nothing")
 
-	assert.Equal(t, "Oke, kuperbaiki: Rp25.000 · ayam crispi · Makanan & Minuman · BCA", f.sender.last())
+	assert.Equal(t, "Oke, kuperbaiki: Rp25.000 · Ayam Crispi · Makanan & Minuman · BCA", f.sender.last())
 }
 
 func TestSourceCorrectionReversesAndRewrites(t *testing.T) {
@@ -207,7 +220,7 @@ func TestSourceCorrectionReversesAndRewrites(t *testing.T) {
 		}
 	}
 	require.NotEqual(t, uuid.Nil, replacement, "the rewrite is missing")
-	assert.Contains(t, f.sender.last(), "Oke, kuperbaiki: Rp25.000 · ayam crispi")
+	assert.Contains(t, f.sender.last(), "Oke, kuperbaiki: Rp25.000 · Ayam Crispi")
 	assert.Contains(t, f.sender.last(), "GoPay")
 
 	// The batch is addressable again: "batal" must reverse the rewrite,
@@ -321,18 +334,18 @@ func TestPlaceClauseBecomesMerchantAndSourceIsRecognised(t *testing.T) {
 	txs := f.live(t)
 	require.Len(t, txs, 2)
 	require.NotNil(t, txs[0].Merchant)
-	assert.Equal(t, "alfamart", *txs[0].Merchant)
+	assert.Equal(t, "Alfamart", *txs[0].Merchant)
 	require.NotNil(t, txs[0].Note)
 	assert.Equal(t, "tissu", *txs[0].Note)
 	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
 	require.NotNil(t, txs[1].Merchant)
-	assert.Equal(t, "cimol", *txs[1].Merchant)
+	assert.Equal(t, "Cimol", *txs[1].Merchant)
 	assert.Nil(t, txs[1].Note)
 	assert.Equal(t, f.dana.ID, legSourceID(t, txs[1].Legs))
 
 	reply := f.sender.last()
 	assert.Contains(t, reply, "2 transaksi tercatat")
-	assert.Contains(t, reply, "alfamart · tissu")
+	assert.Contains(t, reply, "Alfamart · tissu")
 	assert.Equal(t, 0, f.openActions(t))
 	assert.Equal(t, 0, script.callsOf("source_pick"), "a from-clause never reaches the model")
 }
@@ -347,7 +360,7 @@ func TestUnmatchedFromClauseIsAPlaceNotAModelCall(t *testing.T) {
 
 	assert.Empty(t, f.live(t))
 	reply := f.sender.last()
-	assert.Contains(t, reply, "Aku tahan dulu: kantor · gaji Rp5.000.000")
+	assert.Contains(t, reply, "Aku tahan dulu: Kantor · gaji Rp5.000.000")
 	assert.Contains(t, reply, "Bayar pakai sumber mana?")
 	assert.Equal(t, 0, script.callsOf("source_pick"))
 
@@ -356,7 +369,7 @@ func TestUnmatchedFromClauseIsAPlaceNotAModelCall(t *testing.T) {
 	require.Len(t, open, 1)
 	var params map[string]any
 	require.NoError(t, json.Unmarshal(open[0].Params, &params))
-	assert.Equal(t, "kantor", params["merchant"])
+	assert.Equal(t, "Kantor", params["merchant"])
 	assert.Equal(t, "gaji", params["note"])
 }
 

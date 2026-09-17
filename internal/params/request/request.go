@@ -108,6 +108,17 @@ type CreateCategoryRequest struct {
 	Essential bool       `json:"essential"`
 }
 
+// RenameMerchantRequest renames a canonical merchant; every row that
+// points at it picks up the new display text.
+type RenameMerchantRequest struct {
+	Name string `json:"name" validate:"required,min=1,max=80"`
+}
+
+// MergeMerchantRequest folds the path merchant into another one.
+type MergeMerchantRequest struct {
+	IntoMerchantID uuid.UUID `json:"into_merchant_id" validate:"required"`
+}
+
 type UpdateCategoryRequest struct {
 	Name      *string    `json:"name" validate:"omitempty,min=1"`
 	ParentID  *uuid.UUID `json:"parent_id" validate:"omitempty,uuid"`

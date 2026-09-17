@@ -217,6 +217,7 @@ func LedgerItemFromRow(row repository.LedgerRow) response.LedgerItem {
 		OccurredAt:            row.OccurredAt,
 		Type:                  row.Type,
 		Merchant:              row.Merchant,
+		MerchantID:            row.MerchantID,
 		Note:                  row.Note,
 		AmountMinor:           row.AmountMinor,
 		CategoryID:            row.CategoryID,

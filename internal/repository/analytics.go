@@ -116,27 +116,27 @@ func (r *AnalyticsRepository) DailyFlows(ctx context.Context, from, to time.Time
 	return income, expense, rows.Err()
 }
 
-// TopMerchants ranks merchants by outflow (negative expense source
-// legs as positive magnitudes) in range. Merchants without a name are
-// skipped — they are not merchants.
+// TopMerchants ranks canonical merchants by outflow (negative expense
+// source legs as positive magnitudes) in range. Rows that never named a
+// merchant have nothing to rank.
 func (r *AnalyticsRepository) TopMerchants(ctx context.Context, from, to time.Time, limit int) ([]TopMerchantRow, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := r.db.Query(ctx,
-		`SELECT t.merchant,
+		`SELECT m.id, m.name,
 		        COALESCE(SUM(-l.signed_amount), 0) AS amount,
 		        COUNT(DISTINCT t.id) AS tx_count
 		 FROM legs l
 		 JOIN transactions t ON t.id = l.transaction_id
+		 JOIN merchants m ON m.id = t.merchant_id
 		 WHERE t.user_id = $1
 		   AND t.type = 'expense' AND t.voided_at IS NULL
 		   AND l.source_id IS NOT NULL AND l.signed_amount < 0
-		   AND t.merchant IS NOT NULL AND t.merchant <> ''
 		   AND t.occurred_at >= $2 AND t.occurred_at < $3
-		 GROUP BY t.merchant
-		 ORDER BY amount DESC, t.merchant ASC
+		 GROUP BY m.id, m.name
+		 ORDER BY amount DESC, m.name ASC
 		 LIMIT $4`,
 		uid, from, to, limit,
 	)
@@ -148,7 +148,7 @@ func (r *AnalyticsRepository) TopMerchants(ctx context.Context, from, to time.Ti
 	out := []TopMerchantRow{}
 	for rows.Next() {
 		var m TopMerchantRow
-		if err := rows.Scan(&m.Name, &m.AmountMinor, &m.TxCount); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.AmountMinor, &m.TxCount); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -157,12 +157,15 @@ func (r *AnalyticsRepository) TopMerchants(ctx context.Context, from, to time.Ti
 }
 
 type TopMerchantRow struct {
+	ID          uuid.UUID
 	Name        string
 	AmountMinor int64
 	TxCount     int64
 }
 
 // NeedsReviewCount counts live transactions in the needs-review queue.
+// An original that a live reversal has cancelled is not money that still
+// stands, so it leaves the queue with its badge.
 func (r *AnalyticsRepository) NeedsReviewCount(ctx context.Context) (int64, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
@@ -170,8 +173,13 @@ func (r *AnalyticsRepository) NeedsReviewCount(ctx context.Context) (int64, erro
 	}
 	var n int64
 	err = r.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM transactions
-		 WHERE user_id = $1 AND review_status = 'needs_review' AND voided_at IS NULL`,
+		`SELECT COUNT(*) FROM transactions t
+		 WHERE t.user_id = $1 AND t.review_status = 'needs_review' AND t.voided_at IS NULL
+		   AND NOT EXISTS (
+		     SELECT 1 FROM transactions rv
+		     WHERE rv.reverses_transaction_id = t.id AND rv.user_id = t.user_id
+		       AND rv.voided_at IS NULL
+		   )`,
 		uid,
 	).Scan(&n)
 	return n, err
@@ -186,9 +194,14 @@ func (r *AnalyticsRepository) UncategorizedCount(ctx context.Context, from time.
 	}
 	var n int64
 	err = r.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM transactions
-		 WHERE user_id = $1 AND category_id IS NULL AND type IN ('expense','income')
-		   AND voided_at IS NULL AND occurred_at >= $2`,
+		`SELECT COUNT(*) FROM transactions t
+		 WHERE t.user_id = $1 AND t.category_id IS NULL AND t.type IN ('expense','income')
+		   AND t.voided_at IS NULL AND t.occurred_at >= $2
+		   AND NOT EXISTS (
+		     SELECT 1 FROM transactions rv
+		     WHERE rv.reverses_transaction_id = t.id AND rv.user_id = t.user_id
+		       AND rv.voided_at IS NULL
+		   )`,
 		uid, from,
 	).Scan(&n)
 	return n, err

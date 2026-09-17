@@ -77,14 +77,17 @@ type inviter interface {
 // account first; everything below then runs under that account's scope,
 // so a capture can only ever touch its own ledger.
 type Harness struct {
-	cfg   *config.Config
-	log   *log.Logger
-	gw    gateway.Sender
-	llm   *llm.Client
-	txs   *service.TransactionService
-	over  *service.OverviewService
-	ana   *service.AnalyticsService
-	bills *service.BillService
+	cfg *config.Config
+	log *log.Logger
+	gw  gateway.Sender
+	llm *llm.Client
+	txs *service.TransactionService
+	// merchants canonicalises whatever the chat or a receipt called the
+	// shop, so memory lookups and the reply all speak one name.
+	merchants *service.MerchantService
+	over      *service.OverviewService
+	ana       *service.AnalyticsService
+	bills     *service.BillService
 
 	sources    *repository.SourceRepository
 	categories *repository.CategoryRepository
@@ -127,6 +130,7 @@ func NewHarness(
 	gw gateway.Sender,
 	llmClient *llm.Client,
 	txs *service.TransactionService,
+	merchants *service.MerchantService,
 	over *service.OverviewService,
 	ana *service.AnalyticsService,
 	bills *service.BillService,
@@ -145,7 +149,7 @@ func NewHarness(
 ) *Harness {
 	return &Harness{
 		cfg: cfg, log: logger.With(log.String("component", "bot")), gw: gw, llm: llmClient,
-		txs: txs, over: over, ana: ana, bills: bills,
+		txs: txs, merchants: merchants, over: over, ana: ana, bills: bills,
 		sources: sources, categories: categories, txRepo: txRepo,
 		pending: pending, inbound: inbound, chats: chats, analytics: analytics,
 		settings: settings, users: users, inviter: inv,

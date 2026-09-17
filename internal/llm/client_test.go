@@ -133,6 +133,62 @@ func TestPickSource(t *testing.T) {
 	assert.Equal(t, spay.ID, *id)
 }
 
+// TestPickMerchantMatchesAKnownMerchant: an id inside the whitelist is
+// kept, with its tidied name and clamped confidence.
+func TestPickMerchantMatchesAKnownMerchant(t *testing.T) {
+	kopi := llm.Candidate{ID: uuid.New(), Name: "Kopi Kenangan"}
+	indomaret := llm.Candidate{ID: uuid.New(), Name: "Indomaret"}
+
+	var calls int32
+	var bodies []map[string]any
+	srv := contentServer(t,
+		`{"merchant_id":"`+kopi.ID.String()+`","name":"Kopi Kenangan","confidence":1.4}`, &calls, &bodies)
+
+	pick, err := newTestClient(srv.URL).PickMerchant(context.Background(), "kopi kenangan tp", "", []llm.Candidate{kopi, indomaret})
+	require.NoError(t, err)
+	require.NotNil(t, pick.MerchantID)
+	assert.Equal(t, kopi.ID, *pick.MerchantID)
+	assert.Equal(t, "Kopi Kenangan", pick.Name)
+	assert.Equal(t, 1.0, pick.Confidence, "confidence is clamped into 0..1")
+
+	require.Len(t, bodies, 1)
+	messages, ok := bodies[0]["messages"].([]any)
+	require.True(t, ok)
+	system, ok := messages[0].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, system["content"], "merchant_id")
+	assert.Contains(t, system["content"], "name")
+	assert.Contains(t, system["content"], "confidence")
+}
+
+// TestPickMerchantDropsAnInventedID: an id outside the whitelist is not
+// a match (ADR-0003), but the tidied name it came with still stands.
+func TestPickMerchantDropsAnInventedID(t *testing.T) {
+	kopi := llm.Candidate{ID: uuid.New(), Name: "Kopi Kenangan"}
+
+	var calls int32
+	srv := contentServer(t,
+		`{"merchant_id":"`+uuid.New().String()+`","name":"Traktir Teman","confidence":0.9}`, &calls, nil)
+
+	pick, err := newTestClient(srv.URL).PickMerchant(context.Background(), "traktir makan temen", "", []llm.Candidate{kopi})
+	require.NoError(t, err)
+	assert.Nil(t, pick.MerchantID)
+	assert.Equal(t, "Traktir Teman", pick.Name)
+	assert.InDelta(t, 0.9, pick.Confidence, 0.0001)
+}
+
+// A user with no merchants yet still gets a tidied name.
+func TestPickMerchantWithNoCandidates(t *testing.T) {
+	var calls int32
+	srv := contentServer(t, `{"merchant_id":null,"name":"Indomaret","confidence":-2}`, &calls, nil)
+
+	pick, err := newTestClient(srv.URL).PickMerchant(context.Background(), "INDOMARET TUNJUNGAN 2", "belanja", nil)
+	require.NoError(t, err)
+	assert.Nil(t, pick.MerchantID)
+	assert.Equal(t, "Indomaret", pick.Name)
+	assert.Zero(t, pick.Confidence)
+}
+
 func TestRetryBudgetOnServerError(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

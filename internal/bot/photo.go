@@ -127,12 +127,22 @@ func (h *Harness) readPhoto(
 	params.Chat = p.Chat
 	params.From = p.From
 
+	// The paper's spelling of the shop becomes the same canonical
+	// merchant a typed capture would produce, so memory, analytics and
+	// the reply all agree on one name.
+	if m, err := h.merchants.Resolve(ctx, params.Merchant, ""); err != nil {
+		h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
+	} else if m != nil {
+		params.MerchantID = &m.ID
+		params.Merchant = m.Name
+	}
+
 	// The caption is the user's own instruction about this photo. It may
 	// name the Source outright, or need the router to read "bayarnya
 	// separuh cash" — but it never confirms: a picture is not a "ya".
 	captionHint, captionAnswer := h.readCaption(ctx, caption, params, sources, cats, lang)
 
-	pick := h.resolveReceiptSource(ctx, read, captionHint, params.Merchant, sources)
+	pick := h.resolveReceiptSource(ctx, read, captionHint, params.MerchantID, sources)
 	if pick.Source != nil {
 		params.SourceID = &pick.Source.ID
 		params.SourceName = pick.Source.Name
@@ -302,7 +312,10 @@ func (h *Harness) findReceiptDuplicate(ctx context.Context, p *receiptParams) (*
 	if err != nil {
 		return nil, err
 	}
-	return h.txRepo.FindLikelyDuplicate(ctx, p.Merchant, p.TotalMinor, start, end)
+	if p.MerchantID == nil {
+		return nil, nil
+	}
+	return h.txRepo.FindLikelyDuplicate(ctx, *p.MerchantID, p.TotalMinor, start, end)
 }
 
 // receiptFingerprint identifies the receipt itself, not the photo of it:

@@ -51,6 +51,7 @@ type receiptParams struct {
 	Type                string        `json:"type"` // expense | income | transfer
 	DocumentType        string        `json:"document_type"`
 	Merchant            string        `json:"merchant"`
+	MerchantID          *uuid.UUID    `json:"merchant_id,omitempty"`
 	TotalMinor          int64         `json:"total_minor"`
 	Items               []receiptItem `json:"items"`
 	SourceID            *uuid.UUID    `json:"source_id,omitempty"`

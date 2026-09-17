@@ -38,7 +38,9 @@ func newBillFixture(t *testing.T) *billFixture {
 	paymentRepo := repository.NewBillPaymentRepository(pool)
 	txSvc := service.NewTransactionService(
 		repository.NewTransactionRepository(pool), sourceRepo,
-		repository.NewCategoryRepository(pool), paymentRepo, billRepo, testkit.Logger(t),
+		repository.NewCategoryRepository(pool),
+		service.NewMerchantService(repository.NewMerchantRepository(pool), nil, testkit.Logger(t)),
+		paymentRepo, billRepo, testkit.Logger(t),
 	)
 	cash, err := sourceRepo.Create(ctx, &entity.Source{
 		ID: uuid.New(), Name: "Cash", Type: "cash", Currency: "IDR",

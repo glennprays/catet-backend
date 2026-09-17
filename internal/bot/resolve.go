@@ -161,11 +161,14 @@ type categoryVerdict struct {
 // a category the user set on this merchant is a rule, not a guess. An
 // LLM label below the confidence threshold still writes, but lands in
 // Needs-Review; no label at all writes uncategorised, also in
-// Needs-Review.
-func (h *Harness) resolveCategory(ctx context.Context, merchant, note, typ string, cats []entity.Category) categoryVerdict {
+// Needs-Review. merchantID is the canonical merchant (nil when the
+// capture named none); merchant is its display name, for the prompt.
+func (h *Harness) resolveCategory(
+	ctx context.Context, merchantID *uuid.UUID, merchant, note, typ string, cats []entity.Category,
+) categoryVerdict {
 	needsReview := categoryVerdict{ReviewStatus: "needs_review"}
-	if merchant != "" {
-		id, err := h.txRepo.LastUserCategoryForMerchant(ctx, merchant)
+	if merchantID != nil {
+		id, err := h.txRepo.LastUserCategoryForMerchant(ctx, *merchantID)
 		if err != nil {
 			h.log.Warn(traceOf(ctx), "merchant memory lookup failed", map[string]any{"error": err.Error()})
 		}

@@ -106,6 +106,7 @@ type LedgerItem struct {
 	OccurredAt            time.Time  `json:"occurred_at"`
 	Type                  string     `json:"type"`
 	Merchant              *string    `json:"merchant"`
+	MerchantID            *uuid.UUID `json:"merchant_id"`
 	Note                  *string    `json:"note"`
 	AmountMinor           int64      `json:"amount_minor"`
 	CategoryID            *uuid.UUID `json:"category_id"`
@@ -233,13 +234,38 @@ type HeatmapData struct {
 }
 
 type TopMerchant struct {
-	Name        string `json:"name"`
-	AmountMinor int64  `json:"amount_minor"`
-	TxCount     int64  `json:"tx_count"`
+	MerchantID  uuid.UUID `json:"merchant_id"`
+	Name        string    `json:"name"`
+	AmountMinor int64     `json:"amount_minor"`
+	TxCount     int64     `json:"tx_count"`
 }
 
 type TopMerchantsData struct {
 	Merchants []TopMerchant `json:"merchants"`
+}
+
+// ------------------------------------------------------------- merchants
+
+// MerchantSummary is one Settings → Merchants line.
+type MerchantSummary struct {
+	ID         uuid.UUID  `json:"id"`
+	Name       string     `json:"name"`
+	TxCount    int64      `json:"tx_count"`
+	TotalMinor int64      `json:"total_minor"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+}
+
+type MerchantListData struct {
+	Merchants []MerchantSummary `json:"merchants"`
+}
+
+type MerchantData struct {
+	Merchant entity.Merchant `json:"merchant"`
+}
+
+type MergedMerchantData struct {
+	Merged         bool      `json:"merged"`
+	IntoMerchantID uuid.UUID `json:"into_merchant_id"`
 }
 
 type EssentialLifestyleData struct {

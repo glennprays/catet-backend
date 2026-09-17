@@ -23,6 +23,7 @@ type captureParams struct {
 	Type                string     `json:"type"`
 	AmountMinor         int64      `json:"amount_minor"`
 	Merchant            string     `json:"merchant,omitempty"`
+	MerchantID          *uuid.UUID `json:"merchant_id,omitempty"`
 	Note                string     `json:"note,omitempty"`
 	SourceID            *uuid.UUID `json:"source_id,omitempty"`
 	SourceName          string     `json:"source_name,omitempty"`
@@ -172,11 +173,33 @@ func (h *Harness) capture(
 					}
 				}
 			}
-			if src == nil && merchant != "" {
+		}
+
+		// The canonical merchant is resolved before the memory lookups:
+		// both the Source memory and the category memory are keyed on the
+		// entity, so "alfamart" and "Alfamart Kebon Jeruk" share one.
+		var canonical *entity.Merchant
+		if merchant != "" {
+			m, err := h.merchants.Resolve(ctx, merchant, note)
+			if err != nil {
+				h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
+			} else if m != nil {
+				canonical = m
+				// The phrase the user actually typed survives as the note
+				// when the canonical name no longer contains it.
+				if note == "" && repository.AliasKey(merchant) != repository.AliasKey(m.Name) {
+					note = merchant
+				}
+				merchant = m.Name
+			}
+		}
+
+		if !explicit {
+			if src == nil && canonical != nil {
 				// The same memory a receipt uses: this shop was paid from
 				// there last time, so a typed "alfamart 15k" needs no
 				// question either.
-				if id, err := h.txRepo.LastSourceForMerchant(ctx, merchant); err != nil {
+				if id, err := h.txRepo.LastSourceForMerchant(ctx, canonical.ID); err != nil {
 					h.log.Warn(traceOf(ctx), "source memory lookup failed", map[string]any{"error": err.Error()})
 				} else if id != nil {
 					src = findSource(*id, sources)
@@ -191,6 +214,9 @@ func (h *Harness) capture(
 			Type: d.Type, AmountMinor: d.AmountMinor, Merchant: merchant, Note: note,
 			OccurredAt: d.OccurredAt, MessageID: p.MessageId, OriginalText: p.Text,
 			Chat: p.Chat, From: p.From,
+		}
+		if canonical != nil {
+			params.MerchantID = &canonical.ID
 		}
 		if src != nil {
 			params.SourceID = &src.ID
@@ -261,7 +287,7 @@ func (h *Harness) capture(
 				Source: &llmSource, ReviewStatus: "clean",
 			}
 		case d.Type == "expense" || d.Type == "income":
-			verdict = h.resolveCategory(ctx, merchant, note, d.Type, cats)
+			verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
 		}
 
 		occurred := d.OccurredAt
@@ -284,6 +310,7 @@ func (h *Harness) capture(
 			m := merchant
 			in.Merchant = &m
 		}
+		in.MerchantID = params.MerchantID
 		if note != "" {
 			nt := note
 			in.Note = &nt

@@ -46,7 +46,7 @@ func (h *Harness) resolveReceiptSource(
 	ctx context.Context,
 	read *llm.ReceiptRead,
 	captionHint *entity.Source,
-	merchant string,
+	merchantID *uuid.UUID,
 	sources []entity.Source,
 ) sourcePick {
 	if captionHint != nil {
@@ -64,8 +64,8 @@ func (h *Harness) resolveReceiptSource(
 		}
 	}
 
-	if merchant != "" {
-		id, err := h.txRepo.LastSourceForMerchant(ctx, merchant)
+	if merchantID != nil {
+		id, err := h.txRepo.LastSourceForMerchant(ctx, *merchantID)
 		if err != nil {
 			h.log.Warn(traceOf(ctx), "source memory lookup failed", map[string]any{"error": err.Error()})
 		}

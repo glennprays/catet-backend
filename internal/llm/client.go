@@ -204,6 +204,68 @@ func (c *Client) PickSource(ctx context.Context, hint string, sources []Candidat
 	return id, nil
 }
 
+// MerchantPick is the model's reading of one raw merchant phrase:
+// either an existing candidate (MerchantID set) or a tidied new name.
+type MerchantPick struct {
+	MerchantID *uuid.UUID
+	Name       string
+	Confidence float64
+}
+
+// PickMerchant maps a typed or printed phrase to a canonical merchant.
+// known is the whitelist of existing merchants; an id outside it is
+// dropped like everywhere else (ADR-0003), leaving the tidied name.
+func (c *Client) PickMerchant(ctx context.Context, raw, note string, known []Candidate) (*MerchantPick, error) {
+	if !c.Enabled(ctx) {
+		return nil, ErrUnavailable
+	}
+
+	system := "You normalise the merchant of one personal-finance entry in Indonesia. " +
+		"Given a raw phrase (typed in chat or printed on a receipt) and a list of the user's existing merchants (id - name), answer with the canonical merchant. " +
+		"Rules: if the phrase names the same brand or the same recurring concept as an existing merchant, return that merchant_id and its name; otherwise return merchant_id null and a new name. " +
+		"A name is the brand or concept only, in Title Case, without branch numbers, locations, legal suffixes (PT, Tbk), payment words or amounts: " +
+		"'INDOMARET TUNJUNGAN 2' -> 'Indomaret', 'kopi kenangan tp' -> 'Kopi Kenangan'. " +
+		"A descriptive phrase with no brand becomes a short Indonesian concept, 2-3 words, so repeats group together: " +
+		"'traktir makan temen' and 'traktir temen' -> 'Traktir Teman', 'bensin motor' -> 'Bensin'. " +
+		"Never invent a brand the phrase does not imply. confidence is 0..1 for the match or the new name."
+
+	var user strings.Builder
+	user.WriteString("Raw: " + raw + "\n")
+	user.WriteString("Note: " + fallback(strings.TrimSpace(note), "(none)") + "\n")
+	user.WriteString("Existing merchants (id - name):\n")
+	if len(known) == 0 {
+		user.WriteString("none\n")
+	} else {
+		writeCandidates(&user, known)
+	}
+
+	schema := objectSchema(map[string]any{
+		"merchant_id": map[string]any{"type": []string{"string", "null"}},
+		"name":        map[string]any{"type": "string"},
+		"confidence":  map[string]any{"type": "number"},
+	}, "merchant_id", "name", "confidence")
+
+	var out struct {
+		MerchantID *string `json:"merchant_id"`
+		Name       string  `json:"name"`
+		Confidence float64 `json:"confidence"`
+	}
+	if err := c.complete(ctx, system, user.String(), "merchant_pick", schema, &out); err != nil {
+		return nil, err
+	}
+
+	pick := &MerchantPick{Name: strings.TrimSpace(out.Name), Confidence: out.Confidence}
+	if id, ok := match(out.MerchantID, known); ok {
+		pick.MerchantID = id
+	}
+	if pick.Confidence < 0 {
+		pick.Confidence = 0
+	} else if pick.Confidence > 1 {
+		pick.Confidence = 1
+	}
+	return pick, nil
+}
+
 // verdictBanned rejects any verdict that quotes a figure: the numbers in
 // a rekap come from the ledger, never from the model.
 var verdictBanned = regexp.MustCompile(`[0-9]|Rp|\brb\b|\bjt\b|\bk\b`)

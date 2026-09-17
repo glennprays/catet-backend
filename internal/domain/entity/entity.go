@@ -34,6 +34,17 @@ type Category struct {
 	CreatedAt  time.Time  `json:"created_at"`
 }
 
+// Merchant is the brand or recurring concept money went to: one
+// canonical row per user per name, pointed at by every transaction that
+// named it however it was spelled.
+type Merchant struct {
+	ID        uuid.UUID `json:"id"`
+	UserID    uuid.UUID `json:"-"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // Leg is one side of a transaction: either a source change, a category
 // attribution, or (both NULL) the adjustment system sink.
 type Leg struct {
@@ -55,6 +66,7 @@ type Transaction struct {
 	Origin                string          `json:"origin"`
 	Type                  string          `json:"type"`
 	Merchant              *string         `json:"merchant"`
+	MerchantID            *uuid.UUID      `json:"merchant_id"`
 	Note                  *string         `json:"note"`
 	AmountMinor           int64           `json:"amount_minor"`
 	CategoryID            *uuid.UUID      `json:"category_id"`

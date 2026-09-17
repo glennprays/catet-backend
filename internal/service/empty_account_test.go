@@ -42,7 +42,8 @@ func TestEmptyAccountListsAreArraysNotNull(t *testing.T) {
 	billPaymentRepo := repository.NewBillPaymentRepository(pool)
 
 	analyticsSvc := service.NewAnalyticsService(analyticsRepo, categoryRepo, sourceRepo, billRepo, settingsRepo)
-	txSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, billPaymentRepo, billRepo, testkit.Logger(t))
+	merchantSvc := service.NewMerchantService(repository.NewMerchantRepository(pool), nil, testkit.Logger(t))
+	txSvc := service.NewTransactionService(transactionRepo, sourceRepo, categoryRepo, merchantSvc, billPaymentRepo, billRepo, testkit.Logger(t))
 	overviewSvc := service.NewOverviewService(sourceRepo, billRepo, settingsRepo, analyticsRepo, pendingRepo, txSvc)
 	sourceSvc := service.NewSourceService(sourceRepo, txSvc)
 	billSvc := service.NewBillService(billRepo, billPaymentRepo, txSvc, sourceRepo)
@@ -68,7 +69,7 @@ func TestEmptyAccountListsAreArraysNotNull(t *testing.T) {
 	})
 
 	t.Run("sts trend", func(t *testing.T) {
-		out, err := analyticsSvc.StsTrend(ctx, 30)
+		out, err := analyticsSvc.StsTrend(ctx, from, to)
 		require.NoError(t, err)
 		body := mustJSON(t, out)
 		assert.NotContains(t, body, `:null`,

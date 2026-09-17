@@ -37,7 +37,9 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 	paymentRepo := repository.NewBillPaymentRepository(pool)
 	txSvc := service.NewTransactionService(
 		repository.NewTransactionRepository(pool), sourceRepo,
-		repository.NewCategoryRepository(pool), paymentRepo, billRepo, testkit.Logger(t),
+		repository.NewCategoryRepository(pool),
+		service.NewMerchantService(repository.NewMerchantRepository(pool), nil, testkit.Logger(t)),
+		paymentRepo, billRepo, testkit.Logger(t),
 	)
 
 	return &sourceFixture{

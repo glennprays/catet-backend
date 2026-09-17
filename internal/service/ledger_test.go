@@ -23,6 +23,7 @@ type ledgerFixture struct {
 	src        *service.SourceService
 	sourceRepo *repository.SourceRepository
 	catRepo    *repository.CategoryRepository
+	analytics  *repository.AnalyticsRepository
 }
 
 // The ledger is per-user, so the fixture opens an account first: every
@@ -35,8 +36,9 @@ func newLedgerFixture(t *testing.T) *ledgerFixture {
 	sourceRepo := repository.NewSourceRepository(pool)
 	categoryRepo := repository.NewCategoryRepository(pool)
 	transactionRepo := repository.NewTransactionRepository(pool)
+	merchantSvc := service.NewMerchantService(repository.NewMerchantRepository(pool), nil, testkit.Logger(t))
 	txSvc := service.NewTransactionService(
-		transactionRepo, sourceRepo, categoryRepo,
+		transactionRepo, sourceRepo, categoryRepo, merchantSvc,
 		repository.NewBillPaymentRepository(pool), repository.NewBillRepository(pool), testkit.Logger(t),
 	)
 	return &ledgerFixture{
@@ -45,6 +47,7 @@ func newLedgerFixture(t *testing.T) *ledgerFixture {
 		src:        service.NewSourceService(sourceRepo, txSvc),
 		sourceRepo: sourceRepo,
 		catRepo:    categoryRepo,
+		analytics:  repository.NewAnalyticsRepository(pool),
 	}
 }
 
@@ -132,7 +135,8 @@ func TestTransferMirrorsLegs(t *testing.T) {
 }
 
 // TestVoidExcludesFromBalances verifies voiding removes a transaction
-// from all math while it stays listed with voided=true.
+// from all math and from the default list, while the Di-void bin still
+// reaches it.
 func TestVoidExcludesFromBalances(t *testing.T) {
 	f := newLedgerFixture(t)
 
@@ -141,19 +145,35 @@ func TestVoidExcludesFromBalances(t *testing.T) {
 	cat := f.createCategory(t, "Makanan")
 
 	kopi := f.createExpense(t, gopay.ID, cat.ID, 25_000, "kopi")
-	assert.Equal(t, int64(475_000), f.balances(t)[gopay.ID])
+	teh := f.createExpense(t, gopay.ID, cat.ID, 10_000, "teh")
+	assert.Equal(t, int64(465_000), f.balances(t)[gopay.ID])
 
 	require.NoError(t, f.tx.Void(f.ctx, kopi.ID))
 
-	assert.Equal(t, int64(500_000), f.balances(t)[gopay.ID])
+	assert.Equal(t, int64(490_000), f.balances(t)[gopay.ID])
 
-	// Still listed, marked voided (filter to expenses; the fixture's
+	// Gone from the default list (filter to expenses; the fixture's
 	// adjustment row is not under test).
 	dir := "expense"
 	page, err := f.tx.List(f.ctx, service.ListInput{Limit: 10, Direction: &dir})
 	require.NoError(t, err)
 	require.Len(t, page.Rows, 1)
+	assert.Equal(t, teh.ID, page.Rows[0].TransactionID)
+	assert.Equal(t, int64(1), page.Total)
+
+	// The Di-void bin holds exactly it.
+	only := "only"
+	page, err = f.tx.List(f.ctx, service.ListInput{Limit: 10, Direction: &dir, Voided: &only})
+	require.NoError(t, err)
+	require.Len(t, page.Rows, 1)
+	assert.Equal(t, kopi.ID, page.Rows[0].TransactionID)
 	assert.True(t, page.Rows[0].Voided)
+
+	// include shows both.
+	include := "include"
+	page, err = f.tx.List(f.ctx, service.ListInput{Limit: 10, Direction: &dir, Voided: &include})
+	require.NoError(t, err)
+	assert.Len(t, page.Rows, 2)
 
 	// Editing a voided transaction is rejected.
 	note := "x"
@@ -162,6 +182,78 @@ func TestVoidExcludesFromBalances(t *testing.T) {
 	var ae *apperror.Error
 	require.True(t, errors.As(err, &ae))
 	assert.Equal(t, apperror.KindConflict, ae.Kind)
+}
+
+// TestVoidedFilterRejectsUnknownValue keeps the enum honest: a typo is a
+// validation error naming the field, never a silent full-history list.
+func TestVoidedFilterRejectsUnknownValue(t *testing.T) {
+	f := newLedgerFixture(t)
+
+	maybe := "maybe"
+	_, err := f.tx.List(f.ctx, service.ListInput{Limit: 10, Voided: &maybe})
+	require.Error(t, err)
+	var ae *apperror.Error
+	require.True(t, errors.As(err, &ae))
+	assert.Equal(t, apperror.KindValidation, ae.Kind)
+	require.Len(t, ae.Details, 1)
+	assert.Equal(t, "voided", ae.Details[0].Field)
+}
+
+// TestReversedOriginalLeavesTheReviewQueue: a cancelled capture is not a
+// question. The original keeps its needs_review status (state is pure)
+// but leaves the queue list and the badge until the reversal is undone.
+func TestReversedOriginalLeavesTheReviewQueue(t *testing.T) {
+	f := newLedgerFixture(t)
+
+	bca := f.createSource(t, "BCA", "bank", false)
+	f.adjust(t, bca.ID, 500_000, "saldo awal")
+
+	merchant := "kopi kenangan"
+	original, err := f.tx.Create(f.ctx, service.CreateInput{
+		Type:        "expense",
+		OccurredAt:  timePtr(time.Now()),
+		AmountMinor: 25_000,
+		SourceID:    bca.ID,
+		Merchant:    &merchant,
+		Origin:      "whatsapp_text",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "needs_review", original.ReviewStatus)
+
+	needsReview := "needs_review"
+	page, err := f.tx.List(f.ctx, service.ListInput{Limit: 10, ReviewStatus: &needsReview})
+	require.NoError(t, err)
+	require.Len(t, page.Rows, 1)
+	n, err := f.analytics.NeedsReviewCount(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	reversal, err := f.tx.Reverse(f.ctx, original.ID, nil, "whatsapp_text")
+	require.NoError(t, err)
+
+	page, err = f.tx.List(f.ctx, service.ListInput{Limit: 10, ReviewStatus: &needsReview})
+	require.NoError(t, err)
+	assert.Empty(t, page.Rows)
+	assert.Equal(t, int64(0), page.Total)
+	n, err = f.analytics.NeedsReviewCount(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+
+	// Both rows stay visible in the plain ledger.
+	dir := "expense"
+	page, err = f.tx.List(f.ctx, service.ListInput{Limit: 10, Direction: &dir})
+	require.NoError(t, err)
+	assert.Len(t, page.Rows, 2)
+
+	// Undo the undo: the question is open again.
+	require.NoError(t, f.tx.Void(f.ctx, reversal.ID))
+	page, err = f.tx.List(f.ctx, service.ListInput{Limit: 10, ReviewStatus: &needsReview})
+	require.NoError(t, err)
+	require.Len(t, page.Rows, 1)
+	assert.Equal(t, original.ID, page.Rows[0].TransactionID)
+	n, err = f.analytics.NeedsReviewCount(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
 }
 
 // TestReversalLinkage verifies a reversal mirrors legs, links back to

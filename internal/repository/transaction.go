@@ -31,8 +31,16 @@ type ListFilter struct {
 	From         *time.Time
 	To           *time.Time
 	Direction    *string
-	Limit        int
-	Cursor       *Cursor
+	// Voided selects soft-deleted rows: "exclude" (the default when empty),
+	// "include", or "only" — the dashboard's Di-void bin.
+	Voided string
+	// ExcludeReversed drops originals that have a live reversal: the review
+	// queue asks about money that still stands, never about cancelled money.
+	ExcludeReversed bool
+	// MerchantID narrows to one canonical merchant; nil = any.
+	MerchantID *uuid.UUID
+	Limit      int
+	Cursor     *Cursor
 }
 
 // LedgerRow is the joined list row ready for response.LedgerItem.
@@ -41,6 +49,7 @@ type LedgerRow struct {
 	OccurredAt            time.Time
 	Type                  string
 	Merchant              *string
+	MerchantID            *uuid.UUID
 	Note                  *string
 	AmountMinor           int64
 	CategoryID            *uuid.UUID
@@ -83,11 +92,11 @@ func (r *TransactionRepository) Insert(ctx context.Context, tx *entity.Transacti
 
 	created, err := pgTx.Exec(ctx,
 		`INSERT INTO transactions (
-			id, occurred_at, origin, type, merchant, note, category_id,
+			id, occurred_at, origin, type, merchant, merchant_id, note, category_id,
 			category_source, category_confidence, review_status, external_id,
 			content_hash, reverses_transaction_id, edit_history, voided_at, user_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-		tx.ID, tx.OccurredAt, tx.Origin, tx.Type, tx.Merchant, tx.Note, tx.CategoryID,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		tx.ID, tx.OccurredAt, tx.Origin, tx.Type, tx.Merchant, tx.MerchantID, tx.Note, tx.CategoryID,
 		tx.CategorySource, tx.CategoryConfidence, tx.ReviewStatus, tx.ExternalID,
 		tx.ContentHash, tx.ReversesTransactionID, editHistory, tx.VoidedAt, uid,
 	)
@@ -121,10 +130,11 @@ func (r *TransactionRepository) Save(ctx context.Context, tx *entity.Transaction
 	tag, err := pgTx.Exec(ctx,
 		`UPDATE transactions SET
 			occurred_at = $2, merchant = $3, note = $4, category_id = $5,
-			category_source = $6, review_status = $7, edit_history = $8
+			category_source = $6, review_status = $7, edit_history = $8,
+			merchant_id = $10
 		 WHERE id = $1 AND user_id = $9 AND voided_at IS NULL`,
 		tx.ID, tx.OccurredAt, tx.Merchant, tx.Note, tx.CategoryID,
-		tx.CategorySource, tx.ReviewStatus, tx.EditHistory, uid,
+		tx.CategorySource, tx.ReviewStatus, tx.EditHistory, uid, tx.MerchantID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("update transaction: %w", err)
@@ -165,7 +175,7 @@ func (r *TransactionRepository) SetVoided(ctx context.Context, id uuid.UUID, at 
 // the user themselves last put on this merchant. Only user-set labels
 // count — echoing back the LLM's own guess would launder a guess into a
 // rule.
-func (r *TransactionRepository) LastUserCategoryForMerchant(ctx context.Context, merchant string) (*uuid.UUID, error) {
+func (r *TransactionRepository) LastUserCategoryForMerchant(ctx context.Context, merchantID uuid.UUID) (*uuid.UUID, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
@@ -173,11 +183,11 @@ func (r *TransactionRepository) LastUserCategoryForMerchant(ctx context.Context,
 	var id uuid.UUID
 	err = r.db.QueryRow(ctx,
 		`SELECT category_id FROM transactions
-		 WHERE user_id = $2 AND lower(merchant) = lower($1)
+		 WHERE user_id = $2 AND merchant_id = $1
 		   AND category_source = 'user'
 		   AND voided_at IS NULL AND category_id IS NOT NULL
 		 ORDER BY created_at DESC LIMIT 1`,
-		merchant, uid,
+		merchantID, uid,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -194,7 +204,7 @@ func (r *TransactionRepository) LastUserCategoryForMerchant(ctx context.Context,
 // one batch (a split receipt writes several rows at the same instant)
 // the larger share wins, because that is the account the user thinks of
 // as having paid.
-func (r *TransactionRepository) LastSourceForMerchant(ctx context.Context, merchant string) (*uuid.UUID, error) {
+func (r *TransactionRepository) LastSourceForMerchant(ctx context.Context, merchantID uuid.UUID) (*uuid.UUID, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
@@ -204,12 +214,12 @@ func (r *TransactionRepository) LastSourceForMerchant(ctx context.Context, merch
 		`SELECT l.source_id FROM transactions t
 		 JOIN legs l ON l.transaction_id = t.id
 		   AND l.source_id IS NOT NULL AND l.signed_amount < 0
-		 WHERE t.user_id = $2 AND lower(t.merchant) = lower($1)
+		 WHERE t.user_id = $2 AND t.merchant_id = $1
 		   AND t.voided_at IS NULL
 		   AND t.reverses_transaction_id IS NULL
 		   AND t.type IN ('expense','transfer')
 		 ORDER BY t.occurred_at DESC, l.signed_amount ASC, t.created_at DESC LIMIT 1`,
-		merchant, uid,
+		merchantID, uid,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -222,7 +232,7 @@ func (r *TransactionRepository) LastSourceForMerchant(ctx context.Context, merch
 
 // LatestExpenseByMerchant finds the refund target: the most recent live,
 // not-yet-reversed expense for this merchant since the given instant.
-func (r *TransactionRepository) LatestExpenseByMerchant(ctx context.Context, merchant string, since time.Time) (*entity.Transaction, error) {
+func (r *TransactionRepository) LatestExpenseByMerchant(ctx context.Context, merchantID uuid.UUID, since time.Time) (*entity.Transaction, error) {
 	uid, err := scope.UserID(ctx)
 	if err != nil {
 		return nil, err
@@ -232,7 +242,7 @@ func (r *TransactionRepository) LatestExpenseByMerchant(ctx context.Context, mer
 		`SELECT t.id FROM transactions t
 		 WHERE t.user_id = $3 AND t.type = 'expense' AND t.voided_at IS NULL
 		   AND t.reverses_transaction_id IS NULL
-		   AND lower(t.merchant) = lower($1)
+		   AND t.merchant_id = $1
 		   AND t.occurred_at >= $2
 		   AND NOT EXISTS (
 		     SELECT 1 FROM transactions r
@@ -240,7 +250,7 @@ func (r *TransactionRepository) LatestExpenseByMerchant(ctx context.Context, mer
 		       AND r.voided_at IS NULL
 		   )
 		 ORDER BY t.occurred_at DESC, t.created_at DESC LIMIT 1`,
-		merchant, since, uid,
+		merchantID, since, uid,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -274,7 +284,7 @@ func (r *TransactionRepository) IsReversed(ctx context.Context, id uuid.UUID) (b
 }
 
 const txDetailSelect = `
-	SELECT t.id, t.occurred_at, t.origin, t.type, t.merchant, t.note,
+	SELECT t.id, t.occurred_at, t.origin, t.type, t.merchant, t.merchant_id, t.note,
 	       t.category_id, c.name, t.category_source, t.category_confidence,
 	       t.review_status, t.external_id, t.reverses_transaction_id,
 	       COALESCE(t.edit_history, '[]'::jsonb), t.voided_at, t.created_at
@@ -307,7 +317,7 @@ func (r *TransactionRepository) getWhere(ctx context.Context, where string, arg 
 		editHistory []byte
 	)
 	err = row.Scan(
-		&t.ID, &t.OccurredAt, &t.Origin, &t.Type, &t.Merchant, &t.Note,
+		&t.ID, &t.OccurredAt, &t.Origin, &t.Type, &t.Merchant, &t.MerchantID, &t.Note,
 		&t.CategoryID, &t.CategoryName, &t.CategorySource, &t.CategoryConfidence,
 		&t.ReviewStatus, &t.ExternalID, &t.ReversesTransactionID,
 		&editHistory, &t.VoidedAt, &t.CreatedAt,
@@ -370,9 +380,9 @@ func (r *TransactionRepository) FindByContentHash(ctx context.Context, hash stri
 // photographed the receipt". It is a hint the user confirms, never an
 // automatic refusal.
 func (r *TransactionRepository) FindLikelyDuplicate(
-	ctx context.Context, merchant string, amountMinor int64, dayStart, dayEnd time.Time,
+	ctx context.Context, merchantID uuid.UUID, amountMinor int64, dayStart, dayEnd time.Time,
 ) (*uuid.UUID, error) {
-	if merchant == "" || amountMinor <= 0 {
+	if merchantID == uuid.Nil || amountMinor <= 0 {
 		return nil, nil
 	}
 	uid, err := scope.UserID(ctx)
@@ -389,10 +399,10 @@ func (r *TransactionRepository) FindLikelyDuplicate(
 		   AND l.source_id IS NOT NULL AND l.signed_amount = $2
 		 WHERE t.user_id = $5 AND t.type = 'expense' AND t.voided_at IS NULL
 		   AND t.reverses_transaction_id IS NULL
-		   AND lower(t.merchant) = lower($1)
+		   AND t.merchant_id = $1
 		   AND t.occurred_at >= $3 AND t.occurred_at < $4
 		 ORDER BY t.created_at DESC LIMIT 1`,
-		merchant, -amountMinor, dayStart, dayEnd, uid,
+		merchantID, -amountMinor, dayStart, dayEnd, uid,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -450,7 +460,7 @@ func insertLegs(ctx context.Context, tx pgx.Tx, txID uuid.UUID, legs []entity.Le
 // expense/income/adjustment, the outbound (negative) leg for transfers
 // — giving user-perspective signed amounts.
 const ledgerSelect = `
-	SELECT t.id, t.occurred_at, t.type, t.merchant, t.note,
+	SELECT t.id, t.occurred_at, t.type, t.merchant, t.merchant_id, t.note,
 	       p.signed_amount, t.category_id, c.name, p.source_id, ps.name,
 	       t.review_status, t.category_source, t.category_confidence,
 	       t.voided_at IS NOT NULL, t.reverses_transaction_id
@@ -485,6 +495,24 @@ func (r *TransactionRepository) buildWhere(f ListFilter, args []any, uid uuid.UU
 	}
 	if f.ReviewStatus != nil {
 		add("t.review_status =", *f.ReviewStatus)
+	}
+	switch f.Voided {
+	case "", "exclude":
+		conds = append(conds, `t.voided_at IS NULL`)
+	case "only":
+		conds = append(conds, `t.voided_at IS NOT NULL`)
+	case "include":
+		// every row, live or voided
+	}
+	if f.ExcludeReversed {
+		conds = append(conds, `NOT EXISTS (
+			SELECT 1 FROM transactions rv
+			WHERE rv.reverses_transaction_id = t.id AND rv.user_id = t.user_id
+			  AND rv.voided_at IS NULL
+		)`)
+	}
+	if f.MerchantID != nil {
+		add("t.merchant_id =", *f.MerchantID)
 	}
 	if f.Query != nil {
 		args = append(args, "%"+*f.Query+"%")
@@ -528,7 +556,7 @@ func (r *TransactionRepository) List(ctx context.Context, f ListFilter) ([]Ledge
 	for rows.Next() {
 		var row LedgerRow
 		if err := rows.Scan(
-			&row.TransactionID, &row.OccurredAt, &row.Type, &row.Merchant, &row.Note,
+			&row.TransactionID, &row.OccurredAt, &row.Type, &row.Merchant, &row.MerchantID, &row.Note,
 			&row.AmountMinor, &row.CategoryID, &row.CategoryName, &row.SourceID, &row.SourceName,
 			&row.ReviewStatus, &row.CategorySource, &row.CategoryConfidence,
 			&row.Voided, &row.ReversesTransactionID,

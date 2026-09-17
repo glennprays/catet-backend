@@ -36,6 +36,7 @@ type ledgerRepos struct {
 	sources   *repository.SourceRepository
 	cats      *repository.CategoryRepository
 	txs       *repository.TransactionRepository
+	merchants *repository.MerchantRepository
 	analytics *repository.AnalyticsRepository
 	budgets   *repository.BudgetRepository
 	bills     *repository.BillRepository
@@ -56,6 +57,7 @@ func newLedgerRepos(pool *pgxpool.Pool) ledgerRepos {
 		analytics: repository.NewAnalyticsRepository(pool),
 		budgets:   repository.NewBudgetRepository(pool),
 		bills:     repository.NewBillRepository(pool),
+		merchants: repository.NewMerchantRepository(pool),
 		billPays:  repository.NewBillPaymentRepository(pool),
 		reminders: repository.NewBillReminderSendRepository(pool),
 		pending:   repository.NewPendingActionRepository(pool),
@@ -82,6 +84,7 @@ type tenantRows struct {
 	externalID  string
 	contentHash string
 	merchant    string
+	merchantID  uuid.UUID
 	mediaSha    string
 	occurredAt  time.Time
 	nextDueDate time.Time
@@ -117,6 +120,12 @@ func seedTenant(t *testing.T, ctx context.Context, r ledgerRepos, userID uuid.UU
 	require.NoError(t, err)
 	rows.category = cat.ID
 
+	// The canonical merchant every merchant-keyed reader is scoped by.
+	merchant, err := r.merchants.Create(ctx, rows.merchant)
+	require.NoError(t, err)
+	rows.merchantID = merchant.ID
+	require.NoError(t, r.merchants.PutAlias(ctx, repository.AliasKey(rows.merchant), merchant.ID, "user"))
+
 	// A complete expense: source leg out, category leg in. category_source
 	// is 'user' because the merchant-memory reader only trusts labels the
 	// user set, and review_status is needs_review so the review queue
@@ -127,6 +136,7 @@ func seedTenant(t *testing.T, ctx context.Context, r ledgerRepos, userID uuid.UU
 		Origin:         "whatsapp_text",
 		Type:           "expense",
 		Merchant:       &rows.merchant,
+		MerchantID:     &rows.merchantID,
 		CategoryID:     &rows.category,
 		CategorySource: new("user"),
 		ReviewStatus:   "needs_review",
@@ -291,13 +301,29 @@ func TestTenantIsolation(t *testing.T) {
 			return r.txs.FindByContentHash(ctx, rows.contentHash)
 		}),
 		isolated("transactions.LatestExpenseByMerchant", func(ctx context.Context) (*entity.Transaction, error) {
-			return r.txs.LatestExpenseByMerchant(ctx, rows.merchant, from)
+			return r.txs.LatestExpenseByMerchant(ctx, rows.merchantID, from)
 		}),
 		isolated("transactions.LastSourceForMerchant", func(ctx context.Context) (*uuid.UUID, error) {
-			return r.txs.LastSourceForMerchant(ctx, rows.merchant)
+			return r.txs.LastSourceForMerchant(ctx, rows.merchantID)
 		}),
 		isolated("transactions.LastUserCategoryForMerchant", func(ctx context.Context) (*uuid.UUID, error) {
-			return r.txs.LastUserCategoryForMerchant(ctx, rows.merchant)
+			return r.txs.LastUserCategoryForMerchant(ctx, rows.merchantID)
+		}),
+
+		isolated("merchants.Get", func(ctx context.Context) (*entity.Merchant, error) {
+			return r.merchants.Get(ctx, rows.merchantID)
+		}),
+		isolated("merchants.FindByAlias", func(ctx context.Context) (*entity.Merchant, error) {
+			return r.merchants.FindByAlias(ctx, repository.AliasKey(rows.merchant))
+		}),
+		isolated("merchants.FindByName", func(ctx context.Context) (*entity.Merchant, error) {
+			return r.merchants.FindByName(ctx, rows.merchant)
+		}),
+		isolated("merchants.List", func(ctx context.Context) ([]repository.MerchantRow, error) {
+			return r.merchants.List(ctx)
+		}),
+		isolated("merchants.Candidates", func(ctx context.Context) ([]entity.Merchant, error) {
+			return r.merchants.Candidates(ctx, 50)
 		}),
 
 		isolated("analytics.CategorySpend", func(ctx context.Context) ([]repository.CategorySpendRow, error) {
