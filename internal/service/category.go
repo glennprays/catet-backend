@@ -128,8 +128,8 @@ func (s *CategoryService) guardCycle(ctx context.Context, id, newParent uuid.UUI
 
 // Archive soft-deletes the category and its whole subtree; an archived
 // parent with live children would be a tree the dashboard cannot draw.
-// Blocked while a budget in the current Jakarta month references the
-// category or any of its sub-categories.
+// Archiving stops every budget in the subtree from the current month;
+// past months stay as history.
 func (s *CategoryService) Archive(ctx context.Context, id uuid.UUID) error {
 	existing, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -145,16 +145,12 @@ func (s *CategoryService) Archive(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return apperror.Internal("failed to load category subtree").Wrap(err)
 	}
-	period := JakartaMonthPeriod(JakartaNow())
-	hasBudget, err := s.repo.HasBudgetInPeriod(ctx, ids, period)
-	if err != nil {
-		return apperror.Internal("failed to check budgets").Wrap(err)
-	}
-	if hasBudget {
-		return apperror.Conflict("category or one of its sub-categories is used by a budget in the current period")
-	}
 	if _, err := s.repo.ArchiveMany(ctx, ids); err != nil {
 		return apperror.Internal("failed to archive category").Wrap(err)
+	}
+	currentMonthStart, _ := currentMonthBounds()
+	if _, err := s.repo.StopBudgetsFrom(ctx, ids, currentMonthStart); err != nil {
+		return apperror.Internal("failed to stop budgets").Wrap(err)
 	}
 	return nil
 }

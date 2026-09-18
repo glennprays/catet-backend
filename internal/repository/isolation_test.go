@@ -88,7 +88,7 @@ type tenantRows struct {
 	mediaSha    string
 	occurredAt  time.Time
 	nextDueDate time.Time
-	period      string
+	monthStart  time.Time
 }
 
 // seedTenant writes one row in every user-owned table under the scope it
@@ -107,7 +107,7 @@ func seedTenant(t *testing.T, ctx context.Context, r ledgerRepos, userID uuid.UU
 		mediaSha:    "9f86d081884c7d659a2feaa0c55ad015",
 		occurredAt:  now,
 		nextDueDate: now.AddDate(0, 0, 3),
-		period:      now.Format("2006-01"),
+		monthStart:  time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC),
 	}
 
 	src, err := r.sources.Create(ctx, &entity.Source{
@@ -188,10 +188,8 @@ func seedTenant(t *testing.T, ctx context.Context, r ledgerRepos, userID uuid.UU
 	}}))
 	require.NoError(t, dbTx.Commit(ctx))
 
-	budget, err := r.budgets.Create(ctx,
-		&entity.BudgetRow{CategoryID: rows.category, AmountMinor: 1_000_000},
-		rows.period, false,
-	)
+	monthEnd := rows.monthStart.AddDate(0, 1, 0)
+	budget, err := r.budgets.Insert(ctx, rows.category, rows.monthStart, &monthEnd, 100_000)
 	require.NoError(t, err)
 	rows.budget = budget.ID
 
@@ -346,8 +344,8 @@ func TestTenantIsolation(t *testing.T) {
 			return r.analytics.UncategorizedCount(ctx, from)
 		}),
 
-		isolated("budgets.List", func(ctx context.Context) ([]repository.BudgetRecord, error) {
-			return r.budgets.List(ctx, rows.period)
+		isolated("budgets.ListCovering", func(ctx context.Context) ([]repository.BudgetRecord, error) {
+			return r.budgets.ListCovering(ctx, rows.monthStart)
 		}),
 		isolated("budgets.GetByID", func(ctx context.Context) (*repository.BudgetRecord, error) {
 			return r.budgets.GetByID(ctx, rows.budget)

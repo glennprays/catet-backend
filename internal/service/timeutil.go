@@ -23,6 +23,10 @@ func JakartaNow() time.Time {
 	return time.Now().In(jakartaLoc)
 }
 
+// Jakarta is the location every calendar comparison runs in; the host's
+// time.Local says nothing about an Indonesian ledger.
+func Jakarta() *time.Location { return jakartaLoc }
+
 // JakartaDate returns today's calendar date (YYYY-MM-DD).
 func JakartaDate() string {
 	return JakartaNow().Format("2006-01-02")
@@ -79,6 +83,23 @@ func JakartaMonthBounds(period string) (time.Time, time.Time, error) {
 func JakartaMonthPeriod(t time.Time) string {
 	return t.In(jakartaLoc).Format("2006-01")
 }
+
+// JakartaMonthStart maps "YYYY-MM" to the Jakarta first-of-month at
+// 00:00 — the anchor every budget segment bound is compared against.
+func JakartaMonthStart(period string) (time.Time, error) {
+	start, _, err := JakartaMonthBounds(period)
+	return start, err
+}
+
+// JakartaMonthOf re-anchors any instant (including a `date` read back
+// from Postgres as UTC midnight) to the Jakarta first-of-month it names.
+func JakartaMonthOf(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, jakartaLoc)
+}
+
+// MonthAfter and MonthBefore step a first-of-month anchor by one month.
+func MonthAfter(t time.Time) time.Time  { return t.AddDate(0, 1, 0) }
+func MonthBefore(t time.Time) time.Time { return t.AddDate(0, -1, 0) }
 
 // currentMonthBounds returns [start, end) for the current Jakarta month.
 func currentMonthBounds() (time.Time, time.Time) {

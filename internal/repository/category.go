@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/scope"
@@ -167,20 +168,33 @@ func (r *CategoryRepository) ArchiveMany(ctx context.Context, ids []uuid.UUID) (
 	return tag.RowsAffected(), nil
 }
 
-// HasBudgetInPeriod reports whether a budget exists for any of the
-// categories in the given YYYY-MM period (archive guard).
-func (r *CategoryRepository) HasBudgetInPeriod(ctx context.Context, ids []uuid.UUID, period string) (bool, error) {
+// StopBudgetsFrom ends every budget of the listed categories at the start of
+// month: segments starting on or after it are deleted, one straddling it is
+// closed at it. Returns how many rows changed.
+func (r *CategoryRepository) StopBudgetsFrom(ctx context.Context, ids []uuid.UUID, month time.Time) (int64, error) {
 	if len(ids) == 0 {
-		return false, nil
+		return 0, nil
 	}
 	uid, err := scope.UserID(ctx)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	var exists bool
-	err = r.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM budgets WHERE category_id = ANY($1) AND period = $2 AND user_id = $3)`,
-		ids, period, uid,
-	).Scan(&exists)
-	return exists, err
+	start := month.Format("2006-01-02")
+	dropped, err := r.db.Exec(ctx,
+		`DELETE FROM budgets WHERE category_id = ANY($1) AND user_id = $3 AND starts_on >= $2`,
+		ids, start, uid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	closed, err := r.db.Exec(ctx,
+		`UPDATE budgets SET ends_before = $2
+		 WHERE category_id = ANY($1) AND user_id = $3
+		   AND starts_on < $2 AND (ends_before IS NULL OR ends_before > $2)`,
+		ids, start, uid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return dropped.RowsAffected() + closed.RowsAffected(), nil
 }

@@ -241,6 +241,7 @@ func (r *Router) setupBudgetRoutes(group fiber.Router) {
 	group.Get("/budgets", r.BudgetHandler.List)
 	group.Post("/budgets", r.BudgetHandler.Create)
 	group.Patch("/budgets/:id", r.BudgetHandler.Update)
+	group.Post("/budgets/:id/stop", r.BudgetHandler.Stop)
 	group.Delete("/budgets/:id", r.BudgetHandler.Delete)
 }
 

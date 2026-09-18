@@ -186,14 +186,26 @@ type PayBillRequest struct {
 
 // ---------------------------------------------------------------- budgets
 
+// CreateBudgetRequest starts a budget rule. Recurring is the default:
+// omitting it (nil) means "runs until stopped".
 type CreateBudgetRequest struct {
 	CategoryID  uuid.UUID `json:"category_id" validate:"required,uuid"`
 	Period      string    `json:"period" validate:"required,yyyy-mm"`
 	AmountMinor int64     `json:"amount_minor" validate:"required,min=1"`
+	Recurring   *bool     `json:"recurring"`
 }
 
+// UpdateBudgetRequest changes the nominal from Period on, or for that
+// single month; the client always says which.
 type UpdateBudgetRequest struct {
-	AmountMinor int64 `json:"amount_minor" validate:"required,min=1"`
+	AmountMinor int64  `json:"amount_minor" validate:"required,min=1"`
+	Period      string `json:"period" validate:"required,yyyy-mm"`
+	Scope       string `json:"scope" validate:"required,oneof=from_month only_month"`
+}
+
+// StopBudgetRequest ends a rule from Period on.
+type StopBudgetRequest struct {
+	Period string `json:"period" validate:"required,yyyy-mm"`
 }
 
 // ------------------------------------------------------------- hold queue

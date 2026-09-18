@@ -91,27 +91,34 @@ func TestArchiveCascadesToSubtree(t *testing.T) {
 	assert.NotNil(t, token.ID)
 }
 
-// TestArchiveParentBlockedByChildBudget: the current-period budget guard
-// covers the subtree, so a parent cannot be archived out from under a
-// child the user is still budgeting.
-func TestArchiveParentBlockedByChildBudget(t *testing.T) {
+// TestArchiveStopsSubtreeBudgets: archiving is no longer blocked by a
+// live budget. It stops every budget in the subtree from the current
+// month and leaves earlier months as history.
+func TestArchiveStopsSubtreeBudgets(t *testing.T) {
 	f := newCategoryFixture(t)
 
 	transport := f.create(t, "Transport", nil)
 	bensin := f.create(t, "Bensin", &transport.ID)
 
-	_, err := f.budgets.Create(f.ctx, bensin.ID, service.JakartaMonthPeriod(service.JakartaNow()), 500_000_00)
+	last := months(-1)
+	_, err := f.budgets.Create(f.ctx, bensin.ID, last, 500_000, true)
 	require.NoError(t, err)
 
-	err = f.cats.Archive(f.ctx, transport.ID)
-	require.Error(t, err)
-	var ae *apperror.Error
-	require.True(t, errors.As(err, &ae))
-	assert.Equal(t, apperror.KindConflict, ae.Kind)
+	require.NoError(t, f.cats.Archive(f.ctx, transport.ID))
+
+	_, rows, err := f.budgets.List(f.ctx, &last)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "past months stay as history")
+	assert.Equal(t, "Bensin", rows[0].CategoryName)
+
+	current := months(0)
+	_, rows, err = f.budgets.List(f.ctx, &current)
+	require.NoError(t, err)
+	assert.Empty(t, rows, "the archived subtree is unbudgeted from this month")
 
 	live := f.byName(t, false)
-	assert.Contains(t, live, "Transport", "a refused archive changes nothing")
-	assert.Contains(t, live, "Bensin")
+	assert.NotContains(t, live, "Transport")
+	assert.NotContains(t, live, "Bensin")
 }
 
 // TestArchivedParentRefusesChildren: an archived category is a dead end.
@@ -168,7 +175,7 @@ func TestArchivedCategoryRefusedOnNewBudget(t *testing.T) {
 	cat := f.create(t, "Hiburan", nil)
 	require.NoError(t, f.cats.Archive(f.ctx, cat.ID))
 
-	_, err := f.budgets.Create(f.ctx, cat.ID, service.JakartaMonthPeriod(service.JakartaNow()), 100_000_00)
+	_, err := f.budgets.Create(f.ctx, cat.ID, service.JakartaMonthPeriod(service.JakartaNow()), 100_000, true)
 	require.Error(t, err)
 	var ae *apperror.Error
 	require.True(t, errors.As(err, &ae))

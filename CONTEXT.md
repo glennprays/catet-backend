@@ -88,6 +88,10 @@ _Avoid_: pending draft, queued action
 
 ### Planning & awareness
 
+**Budget**:
+A per-category monthly limit that runs as a rule from a start month until stopped. Its nominal is effective-dated: changing it "from this month" closes the old run and starts a new one; "this month only" is a one-month exception. Spend counts the category's whole subtree; a budget under a budgeted ancestor is nested and stays out of the totals. Archiving the category stops the budget from the current month. No rollover.
+_Avoid_: anggaran template, budget copy, monthly cap
+
 **Bill**:
 An expected obligation — recurring or one-time (rent, subscription, installment) — with a cadence and an estimated amount band. Feeds reservations and the due calendar; incoming payments auto-match against it.
 _Avoid_: subscription, recurring expense, fixed cost

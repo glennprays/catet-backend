@@ -30,7 +30,11 @@ func (h *BudgetHandler) Create(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	row, err := h.svc.Create(c.UserContext(), req.CategoryID, req.Period, req.AmountMinor)
+	recurring := true
+	if req.Recurring != nil {
+		recurring = *req.Recurring
+	}
+	row, err := h.svc.Create(c.UserContext(), req.CategoryID, req.Period, req.AmountMinor, recurring)
 	if err != nil {
 		return err
 	}
@@ -46,19 +50,36 @@ func (h *BudgetHandler) Update(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	row, err := h.svc.UpdateAmount(c.UserContext(), id, req.AmountMinor)
+	row, err := h.svc.UpdateAmount(c.UserContext(), id, req.Period, req.Scope, req.AmountMinor)
 	if err != nil {
 		return err
 	}
 	return httperror.OK(c, row)
 }
 
+// Stop ends the rule from the given period on; earlier months stay.
+func (h *BudgetHandler) Stop(c *fiber.Ctx) error {
+	id, err := uuidParam(c, "id")
+	if err != nil {
+		return err
+	}
+	req, err := httperror.BindAndValidate[request.StopBudgetRequest](c)
+	if err != nil {
+		return err
+	}
+	if err := h.svc.Stop(c.UserContext(), id, req.Period); err != nil {
+		return err
+	}
+	return httperror.OK(c, response.DeletedData{Deleted: true})
+}
+
+// Delete drops the rule and its whole history.
 func (h *BudgetHandler) Delete(c *fiber.Ctx) error {
 	id, err := uuidParam(c, "id")
 	if err != nil {
 		return err
 	}
-	if err := h.svc.Delete(c.UserContext(), id); err != nil {
+	if err := h.svc.DeleteAll(c.UserContext(), id); err != nil {
 		return err
 	}
 	return httperror.OK(c, response.DeletedData{Deleted: true})

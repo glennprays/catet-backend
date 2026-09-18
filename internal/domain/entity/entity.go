@@ -152,8 +152,9 @@ type BillReminderSend struct {
 	SentAt     time.Time `json:"sent_at"`
 }
 
-// BudgetRow is a budget joined with its category and the computed
-// spend for the period.
+// BudgetRow is a budget segment joined with its category and the
+// computed spend for the viewed period. A segment covers the months
+// [FromPeriod, ToPeriod]; ToPeriod null means it runs until stopped.
 type BudgetRow struct {
 	ID           uuid.UUID `json:"id"`
 	CategoryID   uuid.UUID `json:"category_id"`
@@ -161,6 +162,18 @@ type BudgetRow struct {
 	Essential    bool      `json:"essential"`
 	AmountMinor  int64     `json:"amount_minor"`
 	SpentMinor   int64     `json:"spent_minor"`
+	// FromPeriod is the first month this segment covers (YYYY-MM).
+	FromPeriod string `json:"from_period"`
+	// ToPeriod is the last month it covers; null while it recurs.
+	ToPeriod *string `json:"to_period"`
+	// SincePeriod is the first month the category was ever budgeted.
+	SincePeriod string `json:"since_period"`
+	// PreviousAmountMinor is the nominal this segment replaced, set only
+	// on the month the change took effect.
+	PreviousAmountMinor *int64 `json:"previous_amount_minor"`
+	// Nested marks a budget under an already-budgeted ancestor: its
+	// spend is already inside the ancestor's, so totals skip it.
+	Nested bool `json:"nested"`
 }
 
 // PendingAction is a parked Tier 1-3 tool call waiting for explicit
