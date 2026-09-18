@@ -279,7 +279,9 @@ func TestReceiptDateOutsideTheWindowIsDropped(t *testing.T) {
 		name string
 		date string
 	}{
-		{"too old", testNow.AddDate(0, 0, -40).Format("2006-01-02")},
+		// A year and a bit: printed dates up to MaxBackdateDays are now
+		// believed, so only something older is a hallucination.
+		{"too old", testNow.AddDate(0, 0, -400).Format("2006-01-02")},
 		{"in the future", testNow.AddDate(0, 0, 3).Format("2006-01-02")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

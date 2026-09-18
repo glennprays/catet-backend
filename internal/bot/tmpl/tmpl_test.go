@@ -183,6 +183,9 @@ var fixtures = map[string]struct {
 	"receipt_change_category": {data: map[string]any{"Category": "Makanan & Minuman"}},
 	"receipt_change_merchant": {data: map[string]any{"Merchant": "Indomaret"}},
 	"receipt_change_date":     {data: map[string]any{"Date": "14 Sep"}},
+	"receipt_change_note":     {data: map[string]any{"Note": "patungan"}},
+	"date_future":             {data: nil},
+	"date_too_old":            {data: nil},
 	"rekap_hari": {
 		data: map[string]any{
 			"Spent": "Rp143.000", "Sts": "Rp1.250.000", "ReservedTomorrow": "Rp75.000",
@@ -281,7 +284,7 @@ func TestRenderIndonesianText(t *testing.T) {
 		{"receipt_change_category", "kategori Makanan & Minuman"},
 		{"receipt_change_merchant", "merchant Indomaret"},
 		{"receipt_change_date", "tanggal 14 Sep"},
-		{"open_question_reminder", "Aku masih nunggu jawaban buat: Struk Indomaret · 14 Sep · 2 item · Rp45.000. Balas \"ya\"/\"tidak\", atau sebut sumbernya ya."},
+		{"open_question_reminder", "Aku masih nunggu jawaban buat: Struk Indomaret · 14 Sep · 2 item · Rp45.000. Balas \"ya\"/\"tidak\", sebut sumbernya, atau koreksi tanggal/nominalnya ya."},
 		{"batal_done", "Oke, 1 transaksi kubatalkan:\n1. Rp25.000 · kopi"},
 		{"batal_nothing", "Nggak ada yang bisa dibatalkan dari chat. Hapus lewat dashboard ya."},
 		{"batal_bad_index", "Nomor 5 nggak ada — batch terakhir cuma 2 item."},

@@ -227,7 +227,7 @@ func (h *Harness) readPhoto(
 // longer is worth one router call, which can also carry a category for
 // the whole receipt or a split payment. Whatever it returns is a hint —
 // the caption can never confirm the draft, so Confirm, Merchant and
-// DayOffset are deliberately ignored here.
+// OccurredDate are deliberately ignored here.
 func (h *Harness) readCaption(
 	ctx context.Context,
 	caption string,

@@ -111,6 +111,15 @@ func (h *Harness) capture(
 		return "", nil, lang, fmt.Errorf("list categories: %w", err)
 	}
 
+	// One choke point for both capture paths: a future date is not a
+	// memory and a year-old one is a dashboard job, so neither is written
+	// or parked.
+	for _, d := range drafts {
+		if _, refusal := guardDate(d.OccurredAt, lang); refusal != "" {
+			return refusal, nil, lang, nil
+		}
+	}
+
 	var (
 		written   []writtenItem
 		txIDs     []uuid.UUID
@@ -210,6 +219,14 @@ func (h *Harness) capture(
 			}
 		}
 
+		// A hold that will be written on another day says so: the user
+		// answering "dari BRI" two days later must see which day they are
+		// confirming.
+		dateLabel := ""
+		if d.OccurredAt.In(service.Jakarta()).Format("2006-01-02") != today {
+			dateLabel = formatDay(d.OccurredAt, lang)
+		}
+
 		params := captureParams{
 			Type: d.Type, AmountMinor: d.AmountMinor, Merchant: merchant, Note: note,
 			OccurredAt: d.OccurredAt, MessageID: p.MessageId, OriginalText: p.Text,
@@ -231,7 +248,7 @@ func (h *Harness) capture(
 		if d.Hold != nil {
 			params.Missing = missingFor(d.Hold.Code)
 			question := tmpl.Render(lang, d.Hold.Question, map[string]any{"Sources": sourceNames(sources)})
-			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type), question, params); err != nil {
+			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
 				return "", nil, lang, err
 			}
 			continue
@@ -251,7 +268,7 @@ func (h *Harness) capture(
 		if src == nil {
 			params.Missing = []string{"source"}
 			question := tmpl.Render(lang, "q_source", map[string]any{"Sources": sourceNames(sources)})
-			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type), question, params); err != nil {
+			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
 				return "", nil, lang, err
 			}
 			continue
@@ -268,7 +285,7 @@ func (h *Harness) capture(
 			if dest == nil || dest.ID == src.ID {
 				params.Missing = []string{"destination"}
 				question := tmpl.Render(lang, "q_destination", map[string]any{"Sources": sourceNames(sources)})
-				if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type), question, params); err != nil {
+				if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
 					return "", nil, lang, err
 				}
 				continue
@@ -342,7 +359,7 @@ func (h *Harness) capture(
 		if dest != nil {
 			item.Destination = dest.Name
 		}
-		if occurred.In(time.Local).Format("2006-01-02") != today {
+		if occurred.In(service.Jakarta()).Format("2006-01-02") != today {
 			item.Backdated = true
 			item.Date = formatDay(occurred, lang)
 		}
@@ -394,8 +411,9 @@ func renderWritten(written []writtenItem, lang string) string {
 }
 
 // summaryOf is the Hold Queue row's one-line label: where the money
-// went, what it was for, how much.
-func summaryOf(merchant, note string, amountMinor int64, typ string) string {
+// went, what it was for, how much, and — only when it is not today —
+// which day.
+func summaryOf(merchant, note string, amountMinor int64, typ, date string) string {
 	label := merchant
 	if label == "" {
 		label = typ
@@ -403,10 +421,13 @@ func summaryOf(merchant, note string, amountMinor int64, typ string) string {
 	if note != "" {
 		label += " · " + note
 	}
-	if amountMinor == 0 {
-		return label
+	if amountMinor > 0 {
+		label += " " + money.FormatIDR(amountMinor)
 	}
-	return label + " " + money.FormatIDR(amountMinor)
+	if date != "" {
+		label += " · " + date
+	}
+	return label
 }
 
 // missingFor maps a parser hold to the params.missing list the dashboard

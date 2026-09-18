@@ -26,6 +26,10 @@ import (
 type answerEdits struct {
 	llm.AnswerFields
 	AmountMinor *int64
+	// OccurredAt is a date the deterministic grammar read out of the
+	// message. It wins over the router's OccurredDate: the rules saw the
+	// actual words.
+	OccurredAt *time.Time
 	// Choice is the 1-based index the user replied with to a numbered
 	// pick-list ("2"). Rules-only: a digit needs no model call.
 	Choice *int
@@ -38,16 +42,26 @@ type answerEdits struct {
 var answerFiller = map[string]bool{
 	"catat": true, "aja": true, "dong": true, "deh": true, "tolong": true,
 	"please": true, "bayar": true, "bayarnya": true, "pay": true, "it": true,
+	"itu": true, "tadi": true, "yang": true, "buat": true, "untuk": true,
+	"kemarin": true, "oke": true, "ok": true, "sip": true,
 }
 
 // parseBareAnswer explains a message with rules alone, or gives up.
 // "bayar pake BCA, ya catat" is a confirmation *and* a Source, and both
 // are visible to a regex — spending seven seconds of LLM latency on it
-// would be theatre. nil means the intent router has to look.
+// would be theatre. So is "dari BRI, itu kemaren tanggal 17": a Source,
+// a date and nothing else. nil means the intent router has to look.
 func parseBareAnswer(text, expect string, sources []entity.Source) *answerEdits {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return nil
+	}
+	// A numbered pick-list answer is a digit, never money: it has to be
+	// read before the money grammar claims it.
+	if expect == "bill_choice" && len(strings.Fields(trimmed)) == 1 {
+		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
+			return &answerEdits{Choice: &n}
+		}
 	}
 
 	hint, rest := parse.SourceHint(trimmed)
@@ -60,37 +74,53 @@ func parseBareAnswer(text, expect string, sources []entity.Source) *answerEdits 
 		}
 	}
 
-	if confirm, ok := bareConfirm(rest); ok {
-		out := &answerEdits{AnswerFields: llm.AnswerFields{Confirm: confirm}}
+	rest, when, dated := parse.ExtractTime(rest, service.JakartaNow())
+
+	// One money token in the remainder is the amount; two is an
+	// ambiguity only the router can read.
+	var amount *int64
+	var words []string
+	for _, word := range strings.Fields(rest) {
+		if value, ok := money.ParseToken(strings.Trim(word, ",.;:!?\"'")); ok && value > 0 {
+			if amount != nil {
+				return nil
+			}
+			amount = &value
+			continue
+		}
+		words = append(words, word)
+	}
+
+	confirm, explained := bareConfirm(strings.Join(words, " "))
+	if explained && (confirm != "" || src != nil || dated || amount != nil) {
+		out := &answerEdits{AnswerFields: llm.AnswerFields{Confirm: confirm}, AmountMinor: amount}
 		if src != nil {
 			out.SourceID = &src.ID
 		}
+		if dated {
+			at := when
+			out.OccurredAt = &at
+		}
 		return out
 	}
-	if src != nil && strings.TrimSpace(rest) == "" {
-		return &answerEdits{AnswerFields: llm.AnswerFields{SourceID: &src.ID}}
-	}
-	if src == nil {
+	if src == nil && !dated && amount == nil {
 		if hit := resolveSourceRules(trimmed, sources); hit != nil {
 			return &answerEdits{AnswerFields: llm.AnswerFields{SourceID: &hit.ID}}
 		}
 	}
-	if expect == "bill_choice" && len(strings.Fields(trimmed)) == 1 {
-		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
-			return &answerEdits{Choice: &n}
-		}
-	}
 	if expect == "amount" && len(strings.Fields(trimmed)) == 1 {
-		if amount, ok := money.ParseToken(trimmed); ok && amount > 0 {
-			return &answerEdits{AmountMinor: &amount}
+		if value, ok := money.ParseToken(trimmed); ok && value > 0 {
+			return &answerEdits{AmountMinor: &value}
 		}
 	}
 	return nil
 }
 
 // bareConfirm reads a yes or a no out of what is left of a message once
-// its Source clause is gone. Every remaining word must be a yes/no word
-// or filler: one unexplained word and the rules step aside.
+// its Source, date and amount are gone. explained is false as soon as
+// one word is neither a yes/no nor filler: the rules then step aside.
+// An empty confirm with explained=true is a message that edited the
+// draft without accepting or rejecting it.
 func bareConfirm(rest string) (string, bool) {
 	confirm := ""
 	for _, word := range strings.Fields(strings.ToLower(rest)) {
@@ -115,10 +145,38 @@ func bareConfirm(rest string) (string, bool) {
 			}
 		}
 	}
-	if confirm == "" {
-		return "", false
-	}
 	return confirm, true
+}
+
+// resolveDate turns whatever date the message carried into the instant
+// the transaction is booked at. A non-empty reply is a refusal: the
+// caller must abort the whole message rather than record a wrong day.
+func (h *Harness) resolveDate(edits *answerEdits, lang string) (*time.Time, string) {
+	switch {
+	case edits.OccurredAt != nil:
+		return guardDate(*edits.OccurredAt, lang)
+	case edits.OccurredDate != nil:
+		when, err := service.JakartaNoon(*edits.OccurredDate)
+		if err != nil {
+			return nil, ""
+		}
+		return guardDate(when, lang)
+	}
+	return nil, ""
+}
+
+// guardDate is the one place a date is judged: the future is not a
+// memory, and anything older than the backdate window is a dashboard
+// job. Both are refused out loud rather than silently booked on today.
+func guardDate(when time.Time, lang string) (*time.Time, string) {
+	now := service.JakartaNow()
+	if when.After(now) {
+		return nil, tmpl.Render(lang, "date_future", nil)
+	}
+	if when.Before(now.AddDate(0, 0, -llm.MaxBackdateDays)) {
+		return nil, tmpl.Render(lang, "date_too_old", nil)
+	}
+	return &when, ""
 }
 
 // applyAnswer settles the open question with everything one message
@@ -166,7 +224,8 @@ func (h *Harness) applyAnswer(
 		// A refund reverses a specific row: there is nothing to edit, only
 		// a yes or a no.
 		if edits.Confirm == "" || edits.SourceID != nil || edits.CategoryID != nil ||
-			edits.Merchant != nil || edits.DayOffset != nil || len(edits.Payments) > 0 {
+			edits.Merchant != nil || edits.Note != nil || edits.OccurredAt != nil ||
+			edits.OccurredDate != nil || len(edits.Payments) > 0 {
 			return "", nil, false, nil
 		}
 		if edits.Confirm == "no" {
@@ -316,12 +375,16 @@ func (h *Harness) answerReceipt(
 			"Merchant": params.Merchant,
 		}))
 	}
-	if edits.DayOffset != nil {
+	when, refusal := h.resolveDate(edits, lang)
+	if refusal != "" {
+		return refusal, nil, true, nil
+	}
+	if when != nil {
 		// The printed date stays as printed; only the day the money is
 		// booked on moves.
-		params.OccurredAt = jakartaNoonOffset(*edits.DayOffset)
+		params.OccurredAt = *when
 		changes = append(changes, tmpl.Render(lang, "receipt_change_date", map[string]any{
-			"Date": formatDay(params.OccurredAt.In(service.JakartaNow().Location()), lang),
+			"Date": formatDay(params.OccurredAt.In(service.Jakarta()), lang),
 		}))
 	}
 
@@ -480,10 +543,20 @@ func (h *Harness) answerCapture(
 			"Merchant": params.Merchant,
 		}))
 	}
-	if edits.DayOffset != nil {
-		params.OccurredAt = jakartaNoonOffset(*edits.DayOffset)
+	if edits.Note != nil {
+		params.Note = *edits.Note
+		changes = append(changes, tmpl.Render(lang, "receipt_change_note", map[string]any{
+			"Note": params.Note,
+		}))
+	}
+	when, refusal := h.resolveDate(edits, lang)
+	if refusal != "" {
+		return refusal, nil, true, nil
+	}
+	if when != nil {
+		params.OccurredAt = *when
 		changes = append(changes, tmpl.Render(lang, "receipt_change_date", map[string]any{
-			"Date": formatDay(params.OccurredAt.In(service.JakartaNow().Location()), lang),
+			"Date": formatDay(params.OccurredAt.In(service.Jakarta()), lang),
 		}))
 	}
 
@@ -645,9 +718,13 @@ func renderTransaction(tx *entity.Transaction, lang string) string {
 		category = tmpl.Render(lang, "uncategorized", nil)
 	}
 
-	occurred := tx.OccurredAt.In(service.JakartaNow().Location())
+	note := ""
+	if tx.Note != nil {
+		note = *tx.Note
+	}
+	occurred := tx.OccurredAt.In(service.Jakarta())
 	data := map[string]any{
-		"Amount": money.FormatIDR(tx.AmountMinor), "Merchant": merchant,
+		"Amount": money.FormatIDR(tx.AmountMinor), "Merchant": merchant, "Note": note,
 		"Category": category, "Source": sourceName, "Destination": destName,
 		"Backdated": occurred.Format("2006-01-02") != service.JakartaDate(),
 		"Date":      formatDay(occurred, lang),

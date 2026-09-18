@@ -11,6 +11,7 @@ import (
 
 	"github.com/glennprays/catet-backend/internal/llm"
 	"github.com/glennprays/catet-backend/internal/money"
+	"github.com/glennprays/catet-backend/internal/service"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -386,4 +387,80 @@ func TestUnmatchedPayClauseGetsOneRepairCall(t *testing.T) {
 	require.Len(t, txs, 1)
 	assert.Equal(t, f.bca.ID, legSourceID(t, txs[0].Legs))
 	assert.Equal(t, 1, script.callsOf("source_pick"))
+}
+
+// idMonthAbbr mirrors the bot's own calendar labels without reaching
+// into the package: the reply must name the day it booked.
+var idMonthAbbr = [...]string{"Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"}
+
+// mostRecent17th is "tanggal 17" read the way a person means it: this
+// month if it has already happened, last month otherwise.
+func mostRecent17th() time.Time {
+	now := service.JakartaNow()
+	when := time.Date(now.Year(), now.Month(), 17, 12, 0, 0, 0, service.Jakarta())
+	if when.After(now) {
+		when = when.AddDate(0, -1, 0)
+	}
+	return when
+}
+
+func openSummary(t *testing.T, f *botFixture) string {
+	t.Helper()
+	var summary string
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT summary FROM pending_actions WHERE resolved_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+	).Scan(&summary))
+	return summary
+}
+
+// TestFollowUpSettlesSourceAndDate is the message that motivated the
+// date grammar: a held capture answered with a Source and a backdate in
+// one breath, settled by the rules alone.
+func TestFollowUpSettlesSourceAndDate(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.makanan.ID.String() + `","confidence":0.9}`)
+
+	f.say(t, "m1", "traktir makan temen 133k di ayam balado")
+	require.Empty(t, f.live(t), "no default source, so the capture parks")
+	summary := strings.ToLower(openSummary(t, f))
+	assert.Contains(t, summary, "ayam balado", "the place is the whole clause")
+	assert.Contains(t, summary, "traktir makan temen")
+
+	f.say(t, "m2", "dari BRI, itu kemaren tanggal 17")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, int64(133_000), txs[0].AmountMinor)
+	require.NotNil(t, txs[0].Merchant)
+	assert.True(t, strings.EqualFold("ayam balado", *txs[0].Merchant), "merchant %q", *txs[0].Merchant)
+	require.NotNil(t, txs[0].Note)
+	assert.Equal(t, "traktir makan temen", *txs[0].Note)
+
+	want := mostRecent17th()
+	got := txs[0].OccurredAt.In(service.Jakarta())
+	assert.Equal(t, want.Format("2006-01-02 15:04"), got.Format("2006-01-02 15:04"),
+		"the explicit date wins over \"kemaren\" and lands at Jakarta noon")
+
+	label := want.Format("2") + " " + idMonthAbbr[int(want.Month())-1]
+	assert.Contains(t, f.sender.last(), label, "a backdated write says which day")
+	assert.Equal(t, 0, script.callsOf("intent"), "the rules explained the whole message")
+}
+
+// A date the ledger must not take is refused out loud, and the draft
+// stays parked exactly as it was.
+func TestFollowUpRefusesFutureDate(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+
+	f.say(t, "m1", "traktir makan temen 133k di ayam balado")
+	require.Equal(t, 1, f.openActions(t))
+
+	f.say(t, "m2", "besok dari BRI")
+
+	assert.Contains(t, f.sender.last(), "Tanggal ke depan belum bisa dicatat")
+	assert.Empty(t, f.live(t), "a refused date writes nothing")
+	assert.Equal(t, 1, f.openActions(t), "the question is still standing")
+	assert.Equal(t, 0, script.callsOf("intent"))
 }

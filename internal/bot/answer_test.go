@@ -39,7 +39,11 @@ func TestParseBareAnswer(t *testing.T) {
 		{name: "an unknown alias belongs to the router", text: "pakai jago",
 			expect: "source", nilOut: true},
 		{name: "amount when one was asked for", text: "25rb", expect: "amount", amount: 25_000},
-		{name: "amount nobody asked for", text: "25rb", expect: "yes_no", nilOut: true},
+		// The follow-up channel settles any field now, so a lone money
+		// token is the amount whatever the open question was about.
+		{name: "a bare amount settles the amount", text: "25rb", expect: "yes_no", amount: 25_000},
+		{name: "two amounts are an ambiguity only the router can read",
+			text: "25rb 30rb", expect: "yes_no", nilOut: true},
 		{name: "empty", text: "   ", expect: "yes_no", nilOut: true},
 	}
 
@@ -72,4 +76,21 @@ func TestParseBareAnswer(t *testing.T) {
 func TestParseBareAnswerRefusesContradictions(t *testing.T) {
 	sources := []entity.Source{{ID: uuid.New(), Name: "BCA", Type: "bank"}}
 	assert.Nil(t, parseBareAnswer("ya tidak", "yes_no", sources))
+}
+
+// The message that motivated the date grammar: a Source clause, a
+// misspelled "kemaren" overruled by an explicit "tanggal 17", and
+// nothing a model is needed for.
+func TestParseBareAnswerReadsSourceAndDate(t *testing.T) {
+	bri := entity.Source{ID: uuid.New(), Name: "BRI", Type: "bank"}
+	got := parseBareAnswer("dari BRI, itu kemaren tanggal 17", "source", []entity.Source{bri})
+
+	require.NotNil(t, got, "the rules explain this message word for word")
+	require.NotNil(t, got.SourceID)
+	assert.Equal(t, bri.ID, *got.SourceID)
+	require.NotNil(t, got.OccurredAt)
+	assert.Equal(t, 17, got.OccurredAt.Day(), "the explicit date wins over \"kemaren\"")
+	assert.Equal(t, 12, got.OccurredAt.Hour(), "a dated-but-untimed event is booked at noon")
+	assert.Empty(t, got.Confirm, "naming a source is not a yes")
+	assert.Nil(t, got.AmountMinor)
 }

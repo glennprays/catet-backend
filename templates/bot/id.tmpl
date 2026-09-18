@@ -21,11 +21,11 @@ Sip, tercatat: {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · {
 {{- end}}
 
 {{define "recorded_income" -}}
-Sip, masuk {{.Amount}} · {{.Merchant}} · ke {{.Source}}
+Sip, masuk {{.Amount}} · {{.Merchant}} · ke {{.Source}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "recorded_transfer" -}}
-Sip, pindah {{.Amount}} · {{.Source}} → {{.Destination}}
+Sip, pindah {{.Amount}} · {{.Source}} → {{.Destination}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "recorded_many" -}}
@@ -100,7 +100,7 @@ Nggak ada yang lagi nunggu jawaban.
 {{/* Sent whenever a message arrives that does not settle the open
 draft: the question survives the detour instead of stranding the draft. */}}
 {{define "open_question_reminder" -}}
-Aku masih nunggu jawaban buat: {{.Summary}}. Balas "ya"/"tidak", atau sebut sumbernya ya.
+Aku masih nunggu jawaban buat: {{.Summary}}. Balas "ya"/"tidak", sebut sumbernya, atau koreksi tanggal/nominalnya ya.
 {{- end}}
 
 {{define "unknown" -}}
@@ -108,7 +108,7 @@ Hmm, aku belum nangkep maksudnya. Kalau mau catat pengeluaran, ketik misalnya "k
 {{- end}}
 
 {{define "corrected" -}}
-{{if eq .Type "transfer"}}Oke, kuperbaiki: pindah {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Oke, kuperbaiki: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}
+{{if eq .Type "transfer"}}Oke, kuperbaiki: pindah {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Oke, kuperbaiki: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "correct_nothing" -}}
@@ -239,6 +239,18 @@ merchant {{.Merchant}}
 
 {{define "receipt_change_date" -}}
 tanggal {{.Date}}
+{{- end}}
+
+{{define "receipt_change_note" -}}
+catatan {{.Note}}
+{{- end}}
+
+{{define "date_future" -}}
+Tanggal ke depan belum bisa dicatat — kirim lagi nanti ya.
+{{- end}}
+
+{{define "date_too_old" -}}
+Itu lebih dari setahun lalu; catat lewat dashboard ya.
 {{- end}}
 
 {{define "rekap_hari" -}}

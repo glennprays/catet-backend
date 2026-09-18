@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -20,10 +21,10 @@ const (
 	KindUnknown = "unknown"
 )
 
-// MaxBackdateDays bounds a date the model may claim — a relative offset
-// in the intent router, a printed date on a receipt. Anything older is a
-// hallucination, not a memory: it falls back to today.
-const MaxBackdateDays = 31
+// MaxBackdateDays bounds a date the model may claim — a date in a chat
+// message, a printed date on a receipt. Anything older is a
+// hallucination or a dashboard job.
+const MaxBackdateDays = 365
 
 // OpenQuestion describes the one outstanding question of the chat, so
 // the router can tell "bca" (an answer) from "bca saldo berapa" (a
@@ -67,18 +68,18 @@ type IntentDraft struct {
 	SourceID            *uuid.UUID
 	DestinationSourceID *uuid.UUID
 	CategoryID          *uuid.UUID
-	DayOffset           int // 0 today, -1 yesterday, … (never positive)
+	OccurredDate        string // YYYY-MM-DD in Asia/Jakarta; "" = not mentioned
 }
 
 // Correction is an edit of one recent transaction. Every field is
 // optional; nil means "leave as is".
 type Correction struct {
-	TargetIndex int // 1-based into Recent; 0 = most recent
-	CategoryID  *uuid.UUID
-	SourceID    *uuid.UUID
-	Merchant    *string
-	AmountText  *string
-	DayOffset   *int
+	TargetIndex  int // 1-based into Recent; 0 = most recent
+	CategoryID   *uuid.UUID
+	SourceID     *uuid.UUID
+	Merchant     *string
+	AmountText   *string
+	OccurredDate *string
 }
 
 // AnswerFields is everything one message may settle about the open
@@ -87,12 +88,13 @@ type Correction struct {
 // mean "not mentioned"; an empty Confirm means the message edited the
 // draft without accepting or rejecting it.
 type AnswerFields struct {
-	Confirm    string // "yes" | "no" | ""
-	SourceID   *uuid.UUID
-	Payments   []Payment // split payment: >1 entry
-	CategoryID *uuid.UUID
-	Merchant   *string
-	DayOffset  *int
+	Confirm      string // "yes" | "no" | ""
+	SourceID     *uuid.UUID
+	Payments     []Payment // split payment: >1 entry
+	CategoryID   *uuid.UUID
+	Merchant     *string
+	OccurredDate *string
+	Note         *string
 }
 
 // Payment is one share of a split bill. AmountText is copied verbatim
@@ -114,9 +116,10 @@ type answerPayload struct {
 		SourceID   *string `json:"source_id"`
 		AmountText string  `json:"amount_text"`
 	} `json:"payments"`
-	CategoryID *string `json:"category_id"`
-	Merchant   *string `json:"merchant"`
-	DayOffset  *int    `json:"day_offset"`
+	CategoryID   *string `json:"category_id"`
+	Merchant     *string `json:"merchant"`
+	Note         *string `json:"note"`
+	OccurredDate *string `json:"occurred_date"`
 }
 
 // decodeAnswer whitelists everything the router claims about the open
@@ -145,12 +148,14 @@ func decodeAnswer(a *answerPayload, req IntentRequest) *AnswerFields {
 			out.Merchant = &m
 		}
 	}
-	if a.DayOffset != nil {
-		off := clampOffset(*a.DayOffset)
-		out.DayOffset = &off
+	if a.Note != nil {
+		if n := strings.TrimSpace(*a.Note); n != "" {
+			out.Note = &n
+		}
 	}
+	out.OccurredDate = validDate(a.OccurredDate)
 	if out.Confirm == "" && out.SourceID == nil && out.CategoryID == nil &&
-		out.Merchant == nil && out.DayOffset == nil && len(out.Payments) == 0 {
+		out.Merchant == nil && out.Note == nil && out.OccurredDate == nil && len(out.Payments) == 0 {
 		return nil
 	}
 	return out
@@ -187,7 +192,11 @@ const intentSystem = "You are the intent router of a personal-finance WhatsApp b
 	"\"correct\" means the user is fixing one of the RECENT transactions (words like itu, tadi, ganti, salah, bukan, seharusnya); " +
 	"\"answer\" is only valid when an OPEN QUESTION is shown; fill every field the message settles about that draft: " +
 	"confirm yes/no, the paying source, per-source amounts for a split payment (amount_text VERBATIM, empty for \"sisanya\"/\"the rest\"), " +
-	"one category for all its lines, a corrected merchant name, a day offset; " +
+	"one category for all its lines, a corrected merchant name, " +
+	"the calendar date the event happened as occurred_date YYYY-MM-DD resolved against Today " +
+	"(kemarin/kemaren = yesterday; \"tanggal 17\" = the most recent 17th; \"17 agustus\" = this year unless that is in the future; " +
+	"null when no date is named), a note (free text that is neither merchant nor amount); " +
+	"capture drafts and corrections carry occurred_date the same way; " +
 	"edits to the draft under an OPEN QUESTION are \"answer\", never \"correct\"; " +
 	"\"balance\" asks how much money is in a source or overall; " +
 	"\"summary\" asks about spending today or this week; " +
@@ -241,18 +250,18 @@ func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error)
 				"source_id":             map[string]any{"type": []string{"string", "null"}},
 				"destination_source_id": map[string]any{"type": []string{"string", "null"}},
 				"category_id":           map[string]any{"type": []string{"string", "null"}},
-				"day_offset":            map[string]any{"type": "integer"},
-			}, "type", "amount_text", "merchant", "source_id", "destination_source_id", "category_id", "day_offset"),
+				"occurred_date":         map[string]any{"type": []string{"string", "null"}},
+			}, "type", "amount_text", "merchant", "source_id", "destination_source_id", "category_id", "occurred_date"),
 		},
 		"correction": map[string]any{
 			"type": []string{"object", "null"},
 			"properties": map[string]any{
-				"target_index": map[string]any{"type": "integer"},
-				"category_id":  map[string]any{"type": []string{"string", "null"}},
-				"source_id":    map[string]any{"type": []string{"string", "null"}},
-				"merchant":     map[string]any{"type": []string{"string", "null"}},
-				"amount_text":  map[string]any{"type": []string{"string", "null"}},
-				"day_offset":   map[string]any{"type": []string{"integer", "null"}},
+				"target_index":  map[string]any{"type": "integer"},
+				"category_id":   map[string]any{"type": []string{"string", "null"}},
+				"source_id":     map[string]any{"type": []string{"string", "null"}},
+				"merchant":      map[string]any{"type": []string{"string", "null"}},
+				"amount_text":   map[string]any{"type": []string{"string", "null"}},
+				"occurred_date": map[string]any{"type": []string{"string", "null"}},
 			},
 		},
 		"undo_index":        map[string]any{"type": "integer"},
@@ -270,9 +279,10 @@ func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error)
 						"amount_text": map[string]any{"type": "string"},
 					}, "source_id", "amount_text"),
 				},
-				"category_id": map[string]any{"type": []string{"string", "null"}},
-				"merchant":    map[string]any{"type": []string{"string", "null"}},
-				"day_offset":  map[string]any{"type": []string{"integer", "null"}},
+				"category_id":   map[string]any{"type": []string{"string", "null"}},
+				"merchant":      map[string]any{"type": []string{"string", "null"}},
+				"note":          map[string]any{"type": []string{"string", "null"}},
+				"occurred_date": map[string]any{"type": []string{"string", "null"}},
 			},
 		},
 	}, "intent", "drafts", "correction", "undo_index", "period", "balance_source_id", "answer")
@@ -286,15 +296,15 @@ func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error)
 			SourceID            *string `json:"source_id"`
 			DestinationSourceID *string `json:"destination_source_id"`
 			CategoryID          *string `json:"category_id"`
-			DayOffset           int     `json:"day_offset"`
+			OccurredDate        *string `json:"occurred_date"`
 		} `json:"drafts"`
 		Correction *struct {
-			TargetIndex int     `json:"target_index"`
-			CategoryID  *string `json:"category_id"`
-			SourceID    *string `json:"source_id"`
-			Merchant    *string `json:"merchant"`
-			AmountText  *string `json:"amount_text"`
-			DayOffset   *int    `json:"day_offset"`
+			TargetIndex  int     `json:"target_index"`
+			CategoryID   *string `json:"category_id"`
+			SourceID     *string `json:"source_id"`
+			Merchant     *string `json:"merchant"`
+			AmountText   *string `json:"amount_text"`
+			OccurredDate *string `json:"occurred_date"`
 		} `json:"correction"`
 		UndoIndex       int            `json:"undo_index"`
 		Period          string         `json:"period"`
@@ -319,7 +329,9 @@ func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error)
 			Type:       normalizeDraftType(d.Type),
 			AmountText: strings.TrimSpace(d.AmountText),
 			Merchant:   strings.TrimSpace(d.Merchant),
-			DayOffset:  clampOffset(d.DayOffset),
+		}
+		if date := validDate(d.OccurredDate); date != nil {
+			draft.OccurredDate = *date
 		}
 		if id, ok := match(d.SourceID, req.Sources); ok {
 			draft.SourceID = id
@@ -353,10 +365,7 @@ func (c *Client) Intent(ctx context.Context, req IntentRequest) (*Intent, error)
 				corr.AmountText = &a
 			}
 		}
-		if c.DayOffset != nil {
-			off := clampOffset(*c.DayOffset)
-			corr.DayOffset = &off
-		}
+		corr.OccurredDate = validDate(c.OccurredDate)
 		in.Correction = corr
 	}
 	return in, nil
@@ -406,11 +415,20 @@ func normalizePeriod(period string) string {
 	}
 }
 
-// clampOffset keeps a relative date in the past and inside the memory
-// window; anything else means today.
-func clampOffset(offset int) int {
-	if offset > 0 || offset < -MaxBackdateDays {
-		return 0
+// validDate keeps a well-formed calendar date and drops anything the
+// model could not spell. A date in the future or older than the backdate
+// window survives here on purpose: the bot refuses it out loud rather
+// than silently recording today.
+func validDate(s *string) *string {
+	if s == nil {
+		return nil
 	}
-	return offset
+	trimmed := strings.TrimSpace(*s)
+	if trimmed == "" {
+		return nil
+	}
+	if _, err := time.Parse("2006-01-02", trimmed); err != nil {
+		return nil
+	}
+	return &trimmed
 }

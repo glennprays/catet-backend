@@ -30,7 +30,7 @@ func TestIntentCorrection(t *testing.T) {
 	req, _, food := intentFixture()
 	var bodies []map[string]any
 	srv := contentServer(t, `{"intent":"correct","drafts":[],"correction":{"target_index":1,"category_id":"`+
-		food.ID.String()+`","source_id":null,"merchant":null,"amount_text":null,"day_offset":null},`+
+		food.ID.String()+`","source_id":null,"merchant":null,"amount_text":null,"occurred_date":null},`+
 		`"undo_index":0,"period":"","balance_source_id":null,"answer":null}`, new(int32), &bodies)
 
 	got, err := newTestClient(srv.URL).Intent(context.Background(), req)
@@ -67,7 +67,7 @@ func TestIntentDropsUnlistedID(t *testing.T) {
 	req.Text = "kopi 25k pakai gopay"
 	srv := contentServer(t, `{"intent":"capture","drafts":[{"type":"expense","amount_text":"25k","merchant":"kopi",`+
 		`"source_id":"`+uuid.New().String()+`","destination_source_id":null,"category_id":"`+food.ID.String()+
-		`","day_offset":3}],"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`,
+		`","occurred_date":"2027-01-03"}],"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`,
 		new(int32), nil)
 
 	got, err := newTestClient(srv.URL).Intent(context.Background(), req)
@@ -78,7 +78,8 @@ func TestIntentDropsUnlistedID(t *testing.T) {
 	require.NotNil(t, got.Drafts[0].CategoryID)
 	assert.Equal(t, food.ID, *got.Drafts[0].CategoryID)
 	assert.Equal(t, "25k", got.Drafts[0].AmountText)
-	assert.Equal(t, 0, got.Drafts[0].DayOffset, "a future date is never a capture date")
+	assert.Equal(t, "2027-01-03", got.Drafts[0].OccurredDate,
+		"a future date is kept for the harness to refuse, not silently rewritten")
 }
 
 // One chat message may settle several things about the open draft at
@@ -93,7 +94,8 @@ func TestIntentAnswerCarriesEveryField(t *testing.T) {
 		`"period":"","balance_source_id":null,"answer":{"confirm":"yes","source_id":null,`+
 		`"payments":[{"source_id":"`+cash.ID.String()+`","amount_text":"20rb"},`+
 		`{"source_id":"`+bca.ID.String()+`","amount_text":""}],`+
-		`"category_id":"`+food.ID.String()+`","merchant":"Indomaret","day_offset":-1}}`,
+		`"category_id":"`+food.ID.String()+`","merchant":"Indomaret","note":"patungan",`+
+		`"occurred_date":"2026-09-14"}}`,
 		new(int32), nil)
 
 	got, err := newTestClient(srv.URL).Intent(context.Background(), req)
@@ -112,8 +114,10 @@ func TestIntentAnswerCarriesEveryField(t *testing.T) {
 	assert.Equal(t, food.ID, *got.Answer.CategoryID)
 	require.NotNil(t, got.Answer.Merchant)
 	assert.Equal(t, "Indomaret", *got.Answer.Merchant)
-	require.NotNil(t, got.Answer.DayOffset)
-	assert.Equal(t, -1, *got.Answer.DayOffset)
+	require.NotNil(t, got.Answer.Note)
+	assert.Equal(t, "patungan", *got.Answer.Note)
+	require.NotNil(t, got.Answer.OccurredDate)
+	assert.Equal(t, "2026-09-14", *got.Answer.OccurredDate)
 }
 
 // An answer object that settles nothing is not an answer at all.
@@ -122,7 +126,7 @@ func TestIntentEmptyAnswerIsNil(t *testing.T) {
 	req.Open = &llm.OpenQuestion{Expect: "yes_no", Summary: "Struk"}
 	srv := contentServer(t, `{"intent":"answer","drafts":[],"correction":null,"undo_index":0,`+
 		`"period":"","balance_source_id":null,"answer":{"confirm":"","source_id":null,"payments":[],`+
-		`"category_id":null,"merchant":null,"day_offset":null}}`, new(int32), nil)
+		`"category_id":null,"merchant":null,"note":null,"occurred_date":null}}`, new(int32), nil)
 
 	got, err := newTestClient(srv.URL).Intent(context.Background(), req)
 	require.NoError(t, err)

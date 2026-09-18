@@ -13,11 +13,11 @@ Done, recorded: {{.Amount}} · {{.Merchant}}{{if .Note}} · {{.Note}}{{end}} · 
 {{- end}}
 
 {{define "recorded_income" -}}
-Done, {{.Amount}} in · {{.Merchant}} · to {{.Source}}
+Done, {{.Amount}} in · {{.Merchant}} · to {{.Source}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "recorded_transfer" -}}
-Done, moved {{.Amount}} · {{.Source}} → {{.Destination}}
+Done, moved {{.Amount}} · {{.Source}} → {{.Destination}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "recorded_many" -}}
@@ -92,7 +92,7 @@ Nothing is waiting for an answer.
 {{/* Sent whenever a message arrives that does not settle the open
 draft — see id.tmpl. */}}
 {{define "open_question_reminder" -}}
-I'm still waiting on an answer for: {{.Summary}}. Reply "yes"/"no", or just name the source.
+I'm still waiting on an answer for: {{.Summary}}. Reply "yes"/"no", name the source, or fix the date or amount.
 {{- end}}
 
 {{define "unknown" -}}
@@ -100,7 +100,7 @@ Hmm, I didn't catch that. To record a spend, type something like "coffee 25k wit
 {{- end}}
 
 {{define "corrected" -}}
-{{if eq .Type "transfer"}}Okay, fixed: moved {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Okay, fixed: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}
+{{if eq .Type "transfer"}}Okay, fixed: moved {{.Amount}} · {{.Source}} → {{.Destination}}{{else}}Okay, fixed: {{.Amount}} · {{.Merchant}} · {{.Category}} · {{.Source}}{{end}}{{if .Backdated}} · {{.Date}}{{end}}
 {{- end}}
 
 {{define "correct_nothing" -}}
@@ -224,6 +224,18 @@ merchant {{.Merchant}}
 
 {{define "receipt_change_date" -}}
 date {{.Date}}
+{{- end}}
+
+{{define "receipt_change_note" -}}
+note {{.Note}}
+{{- end}}
+
+{{define "date_future" -}}
+I can't record a future date — send it again when it happens.
+{{- end}}
+
+{{define "date_too_old" -}}
+That's over a year back — please add it from the dashboard.
 {{- end}}
 
 {{define "rekap_hari" -}}

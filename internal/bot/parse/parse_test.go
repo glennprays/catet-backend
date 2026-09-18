@@ -275,6 +275,23 @@ func TestParse(t *testing.T) {
 			lang:   "id",
 			drafts: []wantDraft{{typ: "refund", amount: 18_000, merchant: "", froms: []string{"gojek"}, lang: "id"}},
 		},
+		{
+			// The place is the whole clause: "ayam balado" is one warung,
+			// and keeping only "ayam" used to leave "balado" glued to the
+			// merchant.
+			name:   "place clause runs to the end of the segment",
+			input:  "traktir makan temen 133k di ayam balado",
+			lang:   "id",
+			drafts: []wantDraft{{typ: "expense", amount: 133_000, merchant: "traktir makan temen", places: []string{"ayam balado"}, lang: "id"}},
+		},
+		{
+			// The pay clause is consumed before the place, so the place
+			// still stops where the payment starts.
+			name:   "multi-word place with a pay clause after it",
+			input:  "makan siang 25k di warteg bu tini pake bca",
+			lang:   "id",
+			drafts: []wantDraft{{typ: "expense", amount: 25_000, merchant: "makan siang", pays: []string{"bca"}, places: []string{"warteg bu tini"}, lang: "id"}},
+		},
 		{name: "batal with index", input: "batal 2", cmd: "batal", batalN: 2, lang: "id", noDraft: true},
 		{name: "batal whole batch", input: "batal", cmd: "batal", lang: "id", noDraft: true},
 		{name: "undo is batal", input: "undo", cmd: "batal", lang: "en", noDraft: true},
@@ -373,5 +390,62 @@ func TestHasMoneyToken(t *testing.T) {
 	}
 	for input, want := range tests {
 		assert.Equal(t, want, parse.HasMoneyToken(input), "HasMoneyToken(%q)", input)
+	}
+}
+
+// TestExtractTime covers the date grammar a chat follow-up leans on:
+// an explicit calendar date beats a relative one in the same sentence,
+// the hour is read from whatever is left, and a message with no time in
+// it reports found=false so the caller keeps its own clock.
+func TestExtractTime(t *testing.T) {
+	// The capture that motivated the grammar happened on the 18th.
+	capture := time.Date(2026, time.September, 18, 9, 0, 0, 0, jakarta)
+	day := func(y int, m time.Month, d, h, min int) time.Time {
+		return time.Date(y, m, d, h, min, 0, 0, jakarta)
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		now   time.Time
+		want  time.Time
+		rest  string
+		found bool
+	}{
+		{
+			name:  "explicit date beats the relative one in the same sentence",
+			input: "dari bri, itu kemaren tanggal 17", now: capture,
+			want: day(2026, time.September, 17, 12, 0), rest: "dari bri, itu", found: true,
+		},
+		{name: "yesterday evening", input: "kemarin jam 8 malam", now: capture, want: day(2026, time.September, 17, 20, 0), found: true},
+		{name: "yesterday misspelled", input: "kemaren", now: capture, want: day(2026, time.September, 17, 12, 0), found: true},
+		{name: "tomorrow is parsed, not refused here", input: "besok", now: capture, want: day(2026, time.September, 19, 12, 0), found: true},
+		{name: "day after tomorrow", input: "lusa", now: capture, want: day(2026, time.September, 20, 12, 0), found: true},
+		{name: "lusa kemarin is two days back", input: "lusa kemarin", now: capture, want: day(2026, time.September, 16, 12, 0), found: true},
+		{name: "n days ago", input: "3 hari yang lalu", now: capture, want: day(2026, time.September, 15, 12, 0), found: true},
+		{name: "last week", input: "minggu lalu", now: capture, want: day(2026, time.September, 11, 12, 0), found: true},
+		{name: "day and month name", input: "17 agustus", now: capture, want: day(2026, time.August, 17, 12, 0), found: true},
+		{name: "a month name still ahead falls back a year", input: "25 desember", now: capture, want: day(2025, time.December, 25, 12, 0), found: true},
+		{name: "dd/mm", input: "17/09", now: capture, want: day(2026, time.September, 17, 12, 0), found: true},
+		{name: "dd/mm/yy", input: "17-09-25", now: capture, want: day(2025, time.September, 17, 12, 0), found: true},
+		{name: "english ordinal", input: "on the 3rd", now: capture, want: day(2026, time.September, 3, 12, 0), found: true},
+		{name: "this morning", input: "tadi pagi", now: capture, want: day(2026, time.September, 18, 8, 0), found: true},
+		{name: "bare hour with minutes", input: "jam 14.30", now: capture, want: day(2026, time.September, 18, 14, 30), found: true},
+		{name: "impossible hour is ignored", input: "jam 99", now: capture, want: capture, found: false},
+		{
+			name:  "no time at all leaves the text alone",
+			input: "kopi 25k", now: capture, want: capture, rest: "kopi 25k", found: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rest, when, found := parse.ExtractTime(tc.input, tc.now)
+			assert.Equal(t, tc.found, found, "found")
+			assert.True(t, tc.want.Equal(when), "want %s got %s", tc.want, when)
+			if tc.rest != "" {
+				assert.Equal(t, tc.rest, rest, "remainder")
+			}
+		})
 	}
 }

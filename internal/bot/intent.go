@@ -195,8 +195,13 @@ func (h *Harness) runIntent(
 	if state.OpenPendingActionID != nil {
 		switch {
 		case in.Kind == llm.KindAnswer && in.Answer != nil:
-			reply, ids, handled, err := h.applyAnswer(
-				ctx, &answerEdits{AnswerFields: *in.Answer}, p.MessageId, state, lang)
+			edits := &answerEdits{AnswerFields: *in.Answer}
+			// The rules read the message too: a date they can see beats
+			// whatever the router claimed about it.
+			if _, when, found := parse.ExtractTime(p.Text, service.JakartaNow()); found {
+				edits.OccurredAt = &when
+			}
+			reply, ids, handled, err := h.applyAnswer(ctx, edits, p.MessageId, state, lang)
 			if err != nil {
 				return "", nil, err
 			}
@@ -321,9 +326,15 @@ func withReminder(reply, reminder string) string {
 func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string) []draft {
 	out := make([]draft, 0, len(in))
 	for _, d := range in {
+		// The deterministic grammar saw the actual words, so it outranks
+		// the router's reading; capture() judges whatever comes out.
 		occurred := service.JakartaNow()
-		if d.DayOffset < 0 {
-			occurred = jakartaNoonOffset(d.DayOffset)
+		if _, when, found := parse.ExtractTime(text, occurred); found {
+			occurred = when
+		} else if d.OccurredDate != "" {
+			if parsed, err := service.JakartaNoon(d.OccurredDate); err == nil {
+				occurred = parsed
+			}
 		}
 		built := draft{Draft: parse.Draft{
 			Type:       d.Type,
@@ -375,6 +386,25 @@ func (h *Harness) correct(
 	}
 	target := recent[idx]
 
+	// The date is settled before anything is written: a refused date must
+	// not leave a half-applied correction behind.
+	var correctedAt *time.Time
+	if _, when, found := parse.ExtractTime(p.Text, service.JakartaNow()); found {
+		guarded, refusal := guardDate(when, lang)
+		if refusal != "" {
+			return refusal, nil, nil
+		}
+		correctedAt = guarded
+	} else if corr.OccurredDate != nil {
+		if parsed, err := service.JakartaNoon(*corr.OccurredDate); err == nil {
+			guarded, refusal := guardDate(parsed, lang)
+			if refusal != "" {
+				return refusal, nil, nil
+			}
+			correctedAt = guarded
+		}
+	}
+
 	var writtenIDs []uuid.UUID
 	if corr.SourceID != nil && *corr.SourceID != currentSourceID(&target) {
 		replaced, err := h.rewriteSource(ctx, p, &target, *corr.SourceID, state)
@@ -405,10 +435,7 @@ func (h *Harness) correct(
 		}
 		update.AmountMinor = &amount
 	}
-	if corr.DayOffset != nil {
-		occurred := jakartaNoonOffset(*corr.DayOffset)
-		update.OccurredAt = &occurred
-	}
+	update.OccurredAt = correctedAt
 
 	if update.CategoryID != nil || update.Merchant != nil || update.AmountMinor != nil || update.OccurredAt != nil {
 		updated, err := h.txs.Update(ctx, target.ID, update)
@@ -434,10 +461,13 @@ func (h *Harness) correct(
 	if category == "" {
 		category = tmpl.Render(lang, "uncategorized", nil)
 	}
+	occurred := target.OccurredAt.In(service.Jakarta())
 	return tmpl.Render(lang, "corrected", map[string]any{
 		"Amount": money.FormatIDR(target.AmountMinor), "Merchant": valueOr(target.Merchant, ""),
 		"Category": category, "Source": transactionSourceName(&target),
 		"Destination": transactionDestinationName(&target), "Type": target.Type,
+		"Backdated": occurred.Format("2006-01-02") != service.JakartaDate(),
+		"Date":      formatDay(occurred, lang),
 	}), writtenIDs, nil
 }
 
@@ -567,13 +597,6 @@ func verifyAmount(text, amountText string) (int64, bool) {
 // "rp25.000" in the answer.
 func squash(s string) string {
 	return strings.ReplaceAll(strings.ToLower(s), " ", "")
-}
-
-// jakartaNoonOffset is the canonical timestamp for a day named
-// relatively ("kemarin"): noon, so a timezone shift cannot move it.
-func jakartaNoonOffset(offset int) time.Time {
-	d := service.JakartaNow().AddDate(0, 0, offset)
-	return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, d.Location())
 }
 
 // fieldLabels translate the ledger's field names into the words the user

@@ -128,9 +128,13 @@ var (
 	refundRe   = regexp.MustCompile(`\b(?:refund|balikin|dikembalikan|kembalian dari)\b`)
 	incomeRe   = regexp.MustCompile(`\b(?:gajian|gaji|masuk|dapat|terima|income|salary|received|bonus|thr|cashback)\b`)
 
-	payHintRe   = regexp.MustCompile(`(?:^|\s)(?:pakai|pake|via|dgn|dengan|with|by)\s+(\S+)`)
-	fromHintRe  = regexp.MustCompile(`(?:^|\s)(?:dari|from)\s+(\S+)`)
-	placeHintRe = regexp.MustCompile(`(?:^|\s)(?:di|at)\s+(\S+)`)
+	payHintRe  = regexp.MustCompile(`(?:^|\s)(?:pakai|pake|via|dgn|dengan|with|by)\s+(\S+)`)
+	fromHintRe = regexp.MustCompile(`(?:^|\s)(?:dari|from)\s+(\S+)`)
+	// The place is the whole clause, not one word: "di ayam balado" names
+	// a warung, and keeping only "ayam" leaves "balado" in the merchant.
+	// Pay/from/dest clauses are already consumed when this runs, so the
+	// clause can safely run to punctuation or end of segment.
+	placeHintRe = regexp.MustCompile(`(?:^|\s)(?:di|at)\s+(.+?)(?:\s*[,.;]|$)`)
 	destHintRe  = regexp.MustCompile(`(?:^|\s)(?:ke|to)\s+(\S+)`)
 
 	wordRe = regexp.MustCompile(`[a-z]+`)
@@ -400,7 +404,7 @@ func parseSegment(seg string, now time.Time) Draft {
 
 	// Time first: "tgl 5" and "2 hari lalu" carry digits that would
 	// otherwise be read as money.
-	rest, when := extractTime(seg, now)
+	rest, when, _ := ExtractTime(seg, now)
 	d.OccurredAt = when
 
 	amount, hold, rest := extractAmount(rest)
@@ -450,47 +454,171 @@ func detectLang(s string) string {
 	return LangID
 }
 
-// timeRule maps a phrase to the instant it names. Order matters:
-// "lusa kemarin" must be tried before "kemarin".
+// monthAlt lists the month spellings a message may use, longest first:
+// Go's alternation is leftmost-first, so "september" must be offered
+// before "sep".
+const monthAlt = `januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember|` +
+	`jan|feb|mar|apr|jun|jul|agu|aug|sept|sep|okt|oct|nov|des|dec`
+
+var monthByName = map[string]time.Month{
+	"januari": time.January, "jan": time.January,
+	"februari": time.February, "feb": time.February,
+	"maret": time.March, "mar": time.March,
+	"april": time.April, "apr": time.April,
+	"mei":  time.May,
+	"juni": time.June, "jun": time.June,
+	"juli": time.July, "jul": time.July,
+	"agustus": time.August, "agu": time.August, "aug": time.August,
+	"september": time.September, "sept": time.September, "sep": time.September,
+	"oktober": time.October, "okt": time.October, "oct": time.October,
+	"november": time.November, "nov": time.November,
+	"desember": time.December, "des": time.December, "dec": time.December,
+}
+
+// timeRule maps a phrase to the instant it names. explicit marks a rule
+// that names a calendar date rather than a distance from today: "itu
+// kemaren tanggal 17" says both, and the 17th is what the user means.
+// Within one class the first matching rule in list order wins, so
+// "lusa kemarin" must be listed before "lusa" and "kemarin".
 type timeRule struct {
-	re   *regexp.Regexp
-	when func(now time.Time, m []string) time.Time
+	re       *regexp.Regexp
+	explicit bool
+	when     func(now time.Time, m []string) (time.Time, bool)
+}
+
+func shiftDays(n int) func(time.Time, []string) (time.Time, bool) {
+	return func(now time.Time, _ []string) (time.Time, bool) { return noonOn(now, n), true }
+}
+
+func shiftHour(dayShift, hour int) func(time.Time, []string) (time.Time, bool) {
+	return func(now time.Time, _ []string) (time.Time, bool) { return atHour(now, dayShift, hour), true }
 }
 
 var timeRules = []timeRule{
-	{regexp.MustCompile(`\b(?:lusa kemarin|2 hari lalu|dua hari lalu|two days ago)\b`),
-		func(now time.Time, _ []string) time.Time { return noonOn(now, -2) }},
-	{regexp.MustCompile(`\b(?:tadi pagi|pagi ini|this morning)\b`),
-		func(now time.Time, _ []string) time.Time { return atHour(now, 0, 8) }},
-	{regexp.MustCompile(`\btadi siang\b`),
-		func(now time.Time, _ []string) time.Time { return atHour(now, 0, 12) }},
-	{regexp.MustCompile(`\b(?:tadi malam|semalam|last night)\b`),
-		func(now time.Time, _ []string) time.Time { return atHour(now, -1, 20) }},
-	{regexp.MustCompile(`\b(?:kemarin|yesterday)\b`),
-		func(now time.Time, _ []string) time.Time { return noonOn(now, -1) }},
-	{regexp.MustCompile(`\b(?:tgl|tanggal)\s+(\d{1,2})\b`), dayOfMonth},
-	{regexp.MustCompile(`\bon the (\d{1,2})(?:st|nd|rd|th)\b`), dayOfMonth},
+	{re: regexp.MustCompile(`\b(?:besok|tomorrow)\b`), when: shiftDays(1)},
+	{re: regexp.MustCompile(`\b(?:lusa kemarin|2 hari lalu|dua hari lalu|two days ago)\b`), when: shiftDays(-2)},
+	{re: regexp.MustCompile(`\blusa\b`), when: shiftDays(2)},
+	{re: regexp.MustCompile(`\b(\d{1,2}) hari (?:yang )?lalu\b`), when: daysAgo},
+	{re: regexp.MustCompile(`\b(?:seminggu|1 minggu|satu minggu|minggu) (?:yang )?lalu\b|\blast week\b`), when: shiftDays(-7)},
+	{re: regexp.MustCompile(`\b(?:tadi pagi|pagi ini|this morning)\b`), when: shiftHour(0, 8)},
+	{re: regexp.MustCompile(`\btadi siang\b`), when: shiftHour(0, 12)},
+	{re: regexp.MustCompile(`\b(?:tadi malam|semalam|last night)\b`), when: shiftHour(-1, 20)},
+	{re: regexp.MustCompile(`\b(?:kemarin|kemaren|kemarn|kmrn|yesterday)\b`), when: shiftDays(-1)},
+
+	{re: regexp.MustCompile(`\b(?:tgl|tanggal)\s+(\d{1,2})(?:\s+(` + monthAlt + `))?\b`), explicit: true, when: taggedDay},
+	{re: regexp.MustCompile(`\b(\d{1,2})\s+(` + monthAlt + `)\b`), explicit: true, when: dayMonth},
+	{re: regexp.MustCompile(`\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2}|\d{4}))?\b`), explicit: true, when: dayMonthYear},
+	{re: regexp.MustCompile(`\bon the (\d{1,2})(?:st|nd|rd|th)\b`), explicit: true, when: dayOfMonth},
 }
 
-// extractTime pulls at most one time phrase out of the segment and
-// returns the remainder plus the instant it names.
-func extractTime(seg string, now time.Time) (string, time.Time) {
+// hourRe reads an explicit clock time out of whatever the date rules
+// left behind: "jam 8 malam" is 20:00 on the day already resolved.
+var hourRe = regexp.MustCompile(`\b(?:jam|pukul)\s+(\d{1,2})(?:[.:](\d{2}))?\s*(pagi|siang|sore|malam)?\b`)
+
+// ExtractTime pulls the date and hour a message names out of it and
+// returns the text with every time phrase removed. found is false only
+// when the message named no time at all, in which case when is now.
+func ExtractTime(text string, now time.Time) (string, time.Time, bool) {
+	seg := normalize(text)
+
+	var spans []span
+	when, found, explicit := now, false, false
 	for _, r := range timeRules {
 		loc := r.re.FindStringSubmatchIndex(seg)
 		if loc == nil {
 			continue
 		}
-		m := make([]string, 0, len(loc)/2)
-		for i := 0; i < len(loc); i += 2 {
-			if loc[i] < 0 {
-				m = append(m, "")
-				continue
-			}
-			m = append(m, seg[loc[i]:loc[i+1]])
+		t, ok := r.when(now, submatches(seg, loc))
+		if !ok {
+			continue
 		}
-		return cut(seg, []span{{loc[0], loc[1]}}), r.when(now, m)
+		spans = append(spans, span{loc[0], loc[1]})
+		if !found || (r.explicit && !explicit) {
+			when, found, explicit = t, true, r.explicit
+		}
 	}
-	return seg, now
+	rest := cut(seg, mergeSpans(spans))
+
+	if loc := hourRe.FindStringSubmatchIndex(rest); loc != nil {
+		m := submatches(rest, loc)
+		if h, min, ok := clockOf(m); ok {
+			when = time.Date(when.Year(), when.Month(), when.Day(), h, min, 0, 0, now.Location())
+			found = true
+		}
+		rest = cut(rest, []span{{loc[0], loc[1]}})
+	}
+	return rest, when, found
+}
+
+// submatches renders a FindStringSubmatchIndex result as strings, with
+// "" for the groups that did not participate.
+func submatches(s string, loc []int) []string {
+	m := make([]string, 0, len(loc)/2)
+	for i := 0; i < len(loc); i += 2 {
+		if loc[i] < 0 {
+			m = append(m, "")
+			continue
+		}
+		m = append(m, s[loc[i]:loc[i+1]])
+	}
+	return m
+}
+
+// mergeSpans folds overlapping claims into one range so cut never
+// leaves half of a phrase behind ("lusa kemarin" is claimed three
+// times).
+func mergeSpans(spans []span) []span {
+	if len(spans) < 2 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		return spans[i].end > spans[j].end
+	})
+	out := spans[:1]
+	for _, sp := range spans[1:] {
+		last := &out[len(out)-1]
+		if sp.start <= last.end {
+			if sp.end > last.end {
+				last.end = sp.end
+			}
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// clockOf reads the hour pass: "pagi" keeps the hour, "siang" pushes a
+// small number past noon, "sore"/"malam" always do.
+func clockOf(m []string) (int, int, bool) {
+	hour, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	minute := 0
+	if m[2] != "" {
+		minute, err = strconv.Atoi(m[2])
+		if err != nil {
+			return 0, 0, false
+		}
+	}
+	switch m[3] {
+	case "siang":
+		if hour < 11 {
+			hour += 12
+		}
+	case "sore", "malam":
+		if hour < 12 {
+			hour += 12
+		}
+	}
+	if hour > 23 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
 }
 
 // noonOn is the canonical timestamp for a day the user dated but did
@@ -505,19 +633,94 @@ func atHour(now time.Time, dayShift, hour int) time.Time {
 	return time.Date(d.Year(), d.Month(), d.Day(), hour, 0, 0, 0, now.Location())
 }
 
+func daysAgo(now time.Time, m []string) (time.Time, bool) {
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1 {
+		return time.Time{}, false
+	}
+	return noonOn(now, -n), true
+}
+
+// taggedDay reads "tanggal 17" and "tanggal 17 agustus".
+func taggedDay(now time.Time, m []string) (time.Time, bool) {
+	if m[2] == "" {
+		return dayOfMonth(now, m)
+	}
+	return dayMonth(now, m)
+}
+
 // dayOfMonth reads "tgl 5": this month when that day has passed,
 // otherwise the same day last month — people log the past, not the
 // future.
-func dayOfMonth(now time.Time, m []string) time.Time {
+func dayOfMonth(now time.Time, m []string) (time.Time, bool) {
 	day, err := strconv.Atoi(m[1])
 	if err != nil || day < 1 || day > 31 {
-		return now
+		return time.Time{}, false
 	}
 	t := time.Date(now.Year(), now.Month(), day, 12, 0, 0, 0, now.Location())
+	if t.Month() != now.Month() {
+		return time.Time{}, false // the 31st of a 30-day month
+	}
 	if t.After(now) {
 		t = t.AddDate(0, -1, 0)
 	}
-	return t
+	return t, true
+}
+
+// dayMonth reads "17 agustus": this year, or last year when that date
+// has not happened yet.
+func dayMonth(now time.Time, m []string) (time.Time, bool) {
+	day, err := strconv.Atoi(m[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	month, ok := monthByName[m[2]]
+	if !ok {
+		return time.Time{}, false
+	}
+	return calendarDay(now, now.Year(), month, day)
+}
+
+// dayMonthYear reads "17/09" and "17/09/26"; a bare dd/mm is resolved
+// like "17 september".
+func dayMonthYear(now time.Time, m []string) (time.Time, bool) {
+	day, err := strconv.Atoi(m[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	monthNum, err := strconv.Atoi(m[2])
+	if err != nil || monthNum < 1 || monthNum > 12 {
+		return time.Time{}, false
+	}
+	year := now.Year()
+	if m[3] != "" {
+		year, err = strconv.Atoi(m[3])
+		if err != nil {
+			return time.Time{}, false
+		}
+		if year < 100 {
+			year += 2000
+		}
+		t := time.Date(year, time.Month(monthNum), day, 12, 0, 0, 0, now.Location())
+		if t.Day() != day {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	return calendarDay(now, year, time.Month(monthNum), day)
+}
+
+// calendarDay builds day/month in year at noon, stepping back a year
+// when that date is still ahead of now: a message records the past.
+func calendarDay(now time.Time, year int, month time.Month, day int) (time.Time, bool) {
+	t := time.Date(year, month, day, 12, 0, 0, 0, now.Location())
+	if t.Day() != day || t.Month() != month {
+		return time.Time{}, false
+	}
+	if t.After(now) {
+		t = t.AddDate(-1, 0, 0)
+	}
+	return t, true
 }
 
 type span struct{ start, end int }
