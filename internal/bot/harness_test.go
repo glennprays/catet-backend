@@ -390,6 +390,7 @@ func TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent(t *testing.T) {
 			require.NoError(t, err)
 			assert.Empty(t, open)
 			assert.Zero(t, fake.intents(), "a unique trailing BRI Source is deterministic")
+			assert.Zero(t, fake.sourcePicks(), "a trailing BRI footer is never repaired by source AI")
 		})
 	}
 }
@@ -403,13 +404,19 @@ func TestFailedTextReplyStaysReadyAndRetriesStoredReply(t *testing.T) {
 	row, err := f.inbound.Get(f.ctx, "m1")
 	require.NoError(t, err)
 	require.NotNil(t, row)
-	assert.Equal(t, "ready", row.Status)
+	require.Equal(t, "ready", row.Status)
 	require.NotNil(t, row.ReplyText)
 	assert.Len(t, row.TransactionIDs, 2)
 	assert.Empty(t, f.sender.all(), "a failed delivery was not accepted by the gateway")
 	assert.Len(t, f.live(t), 2)
 
 	f.sender.setSendError(nil)
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+	assert.Empty(t, f.sender.all(), "a not-yet-due ready delivery cannot be retried immediately")
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
 	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
 
 	assert.Len(t, f.live(t), 2, "delivery recovery never reruns the ledger")

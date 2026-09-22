@@ -262,12 +262,18 @@ func TestPhotoFailedReplyStaysReadyAfterParkingReceipt(t *testing.T) {
 	row, err := f.inbound.Get(f.ctx, "m1")
 	require.NoError(t, err)
 	require.NotNil(t, row)
-	assert.Equal(t, "ready", row.Status)
+	require.Equal(t, "ready", row.Status)
 	require.NotNil(t, row.ReplyText)
 	assert.Empty(t, row.TransactionIDs)
 	assert.Empty(t, f.sender.all(), "a failed receipt reply was not accepted")
 
 	f.sender.setSendError(nil)
+	f.sendPhoto(t, "m1", url, size, "")
+	assert.Empty(t, f.sender.all(), "a not-yet-due ready delivery cannot be retried immediately")
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
 	f.sendPhoto(t, "m1", url, size, "")
 
 	assert.Empty(t, f.live(t), "receipt delivery recovery never writes ledger money")
