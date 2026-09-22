@@ -3,6 +3,7 @@ package bot_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -47,18 +48,28 @@ type reaction struct {
 // calling the gateway. lid is what the gateway would answer for a
 // contact lookup; "" means it knows no lid for that number.
 type fakeSender struct {
-	mu     sync.Mutex
-	sent   []sentMessage
-	reacts []reaction
-	typing []bool
-	lid    string
+	mu      sync.Mutex
+	sent    []sentMessage
+	reacts  []reaction
+	typing  []bool
+	lid     string
+	sendErr error
 }
 
 func (f *fakeSender) SendText(_ context.Context, chat, text, key string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return "", f.sendErr
+	}
 	f.sent = append(f.sent, sentMessage{Chat: chat, Text: text, IdempotencyKey: key})
 	return uuid.NewString(), nil
+}
+
+func (f *fakeSender) setSendError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendErr = err
 }
 
 func (f *fakeSender) React(_ context.Context, _, messageID, _, emoji string) error {
@@ -328,6 +339,84 @@ func TestCaptureWritesExpenseAndReplaysDuplicate(t *testing.T) {
 	require.Len(t, sent, 2)
 	assert.Equal(t, sent[0].Text, sent[1].Text)
 	assert.Equal(t, "reply:m1", sent[1].IdempotencyKey)
+}
+
+func TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		merchants []string
+		amounts   []int64
+	}{
+		{
+			name:      "bare source footer",
+			input:     "sarapan bubur ayam 16k\ncilok 10k\nBRI",
+			merchants: []string{"Sarapan bubur ayam", "Cilok"},
+			amounts:   []int64{16_000, 10_000},
+		},
+		{
+			name:      "dari source footer",
+			input:     "nasi daun jeruk 22k\nes podeng 12k\nDari bri",
+			merchants: []string{"Nasi daun jeruk", "Es podeng"},
+			amounts:   []int64{22_000, 12_000},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeVisionLLM{
+				receipt:  func() string { return "" },
+				sourceID: func() uuid.UUID { return uuid.Nil },
+				intent:   func() string { return unknownIntent },
+			}
+			llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+			t.Cleanup(llmServer.Close)
+			f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+			f.say(t, "m1", tc.input)
+
+			txs := f.live(t)
+			require.Len(t, txs, 2)
+			for i, tx := range txs {
+				assert.Equal(t, tc.amounts[i], tx.AmountMinor)
+				require.NotNil(t, tx.Merchant)
+				assert.Equal(t, tc.merchants[i], *tx.Merchant)
+				require.NotNil(t, tx.ExternalID)
+				assert.Equal(t, fmt.Sprintf("m1#%d", i+1), *tx.ExternalID)
+				assert.Equal(t, f.bri.ID, legSourceID(t, tx.Legs))
+			}
+			assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			assert.Empty(t, open)
+			assert.Zero(t, fake.intents(), "a unique trailing BRI Source is deterministic")
+		})
+	}
+}
+
+func TestFailedTextReplyStaysReadyAndRetriesStoredReply(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "ready", row.Status)
+	require.NotNil(t, row.ReplyText)
+	assert.Len(t, row.TransactionIDs, 2)
+	assert.Empty(t, f.sender.all(), "a failed delivery was not accepted by the gateway")
+	assert.Len(t, f.live(t), 2)
+
+	f.sender.setSendError(nil)
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+
+	assert.Len(t, f.live(t), 2, "delivery recovery never reruns the ledger")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, *row.ReplyText, sent[0].Text)
+	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
 }
 
 func TestBatchCaptureThenBatalOneItem(t *testing.T) {

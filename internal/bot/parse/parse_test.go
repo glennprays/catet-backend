@@ -62,6 +62,24 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
+			name:  "physical lines with a bare source footer are two expenses",
+			input: "sarapan bubur ayam 16k\ncilok 10k\nBRI",
+			lang:  "id",
+			drafts: []wantDraft{
+				{typ: "expense", amount: 16_000, merchant: "sarapan bubur ayam", lang: "id"},
+				{typ: "expense", amount: 10_000, merchant: "cilok", lang: "id"},
+			},
+		},
+		{
+			name:  "physical lines with a dari source footer are two expenses",
+			input: "nasi daun jeruk 22k\nes podeng 12k\nDari bri",
+			lang:  "id",
+			drafts: []wantDraft{
+				{typ: "expense", amount: 22_000, merchant: "nasi daun jeruk", lang: "id"},
+				{typ: "expense", amount: 12_000, merchant: "es podeng", lang: "id"},
+			},
+		},
+		{
 			name:  "expense plus transfer",
 			input: "bensin 20k cash, pindah 500k ke gopay",
 			lang:  "id",

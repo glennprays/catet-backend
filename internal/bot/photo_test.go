@@ -247,6 +247,39 @@ func TestPhotoParksReceiptThenYaWritesLines(t *testing.T) {
 	}
 }
 
+func TestPhotoFailedReplyStaysReadyAfterParkingReceipt(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.Empty(t, f.live(t), "receipt arrival only parks a Hold Queue draft")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	assert.Equal(t, "receipt", open[0].Kind)
+
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "ready", row.Status)
+	require.NotNil(t, row.ReplyText)
+	assert.Empty(t, row.TransactionIDs)
+	assert.Empty(t, f.sender.all(), "a failed receipt reply was not accepted")
+
+	f.sender.setSendError(nil)
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.Empty(t, f.live(t), "receipt delivery recovery never writes ledger money")
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "delivery recovery never creates a second Hold Queue draft")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, *row.ReplyText, sent[0].Text)
+	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
+}
+
 func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 
