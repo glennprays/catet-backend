@@ -426,6 +426,30 @@ func TestFailedTextReplyStaysReadyAndRetriesStoredReply(t *testing.T) {
 	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
 }
 
+func TestFailedInformationalReplyClearsReactionOnRecovery(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.say(t, "m1", "rekap")
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "ready", row.Status)
+	assert.Equal(t, []string{"👀"}, f.sender.reactionsOn("m1"))
+
+	f.sender.setSendError(nil)
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
+	f.say(t, "m1", "rekap")
+
+	assert.Equal(t, []string{"👀", ""}, f.sender.reactionsOn("m1"))
+	row, err = f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	assert.Equal(t, "replied", row.Status)
+}
+
 func TestBatchCaptureThenBatalOneItem(t *testing.T) {
 	f := newBotFixture(t, nil)
 
