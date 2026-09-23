@@ -203,10 +203,12 @@ func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
 	require.NoError(t, f.pool.QueryRow(context.Background(),
 		`SELECT status, reply_text, last_error FROM inbound_messages WHERE message_id = $1`,
 		"m-vision-timeout").Scan(&status, &reply, &lastError))
-	assert.Equal(t, "replied", status)
 	require.NotNil(t, reply, "finalization must persist the user-facing error reply")
 	assert.NotEmpty(t, *reply)
 	assert.NotEqual(t, "👀", *reply)
+	require.NotNil(t, lastError)
+	assert.Equal(t, "photo_vision_timeout", *lastError)
+	assert.NotContains(t, *lastError, "http")
 	row, err := f.inbound.Get(f.ctx, "m-vision-timeout")
 	require.NoError(t, err)
 	require.NotNil(t, row)
@@ -836,6 +838,9 @@ func TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	assert.Equal(t, "replied", row.Status)
+	require.NotNil(t, row.LastError)
+	assert.Equal(t, "photo_no_total", *row.LastError)
+	assert.NotContains(t, *row.LastError, "http")
 	require.NotNil(t, row.MediaSha256)
 	require.NotNil(t, row.OutcomeReaction)
 	assert.Equal(t, "❌", *row.OutcomeReaction)

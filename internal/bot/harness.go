@@ -78,6 +78,7 @@ type handlingResult struct {
 	Lang            string
 	OutcomeReaction string
 	Stage           string
+	ErrorCode       string
 }
 
 type enrichmentContextKey struct{}
@@ -445,9 +446,12 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	if handleErr != nil && !panicked {
 		fctx, fcancel := h.finalizeContext(ctx)
 		defer fcancel()
-		stage := result.Stage
+		stage := result.ErrorCode
+		if stage == "" { stage = result.Stage }
 		if stage == "" { stage = "inbound_work" }
-		if len(result.TransactionIDs) > 0 { stage += "_partial" } else { stage += "_error" }
+		if result.ErrorCode == "" {
+			if len(result.TransactionIDs) > 0 { stage += "_partial" } else { stage += "_error" }
+		}
 		return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, stage, p.Chat, p.MessageId, p.From)
 	}
 	if result.OutcomeReaction == "" {
@@ -459,7 +463,7 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	}
 	fctx, fcancel := h.finalizeContext(ctx); defer fcancel()
 	delivery, err := h.inbound.StoreInboundResult(fctx, claim.Lease, repository.InboundResult{
-		ReplyText: result.Reply, TransactionIDs: result.TransactionIDs, Lang: result.Lang, OutcomeReaction: persistedReaction(result.OutcomeReaction),
+		ReplyText: result.Reply, TransactionIDs: result.TransactionIDs, Lang: result.Lang, OutcomeReaction: persistedReaction(result.OutcomeReaction), ErrorCode: result.ErrorCode,
 	})
 	if err != nil { return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, "result_store_failed", p.Chat, p.MessageId, p.From) }
 	if err := h.send(fctx, p.Chat, result.Reply, "reply:"+p.MessageId); err != nil {
@@ -501,10 +505,34 @@ func (h *Harness) runHandle(ctx context.Context, p *waga.IncomingWebhookPayload)
 		result.Lang = parse.Parse(p.Media.Caption, service.JakartaNow()).Lang
 		if result.Lang == "" { result.Lang = "id" }
 		result.Reply, result.TransactionIDs, result.OutcomeReaction, err = h.readPhoto(ctx, p, result.Lang)
+		result.ErrorCode = photoOutcomeCode(result.Reply, result.Lang, err)
 		return
+	}
+	if p.Type == waga.IncomingMessageTypeImage {
+		result.ErrorCode = "photo_no_media"
 	}
 	result.Reply, result.TransactionIDs, result.Lang, err = h.handle(ctx, p)
 	return
+}
+
+func photoOutcomeCode(reply, lang string, err error) string {
+	if err != nil { return "photo_vision_timeout" }
+	switch {
+	case reply == tmpl.Render(lang, "photo_too_large", nil), reply == tmpl.Render(lang, "unsupported_media", nil):
+		return "photo_media_rejected"
+	case reply == tmpl.Render(lang, "photo_unreadable", map[string]any{"Issue": "download"}):
+		return "photo_media_download_failed"
+	case reply == tmpl.Render(lang, "photo_no_total", nil):
+		return "photo_no_total"
+	case reply == tmpl.Render(lang, "photo_vision_down", nil):
+		return "photo_vision_unavailable"
+	case reply == tmpl.Render(lang, "photo_llm_off", nil):
+		return "photo_vision_unavailable"
+	case reply == tmpl.Render(lang, "error_generic", nil):
+		return "photo_vision_timeout"
+	default:
+		return ""
+	}
 }
 
 func (h *Harness) deliverClaim(ctx context.Context, claim *repository.InboundClaim) error {
@@ -522,7 +550,7 @@ func (h *Harness) deliverClaim(ctx context.Context, claim *repository.InboundCla
 func (h *Harness) releaseWork(ctx context.Context, lease *repository.InboundLease, ids []uuid.UUID, lang, stage, chat, messageID, from string) error {
 	final, err := h.inbound.ReleaseInboundWork(ctx, lease, ids, stage)
 	if err != nil { return err }
-	if final { return h.storeIncomplete(ctx, lease, ids, lang, chat, messageID, from) }
+	if final { return h.storeIncomplete(ctx, lease, ids, lang, stage, chat, messageID, from) }
 	return nil
 }
 
@@ -535,10 +563,12 @@ func (h *Harness) handlePanic(ctx context.Context, lease *repository.InboundLeas
 
 func (h *Harness) finalizeIncomplete(ctx context.Context, claim *repository.InboundClaim) error {
 	if claim.Message == nil { return nil }
-	return h.storeIncomplete(ctx, claim.Lease, claim.Message.TransactionIDs, claim.Message.Lang, claim.Message.Chat, claim.Message.MessageID, claim.Message.FromJID)
+	errorCode := ""
+	if claim.Message.LastError != nil { errorCode = *claim.Message.LastError }
+	return h.storeIncomplete(ctx, claim.Lease, claim.Message.TransactionIDs, claim.Message.Lang, errorCode, claim.Message.Chat, claim.Message.MessageID, claim.Message.FromJID)
 }
 
-func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.InboundLease, ids []uuid.UUID, lang, chat, messageID, from string) error {
+func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.InboundLease, ids []uuid.UUID, lang, errorCode, chat, messageID, from string) error {
 	if lang == "" { lang = "id" }
 	items := make([]writtenItem, 0, len(ids))
 	for i, id := range ids {
@@ -547,7 +577,7 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 		items = append(items, writtenItem{N: i + 1, Amount: money.FormatIDR(tx.AmountMinor), Merchant: merchant})
 	}
 	reply := tmpl.Render(lang, "capture_incomplete", map[string]any{"Items": items})
-	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected})
+	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected, ErrorCode: errorCode})
 	if err != nil { return err }
 	if len(ids) > 0 {
 		state, stateErr := h.chats.Get(ctx, chat)
