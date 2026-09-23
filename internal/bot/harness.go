@@ -440,10 +440,15 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	if handleErr != nil {
 		errorsTotal.Add(1)
 		h.log.Error(traceOf(ctx), "handle failed", map[string]any{"message_id": p.MessageId, "error": handleErr.Error()})
-		result.Reply = tmpl.Render(result.Lang, "error_generic", nil)
+		if result.ErrorCode == "photo_media_hash_persist_failed" {
+			result.Reply = tmpl.Render(result.Lang, "photo_unreadable", map[string]any{"Issue": "fingerprint"})
+		} else {
+			result.Reply = tmpl.Render(result.Lang, "error_generic", nil)
+		}
 		result.OutcomeReaction = reactRejected
 	}
-	if handleErr != nil && !panicked {
+	terminalError := result.ErrorCode == "photo_media_hash_persist_failed"
+	if handleErr != nil && !panicked && !terminalError {
 		fctx, fcancel := h.finalizeContext(ctx)
 		defer fcancel()
 		stage := result.ErrorCode
@@ -516,7 +521,10 @@ func (h *Harness) runHandle(ctx context.Context, p *waga.IncomingWebhookPayload)
 }
 
 func photoOutcomeCode(reply, lang string, err error) string {
-	if err != nil { return "photo_vision_timeout" }
+	if err != nil {
+		if strings.Contains(err.Error(), "media_hash_persist_failed") { return "photo_media_hash_persist_failed" }
+		return "photo_vision_timeout"
+	}
 	switch {
 	case reply == tmpl.Render(lang, "photo_too_large", nil), reply == tmpl.Render(lang, "unsupported_media", nil):
 		return "photo_media_rejected"
@@ -581,15 +589,10 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 	if err != nil { return err }
 	if len(ids) > 0 {
 		state, stateErr := h.chats.Get(ctx, chat)
-		if stateErr == nil {
-			if state == nil { state = &repository.ChatState{Chat: chat} }
-			state.LastBatchMessageID = &messageID
-			if saveErr := h.saveState(ctx, state); saveErr != nil {
-				h.log.Warn(traceOf(ctx), "save incomplete batch pointer failed", map[string]any{"error": saveErr.Error()})
-			}
-		} else {
-			h.log.Warn(traceOf(ctx), "load chat state for incomplete batch failed", map[string]any{"error": stateErr.Error()})
-		}
+		if stateErr != nil { return stateErr }
+		if state == nil { state = &repository.ChatState{Chat: chat} }
+		state.LastBatchMessageID = &messageID
+		if saveErr := h.saveState(ctx, state); saveErr != nil { return saveErr }
 	}
 	if err := h.send(ctx, chat, reply, "reply:"+messageID); err != nil { _ = h.inbound.RescheduleInbound(ctx, delivery, "reply_transport_timeout"); return nil }
 	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil { return err }
