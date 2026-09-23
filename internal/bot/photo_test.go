@@ -30,14 +30,15 @@ import (
 // them, so a test can prove a duplicate photo never reaches the model
 // and that a rules-answerable reply never reaches the router.
 type fakeVisionLLM struct {
-	mu          sync.Mutex
-	visionCalls int
-	intentCalls int
-	sourceCalls int
-	visionBlock chan struct{}
-	receipt     func() string
-	sourceID    func() uuid.UUID
-	intent      func() string
+	mu             sync.Mutex
+	visionCalls    int
+	intentCalls    int
+	sourceCalls    int
+	visionBlock    chan struct{}
+	visionCanceled chan struct{}
+	receipt        func() string
+	sourceID       func() uuid.UUID
+	intent         func() string
 }
 func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -52,6 +53,7 @@ func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-gate:
 			case <-r.Context().Done():
+				select { case f.visionCanceled <- struct{}{}: default: }
 				return
 			}
 		}
@@ -158,7 +160,7 @@ func newPhotoFixtureWithTimeout(
 	img := jpegBytes(t)
 	media := mediaServer(t, img)
 
-	fake := &fakeVisionLLM{}
+	fake := &fakeVisionLLM{visionCanceled: make(chan struct{}, 2)}
 	llmSrv := httptest.NewServer(http.HandlerFunc(fake.serve))
 	t.Cleanup(llmSrv.Close)
 
@@ -172,9 +174,9 @@ func newPhotoFixtureWithTimeout(
 func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
 	f, fake, url, size := newPhotoFixtureWithTimeout(t, func(*botFixture) string {
 		return `{"document_type":"receipt","legible":true,"issues":[],"merchant":"Indomaret","date":"","currency":"IDR","has_total_line":true,"total_minor":1000,"subtotal_minor":1000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,"payment_method":"cash","direction":"","counterparty":"","items":[]}`
-	}, 100*time.Millisecond)
+	}, 2*time.Second)
 	fake.blockVision()
-	ctx, cancel := context.WithTimeout(f.ctx, 22*time.Second)
+	ctx, cancel := context.WithTimeout(f.ctx, 24*time.Second)
 	defer cancel()
 
 	err := f.harness.Process(ctx, &waga.IncomingWebhookPayload{
@@ -192,9 +194,20 @@ func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 2, fake.calls(), "vision provider is exhausted through both attempts")
-	status, _ := f.inboundRow(t, "m-vision-timeout")
+	_, ok := <-fake.visionCanceled
+	assert.True(t, ok, "vision request observes core-work cancellation before finalization")
+	_, ok = <-fake.visionCanceled
+	assert.True(t, ok, "vision retry also observes cancellation")
+	var status string
+	var reply, lastError *string
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT status, reply_text, last_error FROM inbound_messages WHERE message_id = $1`,
+		"m-vision-timeout").Scan(&status, &reply, &lastError))
 	assert.Equal(t, "replied", status)
-	assert.NotEmpty(t, f.sender.last(), "vision exhaustion stores and delivers a refusal")
+	require.NotNil(t, reply, "finalization must persist the user-facing error reply")
+	assert.NotEmpty(t, *reply)
+	assert.NotEqual(t, "👀", *reply)
+	assert.Equal(t, *reply, f.sender.last())
 }
 
 // twoLineReceipt is the canonical reading: two items that add up to the

@@ -15,6 +15,8 @@ func TestEnrichmentTimeoutKeepsRawMerchantCaptureWritable(t *testing.T) {
 	f.say(t, "m-enrich-merchant", "traktir temen 10k pakai cash")
 
 	assert.Equal(t, 1, script.callsOf("merchant_pick"), "merchant enrichment makes one bounded call")
+	assert.Less(t, script.requestDeadline(), 6*time.Second, "provider request receives the five-second enrichment deadline")
+	assert.Equal(t, 1, script.cancellationsOf("merchant_pick"), "provider observes enrichment cancellation")
 
 	txs := f.live(t)
 	require.Len(t, txs, 1)
@@ -31,6 +33,8 @@ func TestEnrichmentTimeoutOnUnmatchedSourceLeavesHoldWithoutDefault(t *testing.T
 	f.say(t, "m-enrich-source", "kopi 10k pakai not-a-source")
 
 	assert.Equal(t, 1, script.callsOf("source_pick"), "unmatched Source alias makes one bounded repair call")
+	assert.Less(t, script.requestDeadline(), 6*time.Second, "provider request receives the five-second enrichment deadline")
+	assert.Equal(t, 1, script.cancellationsOf("source_pick"), "provider observes enrichment cancellation")
 
 	assert.Empty(t, f.live(t), "an unmatched Source alias must never write without a Source")
 	assert.Equal(t, 1, f.openActions(t))
@@ -43,6 +47,8 @@ func TestEnrichmentTimeoutOnCategoryStillWritesNeedsReview(t *testing.T) {
 	f := newBotFixture(t, client)
 
 	f.say(t, "m-enrich-category", "10k pakai cash")
+	assert.Less(t, script.requestDeadline(), 6*time.Second, "provider request receives the five-second enrichment deadline")
+	assert.Equal(t, 1, script.cancellationsOf("category_pick"), "provider observes enrichment cancellation")
 
 	assert.Equal(t, 1, script.callsOf("category_pick"), "category enrichment makes one bounded call")
 

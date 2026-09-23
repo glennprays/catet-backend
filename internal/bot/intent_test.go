@@ -27,9 +27,11 @@ type scriptedLLM struct {
 	category string
 	source   string
 	merchant string
-	block    chan struct{}
-	calls    map[string]int
-	prompts  []string
+	block         chan struct{}
+	calls         map[string]int
+	prompts       []string
+	deadline      time.Duration
+	cancellations map[string]int
 }
 
 func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
@@ -39,12 +41,11 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLLM, *llm.Client) {
 	t.Helper()
 	s := &scriptedLLM{
-		category: `{"category_id":null,"confidence":0}`,
-		source:   `{"source_id":null}`,
-		// Default: the model returns the phrase untouched, so a test that
-		// is not about naming reads exactly what it typed.
-		merchant: `{"merchant_id":null,"name":"","confidence":0}`,
-		calls:    map[string]int{},
+		category:  `{"category_id":null,"confidence":0}`,
+		source:    `{"source_id":null}`,
+		merchant:  `{"merchant_id":null,"name":"","confidence":0}`,
+		calls:         map[string]int{},
+		cancellations: map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -74,12 +75,18 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 		"merchant_pick": s.merchant,
 	}[kind]
 	gate := s.block
+	if deadline, ok := r.Context().Deadline(); ok {
+		s.deadline = deadline.Sub(time.Now())
+	}
 	s.mu.Unlock()
 
 	if gate != nil {
 		select {
 		case <-gate:
 		case <-r.Context().Done():
+			s.mu.Lock()
+			s.cancellations[kind]++
+			s.mu.Unlock()
 			return
 		}
 	}
@@ -120,6 +127,18 @@ func (s *scriptedLLM) callsOf(kind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls[kind]
+}
+
+func (s *scriptedLLM) requestDeadline() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deadline
+}
+
+func (s *scriptedLLM) cancellationsOf(kind string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancellations[kind]
 }
 
 func (s *scriptedLLM) lastPrompt() string {
