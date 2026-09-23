@@ -485,6 +485,27 @@ func TestFollowUpSettlesSourceAndDate(t *testing.T) {
 	assert.Equal(t, 0, script.callsOf("intent"), "the rules explained the whole message")
 }
 
+func TestIntentPartialLaterDraftUsesSharedFooter(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setIntent(`{"intent":"capture","drafts":[
+		{"type":"expense","merchant":"teh itu","amount_text":"5k","source_id":"` + f.bca.ID.String() + `","destination_source_id":null,"category_id":null,"occurred_date":null}
+	],"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`)
+
+	// "itu" forces the intent path. The model returns only the later line,
+	// and even claims BCA; neither may inherit the first line's DANA hint or
+	// bypass the shared BRI footer.
+	f.say(t, "m1", "kopi 10k pakai dana\nteh 5k itu\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	assert.Equal(t, int64(5_000), txs[0].AmountMinor)
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
+	require.NotNil(t, txs[0].Merchant)
+	assert.Equal(t, "Teh Itu", *txs[0].Merchant)
+	assert.Equal(t, 1, script.callsOf("intent"))
+}
+
 // A date the ledger must not take is refused out loud, and the draft
 // stays parked exactly as it was.
 func TestFollowUpRefusesFutureDate(t *testing.T) {

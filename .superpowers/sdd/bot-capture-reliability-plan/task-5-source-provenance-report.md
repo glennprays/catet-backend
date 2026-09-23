@@ -31,6 +31,7 @@ Focused race evidence:
 
 - `go test ./internal/bot/parse -race -count=1` — passed.
 - `go test ./internal/bot -run 'TestIntentDrafts(MapParserSourcesByVerifiedPhysicalLine|ClearUnprovenParserSourceHints)$' -race -count=1` — passed.
+- `go test ./internal/bot -run '^TestIntentPartialLaterDraftUsesSharedFooter$' -race -count=1` — passed; a model response containing only the later line and a BCA id writes it against shared BRI, not first-line DANA.
 - `go test ./internal/bot -run 'TestIntentDrafts|TestIntentBatchPreservesParserSourceAndFooter|TestBatchFooterDoesNotOverrideExplicitLineSource' -race -count=1` — passed.
 
 Project-wide validation, formatters, linters, and unrelated suites were not run per assignment constraints.
