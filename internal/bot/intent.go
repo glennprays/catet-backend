@@ -46,7 +46,7 @@ func (h *Harness) intentStage(
 		return h.intentFallback(ctx, p, parsed, state, lang)
 	}
 
-	reply, ids, err := h.runIntent(ctx, p, in, state, lang)
+	reply, ids, err := h.runIntent(ctx, p, in, state, lang, parsed.SourceFooter)
 	return reply, ids, lang, err
 }
 
@@ -69,7 +69,7 @@ func (h *Harness) intentFallback(
 				return "", nil, lang, err
 			}
 		}
-		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang)
+		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang, parsed.SourceFooter)
 	}
 	// Without a model there is nothing left to try, but the question is
 	// still the user's open business: repeat it instead of dropping it.
@@ -186,6 +186,7 @@ func (h *Harness) runIntent(
 	in *llm.Intent,
 	state *repository.ChatState,
 	lang string,
+	sourceFooter string,
 ) (string, []uuid.UUID, error) {
 	// The open question outlives almost everything: it is the only state
 	// a message can silently break, and a stranded draft is how a receipt
@@ -243,7 +244,7 @@ func (h *Harness) runIntent(
 		if len(in.Drafts) == 0 {
 			return h.remind(ctx, state, lang, "")
 		}
-		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang), state, lang)
+		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang), state, lang, sourceFooter)
 		return reply, ids, err
 
 	case llm.KindCorrect:

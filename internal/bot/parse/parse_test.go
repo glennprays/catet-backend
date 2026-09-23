@@ -377,6 +377,22 @@ func questionFor(code string) string {
 	return ""
 }
 
+func TestParsePhysicalLineBatchEquivalenceAndFooter(t *testing.T) {
+	inputs := []string{
+		"sarapan bubur ayam 16k\n\ncilok 10k\n\nDari BRI",
+		"sarapan bubur ayam 16k\r\n\r\ncilok 10k\r\n\r\nDari BRI",
+	}
+	for _, input := range inputs {
+		got := parse.Parse(input, now)
+		require.Len(t, got.Drafts, 2)
+		assert.Equal(t, "bri", got.SourceFooter)
+		assert.Equal(t, int64(16_000), got.Drafts[0].AmountMinor)
+		assert.Equal(t, int64(10_000), got.Drafts[1].AmountMinor)
+		assert.Equal(t, "sarapan bubur ayam", got.Drafts[0].Merchant)
+		assert.Equal(t, "cilok", got.Drafts[1].Merchant)
+	}
+}
+
 // TestLooksReferential covers the routing predicate: anything that
 // talks about an earlier transaction must reach the intent router
 // instead of the regex capture path.

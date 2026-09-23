@@ -607,7 +607,7 @@ func (h *Harness) handle(ctx context.Context, p *waga.IncomingWebhookPayload) (s
 	// the intent stage instead of being forced into a write.
 	if state.OpenPendingActionID == nil && len(parsed.Drafts) > 0 &&
 		!anyHold(parsed.Drafts) && !parse.LooksReferential(p.Text) {
-		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang)
+		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang, parsed.SourceFooter)
 	}
 	return h.intentStage(ctx, p, parsed, state, lang)
 }

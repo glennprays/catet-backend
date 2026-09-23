@@ -101,10 +101,19 @@ func (h *Harness) capture(
 	drafts []draft,
 	state *repository.ChatState,
 	lang string,
+	sourceFooter string,
 ) (string, []uuid.UUID, string, error) {
 	sources, err := h.sources.List(ctx, false)
+
 	if err != nil {
 		return "", nil, lang, fmt.Errorf("list sources: %w", err)
+	}
+	var footerSource *entity.Source
+	if strings.TrimSpace(sourceFooter) != "" {
+		// A shared footer is resolved once, deterministically. An
+		// unmatched or ambiguous hint intentionally stays nil so every
+		// affected draft reaches the normal Source Hold below.
+		footerSource = resolveSourceRules(sourceFooter, sources)
 	}
 	cats, err := h.categories.List(ctx, false)
 	if err != nil {
@@ -159,6 +168,13 @@ func (h *Harness) capture(
 		// parked capture that already knows its Source only has to ask
 		// about the one thing that is actually missing.
 		src, places, explicit := h.draftSource(ctx, d, sources)
+		if strings.TrimSpace(sourceFooter) != "" && !explicit {
+			// Every line without its own explicit Source shares the
+			// footer result. A nil result is intentional: it suppresses
+			// merchant memory/default inference and reaches Source Hold.
+			src = footerSource
+			explicit = true
+		}
 
 		// The first place is where the money went ("dari alfamart"); what
 		// the user typed around it is the note ("tissu").

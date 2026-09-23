@@ -351,13 +351,13 @@ func TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent(t *testing.T) {
 		{
 			name:      "bare source footer",
 			input:     "sarapan bubur ayam 16k\ncilok 10k\nBRI",
-			merchants: []string{"Sarapan bubur ayam", "Cilok"},
+			merchants: []string{"Sarapan Bubur Ayam", "Cilok"},
 			amounts:   []int64{16_000, 10_000},
 		},
 		{
 			name:      "dari source footer",
 			input:     "nasi daun jeruk 22k\nes podeng 12k\nDari bri",
-			merchants: []string{"Nasi daun jeruk", "Es podeng"},
+			merchants: []string{"Nasi Daun Jeruk", "Es Podeng"},
 			amounts:   []int64{22_000, 12_000},
 		},
 	}
@@ -394,6 +394,68 @@ func TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent(t *testing.T) {
 		})
 	}
 }
+func TestUnknownOrAmbiguousBatchFooterHoldsEveryLine(t *testing.T) {
+	tests := []struct {
+		name      string
+		footer    string
+		ambiguous bool
+	}{
+		{name: "unknown", footer: "NotARealSource"},
+		{name: "ambiguous", footer: "wallet", ambiguous: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeVisionLLM{
+				receipt:  func() string { return "" },
+				sourceID: func() uuid.UUID { return uuid.Nil },
+				intent:   func() string { return unknownIntent },
+			}
+			llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+			t.Cleanup(llmServer.Close)
+			f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+			if tc.ambiguous {
+				f.source(t, "Wallet One", "bank", false)
+				f.source(t, "Wallet Two", "bank", false)
+			}
+
+			f.say(t, "m1", "kopi 10k\nteh 5k\n"+tc.footer)
+
+			assert.Empty(t, f.live(t))
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			require.Len(t, open, 2)
+			for _, action := range open {
+				var params map[string]any
+				require.NoError(t, json.Unmarshal(action.Params, &params))
+				assert.Equal(t, []any{"source"}, params["missing"])
+				assert.Nil(t, params["source_id"])
+			}
+			assert.Zero(t, fake.intents(), "a structural batch footer must not invoke intent")
+			assert.Zero(t, fake.sourcePicks(), "a shared footer is never repaired by source AI")
+		})
+	}
+}
+
+func TestBatchFooterDoesNotOverrideExplicitLineSource(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+	f.say(t, "m1", "kopi 10k pakai DANA\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.dana.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	assert.Zero(t, fake.intents())
+	assert.Zero(t, fake.sourcePicks())
+}
+
 
 func TestFailedTextReplyStaysReadyAndRetriesStoredReply(t *testing.T) {
 	f := newBotFixture(t, nil)
