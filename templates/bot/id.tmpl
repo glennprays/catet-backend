@@ -34,6 +34,12 @@ Sip, {{len .Items}} transaksi tercatat:
 {{end}}Kalau ada yang salah, balas "batal" untuk hapus semua atau "batal 2" untuk nomor 2.
 {{- end}}
 
+{{define "capture_incomplete" -}}
+Aduh, pencatatannya belum lengkap. Yang sudah tercatat:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}
+{{end}}Kalau perlu, balas "batal" untuk membatalkan yang sudah tercatat atau "batal 1" untuk nomor 1.
+{{- end}}
+
 {{define "uncategorized" -}}
 belum ada kategori
 {{- end}}
