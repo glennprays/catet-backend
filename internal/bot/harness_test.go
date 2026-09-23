@@ -629,6 +629,26 @@ func TestNonPhotoMediaIsRefusedPolitely(t *testing.T) {
 	assert.Empty(t, f.live(t))
 	assert.Contains(t, f.sender.last(), "Kirim sebagai foto ya")
 }
+func TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction(t *testing.T) {
+	f := newBotFixture(t, nil)
+
+	f.deliver(t, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming,
+		Chat:  ownerPhone[1:] + "@s.whatsapp.net", From: ownerPhone[1:] + ":1@s.whatsapp.net",
+		MessageId: "m1", Timestamp: time.Now().Unix(),
+		Type:      waga.IncomingMessageTypeImage,
+	})
+
+	assert.Contains(t, f.sender.last(), "Kirim sebagai foto ya")
+	assert.Equal(t, []string{"👀", "❌"}, f.sender.reactionsOn("m1"))
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+}
+
 
 // WhatsApp may address an account by an opaque lid instead of its phone
 // number; the stored lid is what makes that the same person.

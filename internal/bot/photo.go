@@ -29,17 +29,11 @@ const receiptHoldLines = 6
 // user confirms, in chat or in the dashboard (spec §6). Money comes from
 // the printed TOTAL line and nothing else.
 //
-// Process already stamped 👀 and started typing; photo() only owns the
-// outcome, because reading a receipt is slow enough that the emoji is
-// the whole status display.
+// Process stamps 👀 before work and the harness stamps the persisted
+// outcome after successful delivery, so photo() has no delivery side effects.
 func (h *Harness) photo(ctx context.Context, p *waga.IncomingWebhookPayload, lang string) (string, []uuid.UUID, string, error) {
-	reply, ids, emoji, err := h.readPhoto(ctx, p, lang)
-	if err != nil {
-		h.react(ctx, p.Chat, p.MessageId, p.From, reactRejected)
-		return "", nil, lang, err
-	}
-	h.react(ctx, p.Chat, p.MessageId, p.From, emoji)
-	return reply, ids, lang, nil
+	reply, ids, _, err := h.readPhoto(ctx, p, lang)
+	return reply, ids, lang, err
 }
 
 // readPhoto is the pipeline itself; it returns the reaction that
