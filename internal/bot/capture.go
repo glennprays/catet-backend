@@ -498,6 +498,11 @@ func parserSourceExplicit(d draft, sources []entity.Source) bool {
 	if len(d.Pays) > 0 {
 		return true
 	}
+	// draftSource intentionally treats refund "dari" clauses as merchant
+	// text, so they cannot suppress a shared footer Source.
+	if d.Type == parse.TypeRefund {
+		return false
+	}
 	for _, word := range d.Froms {
 		if resolveSourceRules(word, sources) != nil {
 			return true

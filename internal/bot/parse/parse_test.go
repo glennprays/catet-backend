@@ -396,7 +396,10 @@ func TestParsePhysicalLineBatchEquivalenceAndFooter(t *testing.T) {
 func TestParseFooterPunctuationAndDateSuffix(t *testing.T) {
 	for _, input := range []string{
 		"kopi 10k\nteh 5k\nDari: BRI",
+		"kopi 10k\nteh 5k\nDari:BRI",
+		"kopi 10k\nteh 5k\nDari : BRI",
 		"kopi 10k\nteh 5k\nPakai, BRI",
+		"kopi 10k\nteh 5k\nPakai,BRI",
 	} {
 		got := parse.Parse(input, now)
 		require.Len(t, got.Drafts, 2)

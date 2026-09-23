@@ -287,13 +287,19 @@ func lineHasMoney(line string, now time.Time) bool {
 
 func sourceFooterHint(line string) string {
 	hint := strings.Trim(normalize(line), " ,.;:!?\"'")
-	fields := strings.Fields(hint)
-	if len(fields) > 1 {
-		marker := strings.Trim(fields[0], " ,.;:!?\"'")
-		switch marker {
-		case "dari", "from", "pakai", "pake":
-			hint = strings.Join(fields[1:], " ")
+	for _, marker := range []string{"dari", "from", "pakai", "pake"} {
+		if !strings.HasPrefix(hint, marker) {
+			continue
 		}
+		tail := hint[len(marker):]
+		if tail == "" {
+			break
+		}
+		trimmed := strings.TrimLeft(tail, " \t,.;:!?\"'")
+		if trimmed != tail {
+			return strings.Trim(trimmed, " ,.;:!?\"'")
+		}
+		break
 	}
 	return strings.Trim(hint, " ,.;:!?\"'")
 }

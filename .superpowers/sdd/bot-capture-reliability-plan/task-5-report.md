@@ -61,3 +61,17 @@ Fix-round changed files:
 - `internal/bot/harness_test.go`: intent Source precedence regression.
 
 Fix-round commit: `b688ff76c14c0a671ef9c3cfea4f8cc2c8f66c9c`.
+
+## Fix round 2 evidence
+
+- Footer marker parsing now handles `Dari:BRI`, `Dari : BRI`, and `Pakai,BRI` while preserving bare Source hints.
+- Refund `Froms` now follow `draftSource` semantics: they remain merchant text and do not suppress a shared footer Source.
+- `go test ./internal/bot/parse -race -count=1` — `ok`.
+- `go test ./internal/bot -run 'TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent|TestUnknownOrAmbiguousBatchFooterHoldsEveryLine|TestBatchFooterDoesNotOverrideExplicitLineSource|TestIntentBatchPreservesParserSourceAndFooter|TestRefundFromClauseDoesNotOverrideBatchFooter' -race -count=1` — `ok`.
+
+Fix-round 2 changed files:
+
+- `internal/bot/parse/parse.go`: robust marker-prefix/footer punctuation stripping.
+- `internal/bot/parse/parse_test.go`: compact/no-space punctuation regressions.
+- `internal/bot/capture.go`: refund-aware parser Source explicitness.
+- `internal/bot/harness_test.go`: refund footer Source regression.

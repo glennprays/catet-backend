@@ -457,6 +457,33 @@ func TestBatchFooterDoesNotOverrideExplicitLineSource(t *testing.T) {
 	assert.Zero(t, fake.sourcePicks())
 }
 
+func TestRefundFromClauseDoesNotOverrideBatchFooter(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+	f.say(t, "prior", "gojek 10k pakai BRI")
+	f.say(t, "m1", "refund gojek 10k dari alfamart\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	t.Logf("pending=%+v", open)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "BRI", params["source_name"])
+	assert.Zero(t, fake.intents())
+}
+
 func TestIntentBatchPreservesParserSourceAndFooter(t *testing.T) {
 	fake := &fakeVisionLLM{
 		receipt:  func() string { return "" },
