@@ -172,6 +172,21 @@ func (r *InboundMessageRepository) ClaimInbound(ctx context.Context, incoming *I
 		return nil, err
 	}
 
+	if incoming.Status == "dropped" && (row.Status == "processing" || row.Status == "ready") {
+		_, err := tx.Exec(ctx, `UPDATE inbound_messages
+			SET status = 'dropped', lease_until = NULL, next_attempt_at = now(), last_error = $2
+			WHERE message_id = $1`, incoming.MessageID, "sender_unavailable")
+		if err != nil {
+			return nil, err
+		}
+		row.Status = "dropped"
+		row.LeaseUntil = nil
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &InboundClaim{Kind: InboundClaimReplay, Message: &row}, nil
+	}
+
 	if row.Status != "processing" && row.Status != "ready" {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err

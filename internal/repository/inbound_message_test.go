@@ -90,6 +90,49 @@ func TestClaimInboundFencesDuplicateWorkAndStoresResultBeforeDelivery(t *testing
 	assert.Equal(t, "replied", replay.Message.Status)
 }
 
+func TestDroppedClaimTerminalizesDueProcessingAndReadyRows(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ready bool
+	}{{"processing", false}, {"ready", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testkit.NewDB(t)
+			ctx, userID := testkit.Scoped(t, pool, "+628111000809", "Inbound sender drop")
+			repo := repository.NewInboundMessageRepository(pool)
+			id := "wamid.sender-drop-" + tc.name
+			m := &repository.InboundMessage{
+				MessageID: id, Chat: "628111000809@s.whatsapp.net", FromJID: "628111000809@s.whatsapp.net",
+				UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text",
+			}
+			work := claimWork(t, ctx, repo, m)
+			if tc.ready {
+				storeResult(t, ctx, repo, work.Lease, nil)
+			} else {
+				_, err := repo.ReleaseInboundWork(ctx, work.Lease, nil, "work_timeout")
+				require.NoError(t, err)
+			}
+			_, err := pool.Exec(ctx, `UPDATE inbound_messages
+				SET next_attempt_at = now() - interval '1 second', lease_until = now() - interval '1 second'
+				WHERE message_id = $1`, id)
+			require.NoError(t, err)
+
+			dropped := *m
+			dropped.UserID = nil
+			dropped.Status = "dropped"
+			claim, err := repo.ClaimInbound(ctx, &dropped)
+			require.NoError(t, err)
+			assert.Equal(t, repository.InboundClaimReplay, claim.Kind)
+			assert.Equal(t, "dropped", claim.Message.Status)
+			assert.Nil(t, claim.Message.LeaseUntil)
+
+			stored, err := repo.Get(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, "dropped", stored.Status)
+			assert.Nil(t, stored.LeaseUntil)
+		})
+	}
+}
+
 // A regression here shortens a gateway handoff lease and lets recovery send
 // the same stored reply while the original caller may still be awaiting it.
 func TestDeliveryLeasesRemainThirtySecondsForStoreAndReadyClaim(t *testing.T) {

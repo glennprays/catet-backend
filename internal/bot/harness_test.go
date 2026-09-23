@@ -450,6 +450,35 @@ func TestFailedInformationalReplyClearsReactionOnRecovery(t *testing.T) {
 	assert.Equal(t, "replied", row.Status)
 }
 
+
+func TestUnknownSenderDropsDueExistingLeaseWithoutOutbound(t *testing.T) {
+	f := newBotFixture(t, nil)
+	const messageID = "m-unknown-recovery"
+	owner := ownerPhone[1:] + "@s.whatsapp.net"
+	claim, err := f.inbound.ClaimInbound(f.ctx, &repository.InboundMessage{
+		MessageID: messageID, Chat: owner, FromJID: owner, UserID: &f.userID,
+		OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text",
+	})
+	require.NoError(t, err)
+	require.Equal(t, repository.InboundClaimWork, claim.Kind)
+	_, err = f.pool.Exec(f.ctx, `UPDATE inbound_messages
+		SET next_attempt_at = now() - interval '1 second', lease_until = now() - interval '1 second'
+		WHERE message_id = $1`, messageID)
+	require.NoError(t, err)
+
+	require.NoError(t, f.harness.Process(f.ctx, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming, Chat: owner,
+		From: "628999999999:1@s.whatsapp.net", MessageId: messageID,
+		Timestamp: time.Now().Unix(), Text: "kopi 25k", Type: waga.IncomingMessageTypeText,
+	}))
+
+	row, err := f.inbound.Get(f.ctx, messageID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "dropped", row.Status)
+	assert.Nil(t, row.LeaseUntil)
+	assert.Empty(t, f.sender.all())
+}
 func TestBatchCaptureThenBatalOneItem(t *testing.T) {
 	f := newBotFixture(t, nil)
 
