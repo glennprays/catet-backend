@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented as `c175c735b2444bb67f98318058b56598d54480f2`; review fixes are `b54faedb233ed6ad89064b5e28efcd9083f5c1f5` and `cc066e87a6bd9a29dbb52bc572800d34c3ca97a1` (`make pending action keys atomic across retries`).
+Implemented as `c175c735b2444bb67f98318058b56598d54480f2`; review fixes are `b54faedb233ed6ad89064b5e28efcd9083f5c1f5`, `cc066e87a6bd9a29dbb52bc572800d34c3ca97a1`, and `f311361067e0608737e03e52481bb2b7315568f5` (`replay terminal pending actions safely`).
 
 ## Conflict adoption and partial-id decisions
 
@@ -79,3 +79,14 @@ A complete `go test ./internal/bot/... -race -count=1` run also exercised `inter
   `go test ./internal/bot -race -run 'TestCaptureWritesExpenseAndReplaysDuplicate|TestCaptureConflictAdoptsExistingLine|TestCapturePostWriteFailurePreservesPartialIDs|TestCaptureRetryDoesNotDuplicateHoldAction|TestCaptureDisplayNumbersStayContiguousAfterHold|TestCaptureResolvedOrDiscardedHoldIsNotRecreated|TestPendingActionExternalIDCreationIsAtomic|TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail|TestPhotoFailedReadIsReplayedAsDuplicate|TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney|TestPhotoHashPersistenceFailureRefusesBeforeVision|TestPhotoCiphertextIsUnreadable|TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction|TestPhotoParksReceiptThenYaWritesLines' -count=1`
 
   Result: `ok github.com/glennprays/catet-backend/internal/bot 10.183s`.
+
+## Terminal action replay follow-up
+
+- Resolved or discarded capture actions now return the deterministic `no_open_question` reply without incrementing the dashboard-deferred count, so retries never emit an empty result or misleading dashboard prompt.
+- Resolved or discarded refund actions now return the same deterministic terminal reply with `handled=true`; no pending row is reopened and no reversal transaction is created.
+- Added DB-backed retries that resolve/discard an action, reset the inbound row to due `processing`, and assert non-empty replies, zero duplicate actions, and no duplicate money.
+- Final terminal-replay focused race command:
+
+  `go test ./internal/bot -race -run 'TestCaptureWritesExpenseAndReplaysDuplicate|TestCaptureConflictAdoptsExistingLine|TestCapturePostWriteFailurePreservesPartialIDs|TestCaptureRetryDoesNotDuplicateHoldAction|TestCaptureDisplayNumbersStayContiguousAfterHold|TestCaptureResolvedOrDiscardedHoldIsNotRecreated|TestRefundResolvedActionReplaysSafely|TestPendingActionExternalIDCreationIsAtomic|TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail|TestPhotoFailedReadIsReplayedAsDuplicate|TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney|TestPhotoHashPersistenceFailureRefusesBeforeVision|TestPhotoCiphertextIsUnreadable|TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction|TestPhotoParksReceiptThenYaWritesLines' -count=1`
+
+  Result: `ok github.com/glennprays/catet-backend/internal/bot 10.307s`.
