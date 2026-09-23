@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/glennprays/catet-backend/internal/scope"
@@ -14,8 +13,8 @@ import (
 )
 
 const (
-	workLeaseDuration     = 3 * time.Minute
-	deliveryLeaseDuration = 30 * time.Second
+	workLeaseInterval     = "3 minutes"
+	deliveryLeaseInterval = "30 seconds"
 	minimumRetryDelay     = 15 * time.Second
 	maximumRetryDelay     = 5 * time.Minute
 	maximumWorkAttempts   = 3
@@ -56,15 +55,17 @@ type InboundMessage struct {
 	OutcomeReaction *string
 }
 
-// InboundClaimKind is the compact work/delivery/replay/busy boundary crossed
-// by the harness. Locking and schedule details remain private to this module.
+// InboundClaimKind is the compact work/delivery/incomplete/replay/busy
+// boundary crossed by the harness. Locking and schedule details remain
+// private to this module.
 type InboundClaimKind string
 
 const (
-	InboundClaimWork     InboundClaimKind = "work"
-	InboundClaimDelivery InboundClaimKind = "delivery"
-	InboundClaimReplay   InboundClaimKind = "replay"
-	InboundClaimBusy     InboundClaimKind = "busy"
+	InboundClaimWork       InboundClaimKind = "work"
+	InboundClaimDelivery   InboundClaimKind = "delivery"
+	InboundClaimIncomplete InboundClaimKind = "incomplete"
+	InboundClaimReplay     InboundClaimKind = "replay"
+	InboundClaimBusy       InboundClaimKind = "busy"
 )
 
 // InboundLease is an opaque CAS identity. Its timestamp and monotonic attempt
@@ -171,16 +172,6 @@ func (r *InboundMessageRepository) ClaimInbound(ctx context.Context, incoming *I
 		return nil, err
 	}
 
-	if row.Status == "processing" || row.Status == "ready" {
-		superseded, err := supersedeEquivalentText(ctx, tx, row.MessageID)
-		if err != nil {
-			return nil, err
-		}
-		if superseded {
-			row.Status = "superseded"
-			row.LeaseUntil = nil
-		}
-	}
 	if row.Status != "processing" && row.Status != "ready" {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
@@ -192,6 +183,28 @@ func (r *InboundMessageRepository) ClaimInbound(ctx context.Context, incoming *I
 			return nil, err
 		}
 		return &InboundClaim{Kind: InboundClaimBusy, Message: &row}, nil
+	}
+	superseded, err := supersedeEquivalentText(ctx, tx, row.MessageID)
+	if err != nil {
+		return nil, err
+	}
+	if superseded {
+		row.Status = "superseded"
+		row.LeaseUntil = nil
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &InboundClaim{Kind: InboundClaimReplay, Message: &row}, nil
+	}
+	if row.Status == "processing" && row.WorkAttempts >= maximumWorkAttempts {
+		row, err = renewIncompleteInbound(ctx, tx, row.MessageID)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return claimedIncomplete(&row), nil
 	}
 
 	row, err = acquireInbound(ctx, tx, row.MessageID, row.Status)
@@ -215,21 +228,37 @@ func acquireInbound(ctx context.Context, tx pgx.Tx, messageID, status string) (I
 			`UPDATE inbound_messages SET lease_until = now() + $2::interval
 			 WHERE message_id = $1 AND status = 'ready'
 			 RETURNING `+inboundColumns,
-			messageID, interval(deliveryLeaseDuration),
+			messageID, deliveryLeaseInterval,
 		).Scan(row.scanTargets()...)
 	} else {
 		err = tx.QueryRow(ctx,
 			`UPDATE inbound_messages SET work_attempts = work_attempts + 1, lease_until = now() + $2::interval
-			 WHERE message_id = $1 AND status = 'processing'
+			 WHERE message_id = $1 AND status = 'processing' AND work_attempts < $3
 			 RETURNING `+inboundColumns,
-			messageID, interval(workLeaseDuration),
+			messageID, workLeaseInterval, maximumWorkAttempts,
 		).Scan(row.scanTargets()...)
 	}
 	return row, err
 }
 
+func renewIncompleteInbound(ctx context.Context, tx pgx.Tx, messageID string) (InboundMessage, error) {
+	var row InboundMessage
+	err := tx.QueryRow(ctx,
+		`UPDATE inbound_messages SET lease_until = now() + $2::interval
+		 WHERE message_id = $1 AND status = 'processing' AND work_attempts >= $3
+		   AND next_attempt_at <= now() AND (lease_until IS NULL OR lease_until <= now())
+		 RETURNING `+inboundColumns,
+		messageID, workLeaseInterval, maximumWorkAttempts,
+	).Scan(row.scanTargets()...)
+	return row, err
+}
+
 func claimedWork(row *InboundMessage) *InboundClaim {
 	return &InboundClaim{Kind: InboundClaimWork, Message: row, Lease: leaseFor(row, "processing")}
+}
+
+func claimedIncomplete(row *InboundMessage) *InboundClaim {
+	return &InboundClaim{Kind: InboundClaimIncomplete, Message: row, Lease: leaseFor(row, "processing")}
 }
 
 func claimedDelivery(row *InboundMessage) *InboundClaim {
@@ -264,7 +293,7 @@ func (r *InboundMessageRepository) StoreInboundResult(ctx context.Context, lease
 		     lease_until = now() + $5::interval, next_attempt_at = now()
 		 WHERE message_id = $6 AND status = 'processing' AND lease_until = $7 AND work_attempts = $8
 		 RETURNING `+inboundColumns,
-		result.ReplyText, ids, lang, nullIfEmpty(result.OutcomeReaction), interval(deliveryLeaseDuration),
+		result.ReplyText, ids, lang, nullIfEmpty(result.OutcomeReaction), deliveryLeaseInterval,
 		lease.messageID, lease.until, lease.workAttempts,
 	).Scan(row.scanTargets()...)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -401,6 +430,7 @@ func supersedeEquivalentText(ctx context.Context, tx pgx.Tx, messageID string) (
 		 SET status = 'superseded', lease_until = NULL
 		 WHERE stale.message_id = $1 AND stale.status IN ('processing', 'ready')
 		   AND stale.kind = 'text' AND btrim(stale.body) <> ''
+		   AND stale.next_attempt_at <= now() AND (stale.lease_until IS NULL OR stale.lease_until <= now())
 		   AND EXISTS (
 		     SELECT 1 FROM inbound_messages AS replied
 		     WHERE replied.chat = stale.chat AND replied.kind = 'text' AND replied.status = 'replied'
@@ -524,13 +554,10 @@ func sanitizeStage(stage string) string {
 	return "internal_error"
 }
 
-func interval(d time.Duration) string {
-	return strings.TrimSuffix(d.String(), "0s")
-}
-
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}
 	return s
 }
+

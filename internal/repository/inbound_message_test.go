@@ -90,6 +90,32 @@ func TestClaimInboundFencesDuplicateWorkAndStoresResultBeforeDelivery(t *testing
 	assert.Equal(t, "replied", replay.Message.Status)
 }
 
+// A regression here shortens a gateway handoff lease and lets recovery send
+// the same stored reply while the original caller may still be awaiting it.
+func TestDeliveryLeasesRemainThirtySecondsForStoreAndReadyClaim(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000807", "Inbound delivery lease")
+	repo := repository.NewInboundMessageRepository(pool)
+	m := &repository.InboundMessage{MessageID: "wamid.delivery-lease", Chat: "628111000807@s.whatsapp.net", FromJID: "628111000807@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+
+	delivery := storeResult(t, ctx, repo, claimWork(t, ctx, repo, m).Lease, nil)
+	stored, err := repo.Get(ctx, m.MessageID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.LeaseUntil)
+	assert.WithinDuration(t, time.Now().Add(30*time.Second), *stored.LeaseUntil, 2*time.Second)
+
+	require.NoError(t, repo.RescheduleInbound(ctx, delivery, "reply_transport_timeout"))
+	_, err = pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+	require.NoError(t, err)
+	claim, err := repo.ClaimInbound(ctx, m)
+	require.NoError(t, err)
+	require.Equal(t, repository.InboundClaimDelivery, claim.Kind)
+	stored, err = repo.Get(ctx, m.MessageID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.LeaseUntil)
+	assert.WithinDuration(t, time.Now().Add(30*time.Second), *stored.LeaseUntil, 2*time.Second)
+}
+
 // A regression here either retries a held message too early, misses due work,
 // or makes recovery order nondeterministic under a bounded startup drain.
 func TestListDueInboundIsOldestFirstBoundedAndExcludesLeasedRows(t *testing.T) {
@@ -216,6 +242,8 @@ func TestSupersedeEquivalentTextOnlyStopsStalledRows(t *testing.T) {
 	oldWork := claimWork(t, ctx, repo, old)
 	_, err := repo.ReleaseInboundWork(ctx, oldWork.Lease, nil, "work_timeout")
 	require.NoError(t, err)
+	_, err = pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, old.MessageID)
+	require.NoError(t, err)
 	newer := makeMessage("wamid.replied", "kopi 25k")
 	newerDelivery := storeResult(t, ctx, repo, claimWork(t, ctx, repo, newer).Lease, nil)
 	require.NoError(t, repo.MarkInboundReplied(ctx, newerDelivery))
@@ -246,4 +274,58 @@ func TestTerminalInboundRowsAreNeverClaimed(t *testing.T) {
 	assert.Equal(t, repository.InboundClaimReplay, claim.Kind)
 	assert.Equal(t, "dropped", claim.Message.Status)
 	require.Nil(t, claim.Lease, "terminal claims never carry a lease")
+}
+
+// A crash after the third work lease must not reopen ledger work. The next
+// claimant receives only the final-result path, with the original ids intact.
+func TestExpiredThirdWorkLeaseReturnsIncompleteResultPath(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000808", "Inbound third crash")
+	repo := repository.NewInboundMessageRepository(pool)
+	m := &repository.InboundMessage{MessageID: "wamid.third-crash", Chat: "628111000808@s.whatsapp.net", FromJID: "628111000808@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+
+	work := claimWork(t, ctx, repo, m)
+	for attempt := 2; attempt <= 3; attempt++ {
+		_, err := pool.Exec(context.Background(), `UPDATE inbound_messages SET lease_until = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+		require.NoError(t, err)
+		work = claimWork(t, ctx, repo, m)
+	}
+	require.NotNil(t, work.Lease)
+	_, err := pool.Exec(context.Background(), `UPDATE inbound_messages SET lease_until = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+	require.NoError(t, err)
+
+	claim, err := repo.ClaimInbound(ctx, m)
+	require.NoError(t, err)
+	assert.Equal(t, "incomplete", string(claim.Kind))
+	require.NotNil(t, claim.Lease)
+	stored, err := repo.Get(ctx, m.MessageID)
+	require.NoError(t, err)
+	assert.Equal(t, 3, stored.WorkAttempts)
+	assert.Equal(t, "processing", stored.Status)
+}
+
+// A newer equivalent reply can suppress stale recovery, never a row that a
+// worker still owns. The public helper must enforce the same guard directly.
+func TestSupersedeEquivalentTextLeavesActiveLeaseUntouched(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000809", "Inbound active supersede")
+	repo := repository.NewInboundMessageRepository(pool)
+	makeMessage := func(id string) *repository.InboundMessage {
+		return &repository.InboundMessage{MessageID: id, Chat: "628111000809@s.whatsapp.net", FromJID: "628111000809@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+	}
+	old := makeMessage("wamid.active-stalled")
+	claimWork(t, ctx, repo, old)
+	newer := makeMessage("wamid.active-replied")
+	delivery := storeResult(t, ctx, repo, claimWork(t, ctx, repo, newer).Lease, nil)
+	require.NoError(t, repo.MarkInboundReplied(ctx, delivery))
+
+	superseded, err := repo.SupersedeEquivalentText(ctx, old.MessageID)
+	require.NoError(t, err)
+	assert.False(t, superseded)
+	stored, err := repo.Get(ctx, old.MessageID)
+	require.NoError(t, err)
+	assert.Equal(t, "processing", stored.Status)
+	claim, err := repo.ClaimInbound(ctx, old)
+	require.NoError(t, err)
+	assert.Equal(t, repository.InboundClaimBusy, claim.Kind)
 }
