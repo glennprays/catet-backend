@@ -22,7 +22,17 @@ import (
 
 // receiptHoldLines caps how much of a long receipt the chat reply shows;
 // the rest is one "and N more" line and the dashboard's problem.
-const receiptHoldLines = 6
+const (
+	receiptHoldLines         = 6
+	receiptPendingActionKind = "receipt"
+)
+
+// receiptPendingExternalID is separate from receipt line external IDs:
+// accepting a photo only parks one draft, so retries must reuse that draft
+// before the user confirms it.
+func receiptPendingExternalID(messageID string) string {
+	return messageID + "#" + receiptPendingActionKind
+}
 
 // photo turns one inbound picture into a parked receipt draft. A photo
 // never writes: the printed total becomes N ledger lines only after the
@@ -177,11 +187,16 @@ func (h *Harness) readPhoto(
 	}
 
 	summary := tmpl.Render(lang, "receipt_summary", receiptSummaryData(params, lang))
-	raw, err := jsonParams(params)
+	raw, err := jsonParams(struct {
+		*receiptParams
+		ExternalID string `json:"external_id"`
+	}{receiptParams: params, ExternalID: receiptPendingExternalID(p.MessageId)})
 	if err != nil {
 		return "", nil, "", err
 	}
-	action, err := h.pending.Create(ctx, "receipt", raw, summary)
+	action, err := h.pending.FindOrCreateByExternalID(
+		ctx, receiptPendingActionKind, receiptPendingExternalID(p.MessageId), raw, summary,
+	)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("park receipt: %w", err)
 	}

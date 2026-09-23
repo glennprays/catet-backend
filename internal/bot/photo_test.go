@@ -355,6 +355,69 @@ func TestPhotoFailedReplyStaysReadyAfterParkingReceipt(t *testing.T) {
 	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
 }
 
+
+// A receipt Hold is committed before the inbound reply result. If result
+// storage fails, retrying the same delivery must recover the original Hold
+// rather than creating a second dashboard action.
+func TestPhotoResultStoreFailureReusesReceiptHold(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_receipt_result_store() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.status = 'ready' AND OLD.status = 'processing' THEN
+				RAISE EXCEPTION 'forced receipt result-store failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_receipt_result_store_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_receipt_result_store();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_receipt_result_store_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_receipt_result_store();
+		`)
+	})
+
+	f.sendPhoto(t, "m-receipt-crash", url, size, "")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "the Hold is committed before result storage")
+	first := open[0]
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(first.Params, &params))
+	assert.Equal(t, "m-receipt-crash#receipt", params["external_id"])
+	row, err := f.inbound.Get(f.ctx, "m-receipt-crash")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "processing", row.Status)
+	assert.Empty(t, f.sender.all(), "result-store failure sends no reply")
+
+	_, err = f.pool.Exec(f.ctx, `
+		DROP TRIGGER IF EXISTS test_fail_receipt_result_store_trigger ON inbound_messages;
+		DROP FUNCTION IF EXISTS test_fail_receipt_result_store();
+		UPDATE inbound_messages
+		SET next_attempt_at = now() - interval '1 second'
+		WHERE message_id = 'm-receipt-crash'
+	`)
+	require.NoError(t, err)
+
+	f.sendPhoto(t, "m-receipt-crash", url, size, "")
+
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "retry reuses the receipt Hold")
+	assert.Equal(t, first.ID, open[0].ID)
+	assert.Empty(t, f.live(t), "receipt retries never write ledger money")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "reply:m-receipt-crash", sent[0].IdempotencyKey)
+}
 func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 
