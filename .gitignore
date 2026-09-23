@@ -31,3 +31,4 @@ go.work.sum
 /catet
 /main
 /tmp/
+/.worktrees/

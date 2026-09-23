@@ -27,19 +27,25 @@ type scriptedLLM struct {
 	category string
 	source   string
 	merchant string
-	calls    map[string]int
-	prompts  []string
+	block         chan struct{}
+	calls         map[string]int
+	prompts       []string
+	deadline      time.Duration
+	cancellations map[string]int
 }
 
 func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
+	return newScriptedLLMWithTimeout(t, 2*time.Second)
+}
+
+func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLLM, *llm.Client) {
 	t.Helper()
 	s := &scriptedLLM{
-		category: `{"category_id":null,"confidence":0}`,
-		source:   `{"source_id":null}`,
-		// Default: the model returns the phrase untouched, so a test that
-		// is not about naming reads exactly what it typed.
-		merchant: `{"merchant_id":null,"name":"","confidence":0}`,
-		calls:    map[string]int{},
+		category:  `{"category_id":null,"confidence":0}`,
+		source:    `{"source_id":null}`,
+		merchant:  `{"merchant_id":null,"name":"","confidence":0}`,
+		calls:         map[string]int{},
+		cancellations: map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -50,34 +56,53 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Len(t, body.Messages, 2)
 
-		s.mu.Lock()
-		kind := "unknown"
-		switch {
-		case strings.Contains(body.Messages[0].Content, "(intent)"):
-			kind = "intent"
-		case strings.Contains(body.Messages[0].Content, "(category_pick)"):
-			kind = "category_pick"
-		case strings.Contains(body.Messages[0].Content, "(source_pick)"):
-			kind = "source_pick"
-		case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
-			kind = "merchant_pick"
-		}
-		s.calls[kind]++
-		s.prompts = append(s.prompts, body.Messages[1].Content)
-		content := map[string]string{
-			"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
-			"merchant_pick": s.merchant,
-		}[kind]
-		s.mu.Unlock()
+	s.mu.Lock()
+	kind := "unknown"
+	switch {
+	case strings.Contains(body.Messages[0].Content, "(intent)"):
+		kind = "intent"
+	case strings.Contains(body.Messages[0].Content, "(category_pick)"):
+		kind = "category_pick"
+	case strings.Contains(body.Messages[0].Content, "(source_pick)"):
+		kind = "source_pick"
+	case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
+		kind = "merchant_pick"
+	}
+	s.calls[kind]++
+	s.prompts = append(s.prompts, body.Messages[1].Content)
+	content := map[string]string{
+		"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
+		"merchant_pick": s.merchant,
+	}[kind]
+	gate := s.block
+	if deadline, ok := r.Context().Deadline(); ok {
+		s.deadline = deadline.Sub(time.Now())
+	}
+	s.mu.Unlock()
 
-		require.NotEmpty(t, content, "no script for %s prompt", kind)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
-		})
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			s.mu.Lock()
+			s.cancellations[kind]++
+			s.mu.Unlock()
+			return
+		}
+	}
+	require.NotEmpty(t, content, "no script for %s prompt", kind)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+	})
 	}))
 	t.Cleanup(srv.Close)
-	return s, llm.New(srv.URL, "test-key", "test-model", 2*time.Second)
+	return s, llm.New(srv.URL, "test-key", "test-model", timeout)
+}
+func (s *scriptedLLM) blockCalls() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.block = make(chan struct{})
 }
 
 func (s *scriptedLLM) setIntent(body string) {
@@ -102,6 +127,18 @@ func (s *scriptedLLM) callsOf(kind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls[kind]
+}
+
+func (s *scriptedLLM) requestDeadline() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deadline
+}
+
+func (s *scriptedLLM) cancellationsOf(kind string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancellations[kind]
 }
 
 func (s *scriptedLLM) lastPrompt() string {
@@ -446,6 +483,27 @@ func TestFollowUpSettlesSourceAndDate(t *testing.T) {
 	label := want.Format("2") + " " + idMonthAbbr[int(want.Month())-1]
 	assert.Contains(t, f.sender.last(), label, "a backdated write says which day")
 	assert.Equal(t, 0, script.callsOf("intent"), "the rules explained the whole message")
+}
+
+func TestIntentPartialLaterDraftUsesSharedFooter(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setIntent(`{"intent":"capture","drafts":[
+		{"type":"expense","merchant":"teh itu","amount_text":"5k","source_id":"` + f.bca.ID.String() + `","destination_source_id":null,"category_id":null,"occurred_date":null}
+	],"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`)
+
+	// "itu" forces the intent path. The model returns only the later line,
+	// and even claims BCA; neither may inherit the first line's DANA hint or
+	// bypass the shared BRI footer.
+	f.say(t, "m1", "kopi 10k pakai dana\nteh 5k itu\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	assert.Equal(t, int64(5_000), txs[0].AmountMinor)
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
+	require.NotNil(t, txs[0].Merchant)
+	assert.Equal(t, "Teh Itu", *txs[0].Merchant)
+	assert.Equal(t, 1, script.callsOf("intent"))
 }
 
 // A date the ledger must not take is refused out loud, and the draft

@@ -28,6 +28,7 @@ var names = []string{
 	"recorded_income",
 	"recorded_transfer",
 	"recorded_many",
+	"capture_incomplete",
 	"uncategorized",
 	"hold_saved",
 	"hold_to_dashboard",

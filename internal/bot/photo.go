@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -22,24 +23,28 @@ import (
 
 // receiptHoldLines caps how much of a long receipt the chat reply shows;
 // the rest is one "and N more" line and the dashboard's problem.
-const receiptHoldLines = 6
+const (
+	receiptHoldLines         = 6
+	receiptPendingActionKind = "receipt"
+)
+
+// receiptPendingExternalID is separate from receipt line external IDs:
+// accepting a photo only parks one draft, so retries must reuse that draft
+// before the user confirms it.
+func receiptPendingExternalID(messageID string) string {
+	return messageID + "#" + receiptPendingActionKind
+}
 
 // photo turns one inbound picture into a parked receipt draft. A photo
 // never writes: the printed total becomes N ledger lines only after the
 // user confirms, in chat or in the dashboard (spec §6). Money comes from
 // the printed TOTAL line and nothing else.
 //
-// Process already stamped 👀 and started typing; photo() only owns the
-// outcome, because reading a receipt is slow enough that the emoji is
-// the whole status display.
+// Process stamps 👀 before work and the harness stamps the persisted
+// outcome after successful delivery, so photo() has no delivery side effects.
 func (h *Harness) photo(ctx context.Context, p *waga.IncomingWebhookPayload, lang string) (string, []uuid.UUID, string, error) {
-	reply, ids, emoji, err := h.readPhoto(ctx, p, lang)
-	if err != nil {
-		h.react(ctx, p.Chat, p.MessageId, p.From, reactRejected)
-		return "", nil, lang, err
-	}
-	h.react(ctx, p.Chat, p.MessageId, p.From, emoji)
-	return reply, ids, lang, nil
+	reply, ids, _, err := h.readPhoto(ctx, p, lang)
+	return reply, ids, lang, err
 }
 
 // readPhoto is the pipeline itself; it returns the reaction that
@@ -62,6 +67,13 @@ func (h *Harness) readPhoto(
 		default:
 			return tmpl.Render(lang, "photo_unreadable", map[string]any{"Issue": "download"}), nil, reactRejected, nil
 		}
+	}
+	// The bytes' own fingerprint is durable as soon as download has
+	// succeeded, before duplicate checks or vision. A vision failure
+	// must still leave the exact fetched media addressable for recovery.
+	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
+		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
+		return "", nil, "", fmt.Errorf("media_hash_persist_failed")
 	}
 
 	prev, err := h.inbound.FindRepliedByMediaSha256(ctx, sha, time.Now().UTC().Add(-photoDuplicateWindow))
@@ -96,14 +108,6 @@ func (h *Harness) readPhoto(
 		return tmpl.Render(lang, "error_generic", nil), nil, reactRejected, nil
 	}
 
-	// The bytes' own fingerprint: a forwarded duplicate must replay the
-	// earlier answer instead of paying for a second vision call.
-	// Recorded only once the model answered: a read that failed on our
-	// side must be retryable, not replayed as "already sent".
-	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
-		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
-	}
-
 	h.log.Info(traceOf(ctx), "photo read", map[string]any{
 		"merchant": read.Merchant, "total_minor": read.TotalMinor, "items": len(read.Items),
 		"legible": read.Legible, "document_type": read.DocumentType,
@@ -130,7 +134,7 @@ func (h *Harness) readPhoto(
 	// The paper's spelling of the shop becomes the same canonical
 	// merchant a typed capture would produce, so memory, analytics and
 	// the reply all agree on one name.
-	if m, err := h.merchants.Resolve(ctx, params.Merchant, ""); err != nil {
+	if m, err := h.merchants.ResolveWithModelContext(ctx, enrichmentContext(ctx), params.Merchant, ""); err != nil {
 		h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
 	} else if m != nil {
 		params.MerchantID = &m.ID
@@ -184,13 +188,30 @@ func (h *Harness) readPhoto(
 	}
 
 	summary := tmpl.Render(lang, "receipt_summary", receiptSummaryData(params, lang))
-	raw, err := jsonParams(params)
+	raw, err := jsonParams(struct {
+		*receiptParams
+		ExternalID string `json:"external_id"`
+	}{receiptParams: params, ExternalID: receiptPendingExternalID(p.MessageId)})
 	if err != nil {
 		return "", nil, "", err
 	}
-	action, err := h.pending.Create(ctx, "receipt", raw, summary)
+	action, err := h.pending.FindOrCreateByExternalID(
+		ctx, receiptPendingActionKind, receiptPendingExternalID(p.MessageId), raw, summary,
+	)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("park receipt: %w", err)
+	}
+	if len(action.Params) > 0 {
+		var stored receiptParams
+		if err := json.Unmarshal(action.Params, &stored); err == nil && stored.MessageID != "" {
+			// A durable retry must show and confirm the exact draft that
+			// created the action, never a changed vision/caption result.
+			params = &stored
+			summary = action.Summary
+		}
+	}
+	if action.ResolvedAt != nil {
+		return tmpl.Render(lang, "no_open_question", nil), nil, reactNone, nil
 	}
 
 	state, err := h.chats.Get(ctx, p.Chat)

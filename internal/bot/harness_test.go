@@ -3,6 +3,7 @@ package bot_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -47,18 +48,28 @@ type reaction struct {
 // calling the gateway. lid is what the gateway would answer for a
 // contact lookup; "" means it knows no lid for that number.
 type fakeSender struct {
-	mu     sync.Mutex
-	sent   []sentMessage
-	reacts []reaction
-	typing []bool
-	lid    string
+	mu      sync.Mutex
+	sent    []sentMessage
+	reacts  []reaction
+	typing  []bool
+	lid     string
+	sendErr error
 }
 
 func (f *fakeSender) SendText(_ context.Context, chat, text, key string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return "", f.sendErr
+	}
 	f.sent = append(f.sent, sentMessage{Chat: chat, Text: text, IdempotencyKey: key})
 	return uuid.NewString(), nil
+}
+
+func (f *fakeSender) setSendError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendErr = err
 }
 
 func (f *fakeSender) React(_ context.Context, _, messageID, _, emoji string) error {
@@ -330,6 +341,260 @@ func TestCaptureWritesExpenseAndReplaysDuplicate(t *testing.T) {
 	assert.Equal(t, "reply:m1", sent[1].IdempotencyKey)
 }
 
+func TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		merchants []string
+		amounts   []int64
+	}{
+		{
+			name:      "bare source footer",
+			input:     "sarapan bubur ayam 16k\ncilok 10k\nBRI",
+			merchants: []string{"Sarapan Bubur Ayam", "Cilok"},
+			amounts:   []int64{16_000, 10_000},
+		},
+		{
+			name:      "dari source footer",
+			input:     "nasi daun jeruk 22k\nes podeng 12k\nDari bri",
+			merchants: []string{"Nasi Daun Jeruk", "Es Podeng"},
+			amounts:   []int64{22_000, 12_000},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeVisionLLM{
+				receipt:  func() string { return "" },
+				sourceID: func() uuid.UUID { return uuid.Nil },
+				intent:   func() string { return unknownIntent },
+			}
+			llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+			t.Cleanup(llmServer.Close)
+			f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+			f.say(t, "m1", tc.input)
+
+			txs := f.live(t)
+			require.Len(t, txs, 2)
+			for i, tx := range txs {
+				assert.Equal(t, tc.amounts[i], tx.AmountMinor)
+				require.NotNil(t, tx.Merchant)
+				assert.Equal(t, tc.merchants[i], *tx.Merchant)
+				require.NotNil(t, tx.ExternalID)
+				assert.Equal(t, fmt.Sprintf("m1#%d", i+1), *tx.ExternalID)
+				assert.Equal(t, f.bri.ID, legSourceID(t, tx.Legs))
+			}
+			assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			assert.Empty(t, open)
+			assert.Zero(t, fake.intents(), "a unique trailing BRI Source is deterministic")
+			assert.Zero(t, fake.sourcePicks(), "a trailing BRI footer is never repaired by source AI")
+		})
+	}
+}
+func TestUnknownOrAmbiguousBatchFooterHoldsEveryLine(t *testing.T) {
+	tests := []struct {
+		name      string
+		footer    string
+		ambiguous bool
+	}{
+		{name: "unknown", footer: "NotARealSource"},
+		{name: "ambiguous", footer: "wallet", ambiguous: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeVisionLLM{
+				receipt:  func() string { return "" },
+				sourceID: func() uuid.UUID { return uuid.Nil },
+				intent:   func() string { return unknownIntent },
+			}
+			llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+			t.Cleanup(llmServer.Close)
+			f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+			if tc.ambiguous {
+				f.source(t, "Wallet One", "bank", false)
+				f.source(t, "Wallet Two", "bank", false)
+			}
+
+			f.say(t, "m1", "kopi 10k\nteh 5k\n"+tc.footer)
+
+			assert.Empty(t, f.live(t))
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			require.Len(t, open, 2)
+			for _, action := range open {
+				var params map[string]any
+				require.NoError(t, json.Unmarshal(action.Params, &params))
+				assert.Equal(t, []any{"source"}, params["missing"])
+				assert.Nil(t, params["source_id"])
+			}
+			assert.Zero(t, fake.intents(), "a structural batch footer must not invoke intent")
+			assert.Zero(t, fake.sourcePicks(), "a shared footer is never repaired by source AI")
+		})
+	}
+}
+
+
+func TestBatchFooterDoesNotOverrideExplicitLineSource(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+	f.say(t, "m1", "kopi 10k pakai DANA\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.dana.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	assert.Zero(t, fake.intents())
+	assert.Zero(t, fake.sourcePicks())
+}
+
+func TestRefundFromClauseDoesNotOverrideBatchFooter(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+
+	f.say(t, "prior", "gojek 10k pakai BRI")
+	f.say(t, "m1", "refund gojek 10k dari alfamart\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	t.Logf("pending=%+v", open)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "BRI", params["source_name"])
+	assert.Zero(t, fake.intents())
+}
+
+func TestIntentBatchPreservesParserSourceAndFooter(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+	fake.intent = func() string {
+		return fmt.Sprintf(`{"intent":"capture","drafts":[
+			{"type":"expense","merchant":"kopi","amount_text":"10k","source_id":%q},
+			{"type":"expense","merchant":"teh","amount_text":"5k","source_id":%q}],
+			"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`,
+			f.bca.ID, f.bca.ID)
+	}
+
+	f.say(t, "m1", "itu kopi 10k pakai DANA\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.dana.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	assert.Equal(t, 1, fake.intents())
+}
+
+
+func TestFailedTextReplyStaysReadyAndRetriesStoredReply(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, "ready", row.Status)
+	require.NotNil(t, row.ReplyText)
+	assert.Len(t, row.TransactionIDs, 2)
+	assert.Empty(t, f.sender.all(), "a failed delivery was not accepted by the gateway")
+	assert.Len(t, f.live(t), 2)
+
+	f.sender.setSendError(nil)
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+	assert.Empty(t, f.sender.all(), "a not-yet-due ready delivery cannot be retried immediately")
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
+	f.say(t, "m1", "kopi 25k pakai cash, gojek 18k pakai gopay")
+
+	assert.Len(t, f.live(t), 2, "delivery recovery never reruns the ledger")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, *row.ReplyText, sent[0].Text)
+	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
+}
+
+func TestFailedInformationalReplyClearsReactionOnRecovery(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.say(t, "m1", "rekap")
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "ready", row.Status)
+	assert.Equal(t, []string{"👀"}, f.sender.reactionsOn("m1"))
+
+	f.sender.setSendError(nil)
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
+	f.say(t, "m1", "rekap")
+
+	assert.Equal(t, []string{"👀", ""}, f.sender.reactionsOn("m1"))
+	row, err = f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	assert.Equal(t, "replied", row.Status)
+}
+
+
+func TestUnknownSenderDropsDueExistingLeaseWithoutOutbound(t *testing.T) {
+	f := newBotFixture(t, nil)
+	const messageID = "m-unknown-recovery"
+	owner := ownerPhone[1:] + "@s.whatsapp.net"
+	claim, err := f.inbound.ClaimInbound(f.ctx, &repository.InboundMessage{
+		MessageID: messageID, Chat: owner, FromJID: owner, UserID: &f.userID,
+		OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text",
+	})
+	require.NoError(t, err)
+	require.Equal(t, repository.InboundClaimWork, claim.Kind)
+	_, err = f.pool.Exec(f.ctx, `UPDATE inbound_messages
+		SET next_attempt_at = now() - interval '1 second', lease_until = now() - interval '1 second'
+		WHERE message_id = $1`, messageID)
+	require.NoError(t, err)
+
+	require.NoError(t, f.harness.Process(f.ctx, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming, Chat: owner,
+		From: "628999999999:1@s.whatsapp.net", MessageId: messageID,
+		Timestamp: time.Now().Unix(), Text: "kopi 25k", Type: waga.IncomingMessageTypeText,
+	}))
+
+	row, err := f.inbound.Get(f.ctx, messageID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "dropped", row.Status)
+	assert.Nil(t, row.LeaseUntil)
+	assert.Empty(t, f.sender.all())
+}
 func TestBatchCaptureThenBatalOneItem(t *testing.T) {
 	f := newBotFixture(t, nil)
 
@@ -533,6 +798,26 @@ func TestNonPhotoMediaIsRefusedPolitely(t *testing.T) {
 	assert.Empty(t, f.live(t))
 	assert.Contains(t, f.sender.last(), "Kirim sebagai foto ya")
 }
+func TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction(t *testing.T) {
+	f := newBotFixture(t, nil)
+
+	f.deliver(t, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming,
+		Chat:  ownerPhone[1:] + "@s.whatsapp.net", From: ownerPhone[1:] + ":1@s.whatsapp.net",
+		MessageId: "m1", Timestamp: time.Now().Unix(),
+		Type:      waga.IncomingMessageTypeImage,
+	})
+
+	assert.Contains(t, f.sender.last(), "Kirim sebagai foto ya")
+	assert.Equal(t, []string{"👀", "❌"}, f.sender.reactionsOn("m1"))
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+}
+
 
 // WhatsApp may address an account by an opaque lid instead of its phone
 // number; the stored lid is what makes that the same person.
@@ -791,4 +1076,324 @@ func TestTwoUsersLedgersAreIsolated(t *testing.T) {
 	recap := f.sender.last()
 	assert.Contains(t, recap, "Bakso", "the second account's own merchant is missing: %q", recap)
 	assert.NotContains(t, recap, "kopi", "another account's merchant leaked into the recap")
+}
+// A replay that collides on one line adopts the stored transaction so the
+// combined reply remains complete and ordered instead of silently dropping it.
+func TestCaptureConflictAdoptsExistingLine(t *testing.T) {
+	f := newBotFixture(t, nil)
+	merchant := "Nasi"
+	externalID := "m1#1"
+	occurred := service.JakartaNow()
+	existingID := uuid.New()
+	require.NoError(t, func() error {
+		_, err := f.txRepo.Insert(f.ctx, &entity.Transaction{
+			ID: existingID, OccurredAt: occurred, Origin: "whatsapp_text",
+			Type: "expense", Merchant: &merchant, AmountMinor: 22_000,
+			ReviewStatus: "needs_review", ExternalID: &externalID,
+			Legs: []entity.Leg{
+				{ID: uuid.New(), TransactionID: existingID, SourceID: &f.bri.ID, SignedAmount: -22_000},
+				{ID: uuid.New(), TransactionID: existingID, CategoryID: &f.makanan.ID, SignedAmount: 22_000},
+			},
+		})
+		return err
+	}())
+
+	f.say(t, "m1", "nasi 22k BRI\nes 12k BRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	require.NotNil(t, txs[0].ExternalID)
+	require.NotNil(t, txs[1].ExternalID)
+	assert.Equal(t, "m1#1", *txs[0].ExternalID)
+	assert.Equal(t, "m1#2", *txs[1].ExternalID)
+	assert.Equal(t, existingID, txs[0].ID)
+	assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+}
+
+// A retryable failure after line one must retain that line's id so the
+// durable worker can report it without manufacturing the failed line.
+func TestCapturePostWriteFailurePreservesPartialIDs(t *testing.T) {
+	f := newBotFixture(t, nil)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_capture_fail_line() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.external_id = 'm-partial#2' THEN
+				RAISE EXCEPTION 'forced capture failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_capture_fail_line_trigger
+		BEFORE INSERT ON transactions
+		FOR EACH ROW EXECUTE FUNCTION test_capture_fail_line();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_capture_fail_line_trigger ON transactions;
+			DROP FUNCTION IF EXISTS test_capture_fail_line();
+		`)
+	})
+
+	f.say(t, "m-partial", "nasi 22k BRI\nes 12k BRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	var ids []uuid.UUID
+	var status string
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT status, transaction_ids FROM inbound_messages WHERE message_id = $1`,
+		"m-partial").Scan(&status, &ids))
+	assert.NotEmpty(t, ids, "the written line must survive the failed second write")
+	assert.Equal(t, txs[0].ID, ids[0])
+	assert.NotEqual(t, "👀", f.sender.last())
+	for range 2 {
+		_, err = f.pool.Exec(f.ctx, `
+			UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+			WHERE message_id = 'm-partial'
+		`)
+		require.NoError(t, err)
+		f.say(t, "m-partial", "nasi 22k BRI\nes 12k BRI")
+	}
+	assert.Len(t, f.live(t), 1, "exhausted retry never duplicates the written line")
+	assert.Contains(t, f.sender.last(), "belum lengkap")
+	row, err := f.inbound.Get(f.ctx, "m-partial")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Len(t, row.TransactionIDs, 1)
+}
+
+func TestCaptureRetryDoesNotDuplicateHoldAction(t *testing.T) {
+	f := newBotFixture(t, nil)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_capture_fail_after_hold() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.external_id = 'm-hold#3' THEN
+				RAISE EXCEPTION 'forced capture failure after hold';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_capture_fail_after_hold_trigger
+		BEFORE INSERT ON transactions
+		FOR EACH ROW EXECUTE FUNCTION test_capture_fail_after_hold();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_capture_fail_after_hold_trigger ON transactions;
+			DROP FUNCTION IF EXISTS test_capture_fail_after_hold();
+		`)
+	})
+
+	f.say(t, "m-hold", "kopi 10k pakai DANA\ntissu 5k\nroti 7k pakai BRI")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "m-hold#2", params["external_id"])
+	assert.Len(t, f.live(t), 1)
+
+	for range 2 {
+		_, err = f.pool.Exec(f.ctx, `
+			UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+			WHERE message_id = 'm-hold'
+		`)
+		require.NoError(t, err)
+		f.say(t, "m-hold", "kopi 10k pakai DANA\ntissu 5k\nroti 7k pakai BRI")
+	}
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Len(t, open, 1, "retry reuses the existing line hold")
+	assert.Len(t, f.live(t), 1, "failed line is never synthesized")
+}
+
+func TestCaptureDisplayNumbersStayContiguousAfterHold(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.say(t, "prior", "gojek 18k pakai cash")
+	f.say(t, "m-sparse", "refund gojek 18k\nkopi 10k pakai cash\ngojek 5k pakai cash")
+
+	txs := f.live(t)
+	var batch []entity.Transaction
+	for _, tx := range txs {
+		if tx.ExternalID != nil && strings.HasPrefix(*tx.ExternalID, "m-sparse#") {
+			batch = append(batch, tx)
+		}
+	}
+	require.Len(t, batch, 2)
+	require.NotNil(t, batch[0].ExternalID)
+	require.NotNil(t, batch[1].ExternalID)
+	assert.Equal(t, "m-sparse#2", *batch[0].ExternalID)
+	assert.Equal(t, "m-sparse#3", *batch[1].ExternalID)
+	assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+
+	f.say(t, "m-cancel", "batal 1")
+	txs = f.live(t)
+	var reversed int
+	for _, tx := range txs {
+		if tx.ReversesTransactionID != nil {
+			reversed++
+			target, err := f.txRepo.Get(f.ctx, *tx.ReversesTransactionID)
+			require.NoError(t, err)
+			require.NotNil(t, target.ExternalID)
+			assert.Equal(t, "m-sparse#2", *target.ExternalID)
+		}
+	}
+	assert.Equal(t, 1, reversed, "display item 1 maps to the first written line")
+}
+
+func TestCaptureResolvedOrDiscardedHoldIsNotRecreated(t *testing.T) {
+	for _, actionName := range []string{"confirm", "discard"} {
+		t.Run(actionName, func(t *testing.T) {
+			f := newBotFixture(t, nil)
+			params := json.RawMessage(`{"message_id":"m-resolved","external_id":"m-resolved#1","missing":["source"]}`)
+			action, err := f.pending.Create(f.ctx, "capture", params, "tissu 20k")
+			require.NoError(t, err)
+			_, err = f.pending.Resolve(f.ctx, action.ID, actionName)
+			require.NoError(t, err)
+
+			f.say(t, "m-resolved", "tissu 20k")
+			assert.NotEmpty(t, f.sender.last())
+			assert.NotContains(t, f.sender.last(), "dashboard")
+			var count int
+			require.NoError(t, f.pool.QueryRow(f.ctx,
+				`SELECT COUNT(*) FROM pending_actions WHERE kind = 'capture'
+				 AND params->>'external_id' = 'm-resolved#1'`,
+			).Scan(&count))
+			assert.Equal(t, 1, count)
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			assert.Empty(t, open)
+			assert.Empty(t, f.live(t))
+		})
+	}
+}
+
+func TestRefundResolvedActionReplaysSafely(t *testing.T) {
+	for _, actionName := range []string{"confirm", "discard"} {
+		t.Run(actionName, func(t *testing.T) {
+			f := newBotFixture(t, nil)
+			f.say(t, "prior-refund", "gojek 18k pakai cash")
+			f.say(t, "m-refund", "refund gojek 18k")
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			require.Len(t, open, 1)
+			_, err = f.pending.Resolve(f.ctx, open[0].ID, actionName)
+			require.NoError(t, err)
+
+			chat := ownerPhone[1:] + "@s.whatsapp.net"
+			_, err = f.pool.Exec(f.ctx, `
+				UPDATE bot_chat_state
+				SET open_pending_action_id = NULL, open_expect = NULL
+				WHERE chat = $1
+			`, chat)
+			require.NoError(t, err)
+			_, err = f.pool.Exec(f.ctx, `
+				UPDATE inbound_messages
+				SET status = 'processing', lease_until = NULL,
+					next_attempt_at = now() - interval '1 second'
+				WHERE message_id = 'm-refund'
+			`)
+			require.NoError(t, err)
+
+			f.say(t, "m-refund", "refund gojek 18k")
+
+			assert.NotEmpty(t, f.sender.last())
+			assert.Contains(t, f.sender.last(), "Nggak ada yang lagi nunggu")
+			var count int
+			require.NoError(t, f.pool.QueryRow(f.ctx,
+				`SELECT COUNT(*) FROM pending_actions
+				 WHERE kind = 'refund' AND params->>'external_id' = 'm-refund#1'`,
+			).Scan(&count))
+			assert.Equal(t, 1, count)
+			assert.Len(t, f.live(t), 1, "a terminal refund action never writes a second reversal")
+		})
+	}
+}
+
+func TestRefundRetryAfterVoidedReversalWritesNewLiveReversal(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.say(t, "prior-voided-refund", "gojek 18k pakai cash")
+	original := f.live(t)[0]
+	f.say(t, "m-voided-refund", "refund gojek 18k")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+
+	first, err := f.harness.Execute(f.ctx, &open[0], nil)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.NoError(t, err)
+	require.NotNil(t, first[0].ReversesTransactionID)
+	require.Equal(t, original.ID, *first[0].ReversesTransactionID)
+	ok, err := f.txRepo.SetVoided(f.ctx, first[0].ID, time.Now().UTC())
+	require.NoError(t, err)
+	require.True(t, ok)
+	loaded, err := f.txRepo.Get(f.ctx, original.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	liveReversal, err := f.txRepo.GetReversalByOriginalID(f.ctx, original.ID)
+	require.NoError(t, err)
+	require.Nil(t, liveReversal)
+	_, err = f.pool.Exec(f.ctx, `UPDATE pending_actions SET action = NULL, resolved_at = NULL WHERE id = $1`, open[0].ID)
+	require.NoError(t, err)
+	second, err := f.harness.Execute(f.ctx, &open[0], nil)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.NotEqual(t, first[0].ID, second[0].ID)
+
+	var all, live int
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM transactions
+		 WHERE reverses_transaction_id = $1`, original.ID).Scan(&all))
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM transactions
+		 WHERE reverses_transaction_id = $1 AND voided_at IS NULL`, original.ID).Scan(&live))
+	assert.Equal(t, 2, all)
+	assert.Equal(t, 1, live)
+}
+
+func TestPendingActionExternalIDCreationIsAtomic(t *testing.T) {
+	f := newBotFixture(t, nil)
+	ctx := f.ctx
+	params := json.RawMessage(`{"message_id":"m-concurrent","external_id":"m-concurrent#1","missing":["source"]}`)
+	const workers = 8
+	results := make(chan *entity.PendingAction, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			action, err := f.pending.FindOrCreateByExternalID(ctx, "capture", "m-concurrent#1", params, "tissu 20k")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- action
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	var first uuid.UUID
+	for action := range results {
+		if first == uuid.Nil {
+			first = action.ID
+		}
+		assert.Equal(t, first, action.ID)
+	}
+	var count int
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM pending_actions
+		 WHERE kind = 'capture' AND params->>'external_id' = 'm-concurrent#1'`,
+	).Scan(&count))
+	assert.Equal(t, 1, count)
 }

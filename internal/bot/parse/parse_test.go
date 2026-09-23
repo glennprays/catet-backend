@@ -62,6 +62,24 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
+			name:  "physical lines with a bare source footer are two expenses",
+			input: "sarapan bubur ayam 16k\ncilok 10k\nBRI",
+			lang:  "id",
+			drafts: []wantDraft{
+				{typ: "expense", amount: 16_000, merchant: "sarapan bubur ayam", lang: "id"},
+				{typ: "expense", amount: 10_000, merchant: "cilok", lang: "id"},
+			},
+		},
+		{
+			name:  "physical lines with a dari source footer are two expenses",
+			input: "nasi daun jeruk 22k\nes podeng 12k\nDari bri",
+			lang:  "id",
+			drafts: []wantDraft{
+				{typ: "expense", amount: 22_000, merchant: "nasi daun jeruk", lang: "id"},
+				{typ: "expense", amount: 12_000, merchant: "es podeng", lang: "id"},
+			},
+		},
+		{
 			name:  "expense plus transfer",
 			input: "bensin 20k cash, pindah 500k ke gopay",
 			lang:  "id",
@@ -358,6 +376,52 @@ func questionFor(code string) string {
 	}
 	return ""
 }
+
+func TestParsePhysicalLineBatchEquivalenceAndFooter(t *testing.T) {
+	inputs := []string{
+		"sarapan bubur ayam 16k\n\ncilok 10k\n\nDari BRI",
+		"sarapan bubur ayam 16k\r\n\r\ncilok 10k\r\n\r\nDari BRI",
+	}
+	for _, input := range inputs {
+		got := parse.Parse(input, now)
+		require.Len(t, got.Drafts, 2)
+		assert.Equal(t, "bri", got.SourceFooter)
+		assert.Equal(t, int64(16_000), got.Drafts[0].AmountMinor)
+		assert.Equal(t, int64(10_000), got.Drafts[1].AmountMinor)
+		assert.Equal(t, "sarapan bubur ayam", got.Drafts[0].Merchant)
+		assert.Equal(t, "cilok", got.Drafts[1].Merchant)
+	}
+}
+
+func TestParseFooterPunctuationAndDateSuffix(t *testing.T) {
+	for _, input := range []string{
+		"kopi 10k\nteh 5k\nDari: BRI",
+		"kopi 10k\nteh 5k\nDari:BRI",
+		"kopi 10k\nteh 5k\nDari : BRI",
+		"kopi 10k\nteh 5k\nPakai, BRI",
+		"kopi 10k\nteh 5k\nPakai,BRI",
+	} {
+		got := parse.Parse(input, now)
+		require.Len(t, got.Drafts, 2)
+		assert.Equal(t, "bri", got.SourceFooter)
+	}
+
+	got := parse.Parse("kopi 10k\nteh 5k\nkemarin", now)
+	assert.Empty(t, got.SourceFooter)
+	require.Len(t, got.Drafts, 1)
+	assert.Equal(t, now.AddDate(0, 0, -1).Format("2006-01-02"), got.Drafts[0].OccurredAt.Format("2006-01-02"))
+}
+
+func TestParseBatchKeepsPerLineSourceHints(t *testing.T) {
+	got := parse.Parse("kopi 10k pakai dana\nteh 5k\nBRI", now)
+
+	require.Len(t, got.Drafts, 2)
+	assert.Equal(t, []string{"dana"}, got.Drafts[0].Pays)
+	assert.Empty(t, got.Drafts[1].Pays)
+	assert.Empty(t, got.Drafts[1].Froms)
+	assert.Equal(t, "bri", got.SourceFooter)
+}
+
 
 // TestLooksReferential covers the routing predicate: anything that
 // talks about an earlier transaction must reach the intent router

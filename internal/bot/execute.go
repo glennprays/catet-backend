@@ -37,6 +37,20 @@ func (h *Harness) Execute(ctx context.Context, p *entity.PendingAction, ov *serv
 			txs = []*entity.Transaction{tx}
 		}
 	case "refund":
+		var params refundParams
+		if unmarshalErr := json.Unmarshal(p.Params, &params); unmarshalErr != nil {
+			err = unmarshalErr
+			break
+		}
+		existing, lookupErr := h.txRepo.GetReversalByOriginalID(ctx, params.ReversesTransactionID)
+		if lookupErr != nil {
+			err = lookupErr
+			break
+		}
+		if existing != nil {
+			txs = []*entity.Transaction{existing}
+			break
+		}
 		var tx *entity.Transaction
 		tx, err = h.executeRefund(ctx, p, ov)
 		if tx != nil {
@@ -48,17 +62,51 @@ func (h *Harness) Execute(ctx context.Context, p *entity.PendingAction, ov *serv
 		return nil, apperror.BadRequestf("pending action kind %q cannot be executed", p.Kind)
 	}
 	if err != nil {
-		return nil, err
+		return txs, err
 	}
 
 	ok, err := h.pending.Resolve(ctx, p.ID, "confirm")
 	if err != nil {
-		return nil, apperror.Internal("failed to resolve pending action").Wrap(err)
+		if recovered, lookupErr := h.recoverPendingTransactions(ctx, p, ov); lookupErr == nil && len(recovered) > 0 {
+			txs = recovered
+		}
+		return txs, apperror.Internal("failed to resolve pending action").Wrap(err)
 	}
 	if !ok {
-		return nil, apperror.NotFound("pending action not found")
+		return txs, apperror.NotFound("pending action not found")
 	}
 	return txs, nil
+}
+
+func (h *Harness) recoverPendingTransactions(ctx context.Context, p *entity.PendingAction, ov *service.PendingOverrides) ([]*entity.Transaction, error) {
+	var externalIDs []string
+	switch p.Kind {
+	case "capture", "create_transaction":
+		var params captureParams
+		if err := json.Unmarshal(p.Params, &params); err != nil { return nil, err }
+		if params.ExternalID != "" { externalIDs = append(externalIDs, params.ExternalID) }
+	case "receipt":
+		var params receiptParams
+		if err := json.Unmarshal(p.Params, &params); err != nil { return nil, err }
+		if ov != nil && ov.Collapse != nil && *ov.Collapse {
+			externalIDs = append(externalIDs, receiptExternalID(params.MessageID, 0))
+		} else {
+			for _, item := range params.Items { externalIDs = append(externalIDs, receiptExternalID(params.MessageID, item.N)+item.Part) }
+		}
+	case "refund":
+		var params refundParams
+		if err := json.Unmarshal(p.Params, &params); err != nil { return nil, err }
+		tx, err := h.txRepo.GetReversalByOriginalID(ctx, params.ReversesTransactionID)
+		if err != nil { return nil, err }
+		if tx != nil { return []*entity.Transaction{tx}, nil }
+	}
+	out := make([]*entity.Transaction, 0, len(externalIDs))
+	for _, externalID := range externalIDs {
+		tx, err := h.txRepo.GetByExternalID(ctx, externalID)
+		if err != nil { return nil, err }
+		if tx != nil { out = append(out, tx) }
+	}
+	return out, nil
 }
 
 func (h *Harness) executeCapture(ctx context.Context, p *entity.PendingAction, ov *service.PendingOverrides) (*entity.Transaction, error) {
@@ -157,6 +205,11 @@ func (h *Harness) executeCapture(ctx context.Context, p *entity.PendingAction, o
 	}
 
 	tx, err := h.txs.Create(ctx, in)
+	if err != nil && errIsConflict(err) && params.ExternalID != "" {
+		if existing, getErr := h.txRepo.GetByExternalID(ctx, params.ExternalID); getErr == nil && existing != nil {
+			tx, err = existing, nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -366,16 +419,16 @@ func (h *Harness) executeReceipt(
 			if !errIsConflict(err) {
 				// The lines already written stay written; the pending row
 				// stays open, so the next confirmation finishes the rest.
-				return nil, err
+				return out, err
 			}
 			// An earlier partial attempt already wrote this line: adopt it
 			// instead of writing a second copy.
 			existing, getErr := h.txRepo.GetByExternalID(ctx, externalID)
 			if getErr != nil {
-				return nil, apperror.Internal("failed to load written receipt line").Wrap(getErr)
+				return out, apperror.Internal("failed to load written receipt line").Wrap(getErr)
 			}
 			if existing == nil {
-				return nil, err
+				return out, err
 			}
 			h.log.Warn(traceOf(ctx), "receipt line already written", map[string]any{"external_id": externalID})
 			out = append(out, existing)

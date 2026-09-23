@@ -45,11 +45,23 @@ func NewMerchantService(
 	return &MerchantService{merchants: merchants, llm: llmClient, log: logger}
 }
 
-// Resolve turns a raw phrase into the user's canonical Merchant: alias
-// memory first, then an exact name, then one model call, and when the
-// model is off or fails the phrase itself, Title-Cased, so a capture is
-// never blocked by naming. Empty phrase → nil, nil.
+// Resolve turns a raw phrase into the user's canonical Merchant. It keeps
+// the historical single-context behavior for non-bot callers.
 func (s *MerchantService) Resolve(ctx context.Context, raw, note string) (*entity.Merchant, error) {
+	return s.resolve(ctx, ctx, raw, note)
+}
+
+// ResolveWithModelContext keeps database-backed alias/merchant operations on
+// core while bounding only the optional canonicalization call to modelCtx.
+func (s *MerchantService) ResolveWithModelContext(
+	ctx, modelCtx context.Context, raw, note string,
+) (*entity.Merchant, error) {
+	return s.resolve(ctx, modelCtx, raw, note)
+}
+
+func (s *MerchantService) resolve(
+	ctx, modelCtx context.Context, raw, note string,
+) (*entity.Merchant, error) {
 	key := repository.AliasKey(raw)
 	if key == "" {
 		return nil, nil
@@ -58,8 +70,8 @@ func (s *MerchantService) Resolve(ctx context.Context, raw, note string) (*entit
 		return m, err
 	}
 
-	if s.llm.Enabled(ctx) {
-		m, err := s.resolveWithModel(ctx, key, raw, note)
+	if s.llm.Enabled(modelCtx) {
+		m, err := s.resolveWithModel(ctx, modelCtx, key, raw, note)
 		if err == nil {
 			return m, nil
 		}
@@ -143,10 +155,11 @@ func (s *MerchantService) remembered(ctx context.Context, key, raw string) (*ent
 }
 
 // resolveWithModel asks the model once and records the answer as an
-// alias. A returned error means the capture should fall back to the raw
-// phrase; it is never surfaced to the user.
-func (s *MerchantService) resolveWithModel(ctx context.Context, key, raw, note string) (*entity.Merchant, error) {
-	cands, err := s.merchants.Candidates(ctx, merchantCandidateLimit)
+// alias. Database operations stay on coreCtx even when modelCtx times out.
+func (s *MerchantService) resolveWithModel(
+	coreCtx, modelCtx context.Context, key, raw, note string,
+) (*entity.Merchant, error) {
+	cands, err := s.merchants.Candidates(coreCtx, merchantCandidateLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -155,18 +168,18 @@ func (s *MerchantService) resolveWithModel(ctx context.Context, key, raw, note s
 		known = append(known, llm.Candidate{ID: c.ID, Name: c.Name})
 	}
 
-	pick, err := s.llm.PickMerchant(ctx, raw, note, known)
+	pick, err := s.llm.PickMerchant(modelCtx, raw, note, known)
 	if err != nil {
 		return nil, err
 	}
 
 	if pick.MerchantID != nil && pick.Confidence >= merchantConfidenceFloor {
-		m, err := s.merchants.Get(ctx, *pick.MerchantID)
+		m, err := s.merchants.Get(coreCtx, *pick.MerchantID)
 		if err != nil {
 			return nil, err
 		}
 		if m != nil {
-			if err := s.merchants.PutAlias(ctx, key, m.ID, "llm"); err != nil {
+			if err := s.merchants.PutAlias(coreCtx, key, m.ID, "llm"); err != nil {
 				return nil, err
 			}
 			return m, nil
@@ -177,11 +190,11 @@ func (s *MerchantService) resolveWithModel(ctx context.Context, key, raw, note s
 	if strings.TrimSpace(name) == "" {
 		name = titleCase(raw)
 	}
-	m, err := s.findOrCreate(ctx, name)
+	m, err := s.findOrCreate(coreCtx, name)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.merchants.PutAlias(ctx, key, m.ID, "llm"); err != nil {
+	if err := s.merchants.PutAlias(coreCtx, key, m.ID, "llm"); err != nil {
 		return nil, err
 	}
 	return m, nil

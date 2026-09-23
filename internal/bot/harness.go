@@ -28,6 +28,7 @@ import (
 	"github.com/glennprays/catet-backend/config"
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/glennprays/catet-backend/internal/bot/parse"
+	"github.com/glennprays/catet-backend/internal/money"
 	"github.com/glennprays/catet-backend/internal/bot/tmpl"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/gateway"
@@ -54,6 +55,15 @@ const (
 	// receipt is a vision call (up to 2×LLM_VISION_TIMEOUT_SECONDS) on
 	// top of the media download.
 	photoProcessTimeout = 150 * time.Second
+	// finalizationTail reserves time after the core work deadline for
+	// storing and delivering a durable result.
+	textFinalizationTail = 15 * time.Second
+	photoFinalizationTail = 20 * time.Second
+	// enrichmentTimeout is the one per-message budget shared by optional
+	// merchant, Source-alias, and category model calls.
+	enrichmentTimeout = 5 * time.Second
+	recoveryInterval = 30 * time.Second
+	recoveryBatchSize = 100
 	// botOrigin is the provenance every write from this surface carries.
 	botOrigin = "whatsapp_text"
 	// photoOrigin is the provenance of a line read off a receipt photo.
@@ -62,6 +72,30 @@ const (
 	// remembered.
 	photoDuplicateWindow = 7 * 24 * time.Hour
 )
+type handlingResult struct {
+	Reply           string
+	TransactionIDs  []uuid.UUID
+	Lang            string
+	OutcomeReaction string
+	Stage           string
+	ErrorCode       string
+}
+
+type enrichmentContextKey struct{}
+
+func enrichmentContext(ctx context.Context) context.Context {
+	if modelCtx, ok := ctx.Value(enrichmentContextKey{}).(context.Context); ok {
+		return modelCtx
+	}
+	return ctx
+}
+
+type skipEnrichmentContextKey struct{}
+
+func optionalEnrichmentEnabled(ctx context.Context) bool {
+	_, skipped := ctx.Value(skipEnrichmentContextKey{}).(bool)
+	return !skipped
+}
 
 // inviter re-sends a register link to a number that was invited but has
 // not signed up yet. Declared here rather than taken as a concrete type
@@ -177,7 +211,21 @@ const (
 	reactWritten  = "✅"
 	reactRejected = "❌"
 	reactNone     = ""
+	// A persisted result must distinguish "clear the 👀" from an old row
+	// with no outcome at all; the gateway receives the empty string again.
+	reactionClearMarker = "\u200b"
 )
+
+func persistedReaction(reaction string) string {
+	if reaction == reactNone { return reactionClearMarker }
+	return reaction
+}
+
+func outboundReaction(reaction *string) (string, bool) {
+	if reaction == nil { return "", false }
+	if *reaction == reactionClearMarker { return reactNone, true }
+	return *reaction, true
+}
 
 // react puts one emoji on the user's own message: the photo pipeline's
 // only way to say "seen" before the vision call returns. Delivery is
@@ -211,8 +259,6 @@ func (h *Harness) typing(ctx context.Context, chat string, on bool) {
 func (h *Harness) Start(ctx context.Context) {
 	if h.cfg.WaWebhookURL != "" {
 		if sender, ok := h.gw.(*gateway.WagaSender); ok {
-			// Only the inbound family matters; delivery receipts and
-			// session events would just be acked and dropped.
 			if err := sender.RegisterWebhook(ctx, h.cfg.WaWebhookURL, h.cfg.WaWebhookSecret, []string{"message.incoming"}); err != nil {
 				h.log.Error(traceOf(ctx), "register webhook failed", map[string]any{"error": err.Error()})
 			} else {
@@ -220,35 +266,39 @@ func (h *Harness) Start(ctx context.Context) {
 			}
 		}
 	}
+	lifetime := context.WithoutCancel(ctx)
+	recoverDue := func() {
+		scanCtx, cancel := context.WithTimeout(lifetime, 10*time.Second)
+		defer cancel()
+		rows, err := h.inbound.ListDueInbound(scanCtx, recoveryBatchSize)
+		if err != nil {
+			h.log.Error(traceOf(scanCtx), "replay scan failed", map[string]any{"error": err.Error()})
+			return
+		}
+		for i := range rows { h.accept(lifetime, inboundPayload(&rows[i])) }
+	}
+	recoverDue()
+	go func() {
+		ticker := time.NewTicker(recoveryInterval)
+		defer ticker.Stop()
+		for range ticker.C { recoverDue() }
+	}()
+}
 
-	stale, err := h.inbound.ListProcessing(ctx)
-	if err != nil {
-		h.log.Error(traceOf(ctx), "replay scan failed", map[string]any{"error": err.Error()})
-		return
+func inboundPayload(m *repository.InboundMessage) *waga.IncomingWebhookPayload {
+	p := &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming, Chat: m.Chat, From: m.FromJID,
+		MessageId: m.MessageID, Timestamp: m.OccurredAt.Unix(), Text: m.Body,
+		Type: waga.IncomingMessageType(m.Kind), IsGroup: strings.HasSuffix(m.Chat, "@g.us"),
 	}
-	for _, m := range stale {
-		p := &waga.IncomingWebhookPayload{
-			Event:     waga.IncomingEventMessageMessageIncoming,
-			Chat:      m.Chat,
-			From:      m.FromJID,
-			MessageId: m.MessageID,
-			Timestamp: m.OccurredAt.Unix(),
-			Text:      m.Body,
-			Type:      waga.IncomingMessageType(m.Kind),
+	if m.MediaURL != nil {
+		p.Media = &waga.IncomingMessageMediaInfo{
+			Type: waga.IncomingMessageType(m.Kind), Url: *m.MediaURL,
+			MimeType: derefOr(m.MediaMime, ""), Caption: m.Body,
 		}
-		// A photo replay needs its media back: the row stores the URL and
-		// mime the gateway reported, and Body holds the caption.
-		if m.MediaURL != nil {
-			p.Media = &waga.IncomingMessageMediaInfo{
-				Type:     waga.IncomingMessageType(m.Kind),
-				Url:      *m.MediaURL,
-				MimeType: derefOr(m.MediaMime, ""),
-				Caption:  m.Body,
-			}
-			p.Text = ""
-		}
-		h.accept(ctx, p)
+		p.Text = ""
 	}
+	return p
 }
 
 // Accept hands the payload to a background goroutine so the webhook
@@ -322,182 +372,269 @@ func (h *Harness) learnLID(ctx context.Context, user *entity.User) {
 // Process runs the whole pipeline for one message. Exported so the boot
 // replay and the integration tests can run it synchronously.
 func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) error {
-	// The message id is the natural correlation key: it ties every log
-	// line back to the inbound_messages row.
 	ctx = logctx.WithTraceID(ctx, "wa:"+p.MessageId)
 	occurred := time.Unix(p.Timestamp, 0).UTC()
-	if p.Timestamp == 0 {
-		occurred = time.Now().UTC()
-	}
+	if p.Timestamp == 0 { occurred = time.Now().UTC() }
 	msg := &repository.InboundMessage{
-		MessageID:  p.MessageId,
-		Chat:       p.Chat,
-		FromJID:    p.From,
-		OccurredAt: occurred,
-		Body:       p.Text,
-		Kind:       string(p.Type),
-		Status:     "processing",
+		MessageID: p.MessageId, Chat: p.Chat, FromJID: p.From, OccurredAt: occurred,
+		Body: p.Text, Kind: string(p.Type), Status: "processing",
 	}
-
-	// One chat is one conversation: the reply to a photo and the answer
-	// the user types while the vision call is still running must not race
-	// each other. Holding the lock for the whole pipeline is what makes
-	// "photo, then 'bayar pake BCA'" land in that order.
-	mu := h.lockFor(p.Chat)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Media metadata, never the bytes. The log line is the only visibility
-	// into what the gateway actually sends: with its media download
-	// disabled, Url is a raw mmg.whatsapp.net link whose body is still
-	// E2E-encrypted and unreadable here.
 	if p.Media != nil {
-		mediaURL, mediaMime := p.Media.Url, p.Media.MimeType
-		if mediaURL != "" {
-			msg.MediaURL = &mediaURL
-		}
-		if mediaMime != "" {
-			msg.MediaMime = &mediaMime
-		}
-		// The caption is the user's own hint about the photo; keep it
-		// searchable in the same column a text message uses.
-		if strings.TrimSpace(p.Text) == "" {
-			msg.Body = p.Media.Caption
-		}
-		h.log.Info(traceOf(ctx), "inbound media", map[string]any{
-			"type": string(p.Media.Type), "mime": mediaMime,
-			"size": p.Media.Size, "url_host": hostOf(mediaURL),
-			"caption_len": len(p.Media.Caption),
-		})
+		u, mime := p.Media.Url, p.Media.MimeType
+		if u != "" { msg.MediaURL = &u }; if mime != "" { msg.MediaMime = &mime }
+		if strings.TrimSpace(p.Text) == "" { msg.Body = p.Media.Caption }
+		h.log.Info(traceOf(ctx), "inbound media", map[string]any{"type": string(p.Media.Type), "mime": mime, "size": p.Media.Size, "url_host": hostOf(u), "caption_len": len(p.Media.Caption)})
 	}
-
-	// Sender gate: the bot answers registered, active accounts only.
-	// Anything else is recorded and dropped without a reply — a stranger
-	// must not learn that this number is a bot. The one exception is a
-	// number that was invited and has not signed up yet: it gets its
-	// register link resent, because that is the message it is waiting
-	// for.
+	mu := h.lockFor(p.Chat); mu.Lock(); defer mu.Unlock()
 	user, err := h.resolveSender(ctx, p.From)
-	if err != nil {
-		return fmt.Errorf("resolve sender: %w", err)
+	if err != nil { return fmt.Errorf("resolve sender: %w", err) }
+	if user != nil && !p.IsGroup {
+		ctx = scope.WithUserID(ctx, user.ID)
+		msg.UserID = &user.ID
+		if user.WhatsAppLID == nil && p.AddressingMode != "lid" { h.learnLID(ctx, user) }
 	}
-	if p.IsGroup || user == nil || user.DeactivatedAt != nil {
+	var claim *repository.InboundClaim
+	gated := p.IsGroup || user == nil || user.DeactivatedAt != nil
+	if gated {
 		msg.Status = "dropped"
-		if _, _, err := h.inbound.InsertProcessing(ctx, msg); err != nil {
-			return fmt.Errorf("record dropped message: %w", err)
-		}
-		droppedTotal.Add(1)
-
-		reason := "not registered"
-		switch {
-		case p.IsGroup:
-			reason = "group chat"
-		case user != nil:
-			reason = "deactivated"
-		default:
-			// A retried delivery re-issues the link; the template tells
-			// the user to trust the newest one.
-			sent, err := h.inviter.Reissue(ctx, gateway.UserPart(p.From))
-			if err != nil {
-				h.log.Warn(traceOf(ctx), "invite resend failed", map[string]any{"error": err.Error()})
-			}
-			if sent {
-				reason = "invited"
-			}
-		}
-		h.log.Warn(traceOf(ctx), "inbound dropped", map[string]any{"from": p.From, "chat": p.Chat, "reason": reason})
-		return nil
-	}
-
-	// From here on every repository call reads its tenant from the
-	// context: the pipeline below cannot touch another account's ledger
-	// even by mistake.
-	ctx = scope.WithUserID(ctx, user.ID)
-	msg.UserID = &user.ID
-	if user.WhatsAppLID == nil && p.AddressingMode != "lid" {
-		h.learnLID(ctx, user)
-	}
-
-	inserted, existing, err := h.inbound.InsertProcessing(ctx, msg)
-	if err != nil {
-		return fmt.Errorf("claim message: %w", err)
-	}
-	if !inserted {
-		if existing == nil {
+		claim, err = h.inbound.ClaimInbound(ctx, msg)
+		if err != nil { return fmt.Errorf("record dropped message: %w", err) }
+		if claim.Kind == repository.InboundClaimBusy {
+			droppedTotal.Add(1)
 			return nil
 		}
-		// A retried delivery: replay the exact reply we already sent. The
-		// idempotency key lets the gateway collapse it instead of sending
-		// the same text twice.
-		if existing.Status == "replied" && existing.ReplyText != nil {
-			h.send(ctx, existing.Chat, *existing.ReplyText, "reply:"+existing.MessageID)
+		if claim.Kind == repository.InboundClaimReplay || user == nil {
+			if claim.Kind == repository.InboundClaimReplay && claim.Message != nil && claim.Message.Status == "dropped" {
+				droppedTotal.Add(1)
+			}
+			if user == nil && !p.IsGroup && h.inviter != nil { _, _ = h.inviter.Reissue(ctx, gateway.UserPart(p.From)) }
+			return nil
+		}
+	} else {
+		claim, err = h.inbound.ClaimInbound(ctx, msg)
+		if err != nil { return fmt.Errorf("claim message: %w", err) }
+	}
+	if gated && claim.Kind != repository.InboundClaimWork && claim.Kind != repository.InboundClaimDelivery && claim.Kind != repository.InboundClaimIncomplete { return nil }
+	if !gated && claim.Kind == repository.InboundClaimBusy { return nil }
+	if !gated && claim.Kind == repository.InboundClaimReplay {
+		if claim.Message != nil && claim.Message.Status == "replied" && claim.Message.ReplyText != nil {
+			fctx, cancel := h.finalizeContext(ctx); defer cancel()
+			if err := h.send(fctx, claim.Message.Chat, *claim.Message.ReplyText, "reply:"+claim.Message.MessageID); err != nil { h.log.Warn(traceOf(fctx), "replay send failed", map[string]any{"error": err.Error()}) }
 		}
 		return nil
 	}
-
-	// Seen, immediately: everything below can take seconds, and a photo
-	// or an LLM call leaves the user staring at an unanswered message.
+	if claim.Kind == repository.InboundClaimDelivery { return h.deliverClaim(ctx, claim) }
+	if claim.Kind == repository.InboundClaimIncomplete {
+		fctx, cancel := h.finalizeContext(ctx); defer cancel()
+		return h.finalizeIncomplete(fctx, claim)
+	}
+	if claim.Kind != repository.InboundClaimWork { return nil }
 	h.react(ctx, p.Chat, p.MessageId, p.From, reactSeen)
 	h.typing(ctx, p.Chat, true)
-	defer h.typing(ctx, p.Chat, false)
-
-	// A question the message opens outranks anything it wrote, so the
-	// outcome emoji needs to know how many were open before it ran.
+	defer func() { fctx, cancel := h.finalizeContext(ctx); defer cancel(); h.typing(fctx, p.Chat, false) }()
 	openBefore, err := h.pending.CountOpen(ctx)
-	if err != nil {
-		h.log.Warn(traceOf(ctx), "count open actions failed", map[string]any{"error": err.Error()})
-		openBefore = 0
+	if err != nil { openBefore = 0 }
+	workCtx, cancel := reserveWorkContext(ctx, p.Type == waga.IncomingMessageTypeImage)
+	defer cancel()
+	result, handleErr, panicked := h.runHandle(workCtx, p)
+	if handleErr != nil && claim.Message != nil && len(claim.Message.TransactionIDs) > 0 {
+		result.TransactionIDs = mergeTransactionIDs(claim.Message.TransactionIDs, result.TransactionIDs)
 	}
-
-	reply, txIDs, lang, err := h.handle(ctx, p)
-	handleErr := err
-	if err != nil {
+	if result.Lang == "" { result.Lang = "id" }
+	if handleErr != nil {
 		errorsTotal.Add(1)
-		h.log.Error(traceOf(ctx), "handle failed", map[string]any{"message_id": p.MessageId, "error": err.Error()})
-		reply = tmpl.Render(lang, "error_generic", nil)
-		txIDs = nil
-	}
-	if lang != "" && lang != "id" {
-		if err := h.inbound.SetLang(ctx, p.MessageId, lang); err != nil {
-			h.log.Warn(traceOf(ctx), "record language failed", map[string]any{"error": err.Error()})
+		h.log.Error(traceOf(ctx), "handle failed", map[string]any{"message_id": p.MessageId, "error": handleErr.Error()})
+		if result.ErrorCode == "photo_media_hash_persist_failed" {
+			result.Reply = tmpl.Render(result.Lang, "photo_unreadable", map[string]any{"Issue": "fingerprint"})
+		} else {
+			result.Reply = tmpl.Render(result.Lang, "error_generic", nil)
 		}
+		result.OutcomeReaction = reactRejected
 	}
-	if reply != "" {
-		h.send(ctx, p.Chat, reply, "reply:"+p.MessageId)
+	terminalError := result.ErrorCode == "photo_media_hash_persist_failed"
+	if handleErr != nil && !panicked && !terminalError {
+		fctx, fcancel := h.finalizeContext(ctx)
+		defer fcancel()
+		stage := result.ErrorCode
+		if stage == "" { stage = result.Stage }
+		if stage == "" { stage = "inbound_work" }
+		if result.ErrorCode == "" {
+			if len(result.TransactionIDs) > 0 { stage += "_partial" } else { stage += "_error" }
+		}
+		return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, stage, p.Chat, p.MessageId, p.From)
 	}
-	// A photo stamps its own outcome inside photo(); every other message
-	// gets it here, once the reply is out.
-	if p.Type != waga.IncomingMessageTypeImage {
-		h.react(ctx, p.Chat, p.MessageId, p.From, h.outcomeReaction(ctx, handleErr, openBefore, txIDs))
+	if result.OutcomeReaction == "" {
+		result.OutcomeReaction = h.outcomeReaction(ctx, handleErr, openBefore, result.TransactionIDs, p.Type == waga.IncomingMessageTypeImage)
 	}
-	var replyPtr *string
-	if reply != "" {
-		replyPtr = &reply
+	if panicked {
+		fctx, fcancel := h.finalizeContext(ctx); defer fcancel()
+		return h.handlePanic(fctx, claim.Lease, result, p)
 	}
-	if err := h.inbound.Finish(ctx, p.MessageId, "replied", replyPtr, txIDs); err != nil {
-		return fmt.Errorf("finish message: %w", err)
+	fctx, fcancel := h.finalizeContext(ctx); defer fcancel()
+	delivery, err := h.inbound.StoreInboundResult(fctx, claim.Lease, repository.InboundResult{
+		ReplyText: result.Reply, TransactionIDs: result.TransactionIDs, Lang: result.Lang, OutcomeReaction: persistedReaction(result.OutcomeReaction), ErrorCode: result.ErrorCode,
+	})
+	if err != nil { return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, "result_store_failed", p.Chat, p.MessageId, p.From) }
+	if err := h.send(fctx, p.Chat, result.Reply, "reply:"+p.MessageId); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, delivery, "reply_transport_timeout")
+		return nil
 	}
+	if err := h.inbound.MarkInboundReplied(fctx, delivery); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, delivery, "reply_finalize_failed")
+		return fmt.Errorf("mark replied: %w", err)
+	}
+	h.react(fctx, p.Chat, p.MessageId, p.From, result.OutcomeReaction)
 	processedTotal.Add(1)
 	return nil
 }
+func reserveWorkContext(ctx context.Context, photo bool) (context.Context, context.CancelFunc) {
+	tail := textFinalizationTail
+	if photo {
+		tail = photoFinalizationTail
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline.Add(-tail))
+	}
+	return context.WithCancel(ctx)
+}
 
+func (h *Harness) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+}
+func (h *Harness) runHandle(ctx context.Context, p *waga.IncomingWebhookPayload) (result handlingResult, err error, panicked bool) {
+	result.Stage = "text"
+	if p.Type == waga.IncomingMessageTypeImage { result.Stage = "photo" }
+	enrichmentCtx, cancelEnrichment := context.WithTimeout(ctx, enrichmentTimeout)
+	defer cancelEnrichment()
+	ctx = context.WithValue(ctx, enrichmentContextKey{}, enrichmentCtx)
+	defer func() {
+		if v := recover(); v != nil {
+			panicked = true
+			err = fmt.Errorf("panic: %v", v)
+		}
+	}()
+	if p.Type == waga.IncomingMessageTypeImage && p.Media != nil {
+		result.Lang = parse.Parse(p.Media.Caption, service.JakartaNow()).Lang
+		if result.Lang == "" { result.Lang = "id" }
+		result.Reply, result.TransactionIDs, result.OutcomeReaction, err = h.readPhoto(ctx, p, result.Lang)
+		result.ErrorCode = photoOutcomeCode(result.Reply, result.Lang, err)
+		return
+	}
+	if p.Type == waga.IncomingMessageTypeImage {
+		result.ErrorCode = "photo_no_media"
+	}
+	result.Reply, result.TransactionIDs, result.Lang, err = h.handle(ctx, p)
+	return
+}
+
+func photoOutcomeCode(reply, lang string, err error) string {
+	if err != nil {
+		if strings.Contains(err.Error(), "media_hash_persist_failed") { return "photo_media_hash_persist_failed" }
+		return "photo_vision_timeout"
+	}
+	switch {
+	case reply == tmpl.Render(lang, "photo_too_large", nil), reply == tmpl.Render(lang, "unsupported_media", nil):
+		return "photo_media_rejected"
+	case reply == tmpl.Render(lang, "photo_unreadable", map[string]any{"Issue": "download"}):
+		return "photo_media_download_failed"
+	case reply == tmpl.Render(lang, "photo_no_total", nil):
+		return "photo_no_total"
+	case reply == tmpl.Render(lang, "photo_vision_down", nil):
+		return "photo_vision_unavailable"
+	case reply == tmpl.Render(lang, "photo_llm_off", nil):
+		return "photo_vision_unavailable"
+	case reply == tmpl.Render(lang, "error_generic", nil):
+		return "photo_vision_timeout"
+	default:
+		return ""
+	}
+}
+
+func (h *Harness) deliverClaim(ctx context.Context, claim *repository.InboundClaim) error {
+	if claim.Message == nil || claim.Message.ReplyText == nil { return nil }
+	fctx, cancel := h.finalizeContext(ctx); defer cancel()
+	if err := h.send(fctx, claim.Message.Chat, *claim.Message.ReplyText, "reply:"+claim.Message.MessageID); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, claim.Lease, "reply_transport_timeout"); return nil
+	}
+	if err := h.inbound.MarkInboundReplied(fctx, claim.Lease); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, claim.Lease, "reply_finalize_failed")
+		return err
+	}
+	reaction, ok := outboundReaction(claim.Message.OutcomeReaction)
+	if ok { h.react(fctx, claim.Message.Chat, claim.Message.MessageID, claim.Message.FromJID, reaction) }
+	return nil
+}
+
+func (h *Harness) releaseWork(ctx context.Context, lease *repository.InboundLease, ids []uuid.UUID, lang, stage, chat, messageID, from string) error {
+	final, err := h.inbound.ReleaseInboundWork(ctx, lease, ids, stage)
+	if err != nil { return err }
+	if final { return h.storeIncomplete(ctx, lease, ids, lang, stage, chat, messageID, from) }
+	return nil
+}
+
+func (h *Harness) handlePanic(ctx context.Context, lease *repository.InboundLease, result handlingResult, p *waga.IncomingWebhookPayload) error {
+	stage := result.Stage
+	if stage == "" { stage = "inbound_work" }
+	h.log.Error(traceOf(ctx), "inbound work panic", map[string]any{"stage": stage})
+	return h.releaseWork(ctx, lease, result.TransactionIDs, result.Lang, stage+"_panic", p.Chat, p.MessageId, p.From)
+}
+
+func (h *Harness) finalizeIncomplete(ctx context.Context, claim *repository.InboundClaim) error {
+	if claim.Message == nil { return nil }
+	errorCode := ""
+	if claim.Message.LastError != nil { errorCode = *claim.Message.LastError }
+	return h.storeIncomplete(ctx, claim.Lease, claim.Message.TransactionIDs, claim.Message.Lang, errorCode, claim.Message.Chat, claim.Message.MessageID, claim.Message.FromJID)
+}
+
+func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.InboundLease, ids []uuid.UUID, lang, errorCode, chat, messageID, from string) error {
+	if lang == "" { lang = "id" }
+	items := make([]writtenItem, 0, len(ids))
+	for i, id := range ids {
+		tx, err := h.txRepo.Get(ctx, id); if err != nil || tx == nil { continue }
+		merchant := ""; if tx.Merchant != nil { merchant = *tx.Merchant }
+		items = append(items, writtenItem{N: i + 1, Amount: money.FormatIDR(tx.AmountMinor), Merchant: merchant})
+	}
+	reply := tmpl.Render(lang, "capture_incomplete", map[string]any{"Items": items})
+	if len(ids) > 0 {
+		state, stateErr := h.chats.Get(ctx, chat)
+		if stateErr != nil { return stateErr }
+		if state == nil { state = &repository.ChatState{Chat: chat} }
+		state.LastBatchMessageID = &messageID
+		if saveErr := h.saveState(ctx, state); saveErr != nil { return saveErr }
+	}
+	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected, ErrorCode: errorCode})
+	if err != nil { return err }
+	if err := h.send(ctx, chat, reply, "reply:"+messageID); err != nil { _ = h.inbound.RescheduleInbound(ctx, delivery, "reply_transport_timeout"); return nil }
+	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil {
+		_ = h.inbound.RescheduleInbound(ctx, delivery, "reply_finalize_failed")
+		return err
+	}
+	h.react(ctx, chat, messageID, from, reactRejected)
+	return nil
+}
 // outcomeReaction names what the message did to the ledger. A question
+func mergeTransactionIDs(existing, current []uuid.UUID) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(existing)+len(current))
+	seen := make(map[uuid.UUID]struct{}, cap(out))
+	for _, id := range append(existing, current...) {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 // it left open outranks a write: something still needs the user. A
 // message that only informed (a recap, a balance, an unknown) clears
 // the 👀 instead of claiming an effect it never had.
-func (h *Harness) outcomeReaction(ctx context.Context, handleErr error, openBefore int64, txIDs []uuid.UUID) string {
-	if handleErr != nil {
-		return reactRejected
-	}
+func (h *Harness) outcomeReaction(ctx context.Context, handleErr error, openBefore int64, txIDs []uuid.UUID, image bool) string {
+	if handleErr != nil { return reactRejected }
 	openAfter, err := h.pending.CountOpen(ctx)
-	if err != nil {
-		h.log.Warn(traceOf(ctx), "count open actions failed", map[string]any{"error": err.Error()})
-	} else if openAfter > openBefore {
-		return reactParked
-	}
-	if len(txIDs) > 0 {
-		return reactWritten
-	}
+	if err != nil { h.log.Warn(traceOf(ctx), "count open actions failed", map[string]any{"error": err.Error()}) } else if openAfter > openBefore { return reactParked }
+	if len(txIDs) > 0 { return reactWritten }
+	if image { return reactRejected }
 	return reactNone
 }
 
@@ -547,7 +684,7 @@ func (h *Harness) handle(ctx context.Context, p *waga.IncomingWebhookPayload) (s
 		reply, ids, handled, err := h.applyAnswer(
 			ctx, parseBareAnswer(p.Text, expect, sources), p.MessageId, state, lang)
 		if err != nil {
-			return "", nil, lang, err
+			return "", ids, lang, err
 		}
 		if handled {
 			return reply, ids, lang, nil
@@ -583,7 +720,7 @@ func (h *Harness) handle(ctx context.Context, p *waga.IncomingWebhookPayload) (s
 	// the intent stage instead of being forced into a write.
 	if state.OpenPendingActionID == nil && len(parsed.Drafts) > 0 &&
 		!anyHold(parsed.Drafts) && !parse.LooksReferential(p.Text) {
-		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang)
+		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang, parsed.SourceFooter)
 	}
 	return h.intentStage(ctx, p, parsed, state, lang)
 }
@@ -599,12 +736,14 @@ func anyHold(drafts []parse.Draft) bool {
 }
 
 // send delivers one reply; a delivery failure never rolls back a write.
-func (h *Harness) send(ctx context.Context, chat, text, idempotencyKey string) {
+func (h *Harness) send(ctx context.Context, chat, text, idempotencyKey string) error {
 	if _, err := h.gw.SendText(ctx, chat, text, idempotencyKey); err != nil {
 		h.log.Error(traceOf(ctx), "reply send failed", map[string]any{"chat": chat, "error": err.Error()})
+		return err
 	}
-}
+	return nil
 
+}
 // saveState persists the chat's batch pointer and open question.
 func (h *Harness) saveState(ctx context.Context, state *repository.ChatState) error {
 	if err := h.chats.Upsert(ctx, state); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/glennprays/catet-backend/internal/domain/entity"
@@ -41,6 +42,66 @@ func (r *PendingActionRepository) Create(ctx context.Context, kind string, param
 		uid, kind, params, summary,
 	).Scan(&p.ID, &p.Kind, &p.Params, &p.Summary, &p.Action, &p.CreatedAt, &p.ResolvedAt)
 	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// FindOrCreateByExternalID atomically reuses every prior action for a
+// capture line, including resolved and discarded rows. The transaction
+// advisory lock closes the stale-worker race without adding a schema key;
+// the external_id is already persisted in the action JSON.
+func (r *PendingActionRepository) FindOrCreateByExternalID(
+	ctx context.Context, kind, externalID string, params json.RawMessage, summary string,
+) (*entity.PendingAction, error) {
+	uid, err := scope.UserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if externalID == "" {
+		return r.Create(ctx, kind, params, summary)
+	}
+	if len(params) == 0 {
+		params = json.RawMessage(`{}`)
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	lockKey := fmt.Sprintf("%s:%s:%s", uid, kind, externalID)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return nil, err
+	}
+	var p entity.PendingAction
+	err = tx.QueryRow(ctx,
+		`SELECT id, kind, params, summary, action, created_at, resolved_at
+		 FROM pending_actions
+		 WHERE user_id = $1 AND kind = $2 AND params->>'external_id' = $3
+		 ORDER BY created_at ASC, id ASC
+		 LIMIT 1`,
+		uid, kind, externalID,
+	).Scan(&p.ID, &p.Kind, &p.Params, &p.Summary, &p.Action, &p.CreatedAt, &p.ResolvedAt)
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO pending_actions (user_id, kind, params, summary)
+		 VALUES ($1,$2,$3,$4)
+		 RETURNING id, kind, params, summary, action, created_at, resolved_at`,
+		uid, kind, params, summary,
+	).Scan(&p.ID, &p.Kind, &p.Params, &p.Summary, &p.Action, &p.CreatedAt, &p.ResolvedAt)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &p, nil

@@ -26,6 +26,12 @@ Done, {{len .Items}} transactions recorded:
 {{end}}If something is off, reply "cancel" to delete all or "cancel 2" for number 2.
 {{- end}}
 
+{{define "capture_incomplete" -}}
+Sorry, this capture is incomplete. These items were recorded:
+{{range .Items}}{{.N}}. {{.Amount}} · {{.Merchant}}
+{{end}}If needed, reply "cancel" to undo the recorded items or "cancel 1" for number 1.
+{{- end}}
+
 {{define "uncategorized" -}}
 no category yet
 {{- end}}

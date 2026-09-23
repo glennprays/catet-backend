@@ -46,7 +46,7 @@ func (h *Harness) intentStage(
 		return h.intentFallback(ctx, p, parsed, state, lang)
 	}
 
-	reply, ids, err := h.runIntent(ctx, p, in, state, lang)
+	reply, ids, err := h.runIntent(ctx, p, in, state, lang, parsed)
 	return reply, ids, lang, err
 }
 
@@ -69,7 +69,7 @@ func (h *Harness) intentFallback(
 				return "", nil, lang, err
 			}
 		}
-		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang)
+		return h.capture(ctx, p, wrapDrafts(parsed.Drafts), state, lang, parsed.SourceFooter)
 	}
 	// Without a model there is nothing left to try, but the question is
 	// still the user's open business: repeat it instead of dropping it.
@@ -186,6 +186,7 @@ func (h *Harness) runIntent(
 	in *llm.Intent,
 	state *repository.ChatState,
 	lang string,
+	parsed parse.Parsed,
 ) (string, []uuid.UUID, error) {
 	// The open question outlives almost everything: it is the only state
 	// a message can silently break, and a stranded draft is how a receipt
@@ -203,7 +204,7 @@ func (h *Harness) runIntent(
 			}
 			reply, ids, handled, err := h.applyAnswer(ctx, edits, p.MessageId, state, lang)
 			if err != nil {
-				return "", nil, err
+				return "", ids, err
 			}
 			if handled {
 				return reply, ids, nil
@@ -243,7 +244,7 @@ func (h *Harness) runIntent(
 		if len(in.Drafts) == 0 {
 			return h.remind(ctx, state, lang, "")
 		}
-		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang), state, lang)
+		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang, parsed.Drafts), state, lang, parsed.SourceFooter)
 		return reply, ids, err
 
 	case llm.KindCorrect:
@@ -323,8 +324,9 @@ func withReminder(reply, reminder string) string {
 // amount is re-derived from the message: the model only points at the
 // token, the money grammar decides what it is worth, and a token that is
 // not in the message is no amount at all.
-func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string) []draft {
+func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string, parserDrafts []parse.Draft) []draft {
 	out := make([]draft, 0, len(in))
+	usedParser := make([]bool, len(parserDrafts))
 	for _, d := range in {
 		// The deterministic grammar saw the actual words, so it outranks
 		// the router's reading; capture() judges whatever comes out.
@@ -347,12 +349,68 @@ func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string) []draft 
 		} else {
 			built.Hold = &parse.HoldReason{Code: parse.HoldNoAmount, Question: "q_amount"}
 		}
+		if parserIndex, ok := matchParserDraft(d, text, parserDrafts, usedParser); ok {
+			// The model may omit or reorder drafts. Only copy parser-owned
+			// clauses after a unique amount/type (and, when necessary,
+			// merchant) match proves this is the same physical line.
+			parserDraft := parserDrafts[parserIndex]
+			built.Pays = append([]string(nil), parserDraft.Pays...)
+			built.Froms = append([]string(nil), parserDraft.Froms...)
+			built.Places = append([]string(nil), parserDraft.Places...)
+			built.SourceFromParser = true
+			usedParser[parserIndex] = true
+		}
 		built.SourceID = d.SourceID
 		built.DestinationID = d.DestinationSourceID
 		built.CategoryID = d.CategoryID
 		out = append(out, built)
 	}
 	return out
+}
+
+// matchParserDraft links a model draft to one deterministic physical line.
+// Amounts are the parser's financial identity; when equal amounts appear
+// more than once, the model merchant and type must disambiguate them.
+// Returning no match is intentionally conservative: an unproven parser
+// Source hint must not suppress a shared footer or Source Hold.
+func matchParserDraft(model llm.IntentDraft, text string, parserDrafts []parse.Draft, used []bool) (int, bool) {
+	amount, ok := verifyAmount(text, model.AmountText)
+	if !ok {
+		return 0, false
+	}
+
+	candidates := make([]int, 0, len(parserDrafts))
+	for i, parserDraft := range parserDrafts {
+		if used[i] || parserDraft.AmountMinor != amount || parserDraft.Type != model.Type {
+			continue
+		}
+		candidates = append(candidates, i)
+	}
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	if len(candidates) == 0 {
+		return 0, false
+	}
+
+	merchant := provenanceText(model.Merchant)
+	if merchant == "" {
+		return 0, false
+	}
+	matches := candidates[:0]
+	for _, i := range candidates {
+		if provenanceText(parserDrafts[i].Merchant) == merchant {
+			matches = append(matches, i)
+		}
+	}
+	if len(matches) != 1 {
+		return 0, false
+	}
+	return matches[0], true
+}
+
+func provenanceText(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
 }
 
 // correct edits one transaction of the last chat batch. A category,

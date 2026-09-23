@@ -68,6 +68,10 @@ var fixtures = map[string]struct {
 		},
 		wantMoney: []string{"Rp25.000", "Rp18.000"},
 	},
+	"capture_incomplete": {
+		data:      map[string]any{"Items": []batalItem{{N: 1, Amount: "Rp25.000", Merchant: "kopi"}}},
+		wantMoney: []string{"Rp25.000"},
+	},
 	"uncategorized":     {data: nil},
 	"hold_saved":        {data: map[string]any{"Summary": "Pindah Rp500.000", "Question": "Dipindah ke mana? BCA / GoPay"}, wantMoney: []string{"Rp500.000"}},
 	"hold_to_dashboard": {data: nil},
@@ -366,6 +370,23 @@ func TestRekapMingguWithoutAnomalyDays(t *testing.T) {
 
 func TestRenderUnknownNameIsEmpty(t *testing.T) {
 	assert.Empty(t, tmpl.Render("id", "not_a_template", nil))
+}
+
+// An exhausted capture must name only the partial rows that remain
+// addressable by batal; saying every line was recorded would mislead users.
+func TestCaptureIncompleteKeepsPartialRowsCancelable(t *testing.T) {
+	data := map[string]any{"Items": []batalItem{{N: 1, Amount: "Rp25.000", Merchant: "kopi"}}}
+	for _, lang := range []string{"id", "en"} {
+		out := tmpl.Render(lang, "capture_incomplete", data)
+		assert.Contains(t, out, "Rp25.000", "%s must retain the recorded partial row", lang)
+		wantCancel := "batal"
+		if lang == "en" {
+			wantCancel = "cancel"
+		}
+		assert.Contains(t, strings.ToLower(out), wantCancel, "%s must keep the partial row cancelable", lang)
+		assert.NotContains(t, strings.ToLower(out), "semua", "%s must not claim every line was recorded", lang)
+		assert.NotContains(t, strings.ToLower(out), "all recorded", "%s must not claim every line was recorded", lang)
+	}
 }
 
 func TestRenderExecutionErrorIsEmpty(t *testing.T) {

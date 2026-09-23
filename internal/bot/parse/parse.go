@@ -87,6 +87,10 @@ type Parsed struct {
 	Command    string
 	BatalIndex int
 	Lang       string
+	// SourceFooter is a trailing shared Source hint from a physical-line
+	// batch. It is deliberately kept separate from Draft so capture can
+	// resolve it once, without treating it as a merchant or asking AI.
+	SourceFooter string
 	// BillQuery and Amount carry the `lunas` operands: which bill (a
 	// name fragment, "" for "whatever is due") and how much, when the
 	// user said it.
@@ -218,7 +222,89 @@ func Parse(text string, now time.Time) Parsed {
 		return Parsed{Command: CmdLunas, BillQuery: query, Amount: amount, Lang: detectLang(norm)}
 	}
 
+	if lines, footer, ok := hardBatchLines(text, now); ok {
+		out := Parsed{Lang: detectLang(norm), SourceFooter: footer}
+		for _, line := range lines {
+			appendSegments(&out, normalize(line), now)
+		}
+		if len(out.Drafts) > 0 {
+			out.Lang = out.Drafts[0].Lang
+		}
+		return out
+	}
+
 	out := Parsed{Lang: detectLang(norm)}
+	appendSegments(&out, norm, now)
+	if len(out.Drafts) > 0 {
+		out.Lang = out.Drafts[0].Lang
+	}
+	return out
+}
+
+// hardBatchLines preserves physical line boundaries long enough to decide
+// whether a message is a true line batch. A final non-money line is the
+// shared Source footer; any other non-money line keeps the legacy
+// whole-message grammar rather than becoming an amountless draft.
+func hardBatchLines(text string, now time.Time) (lines []string, footer string, ok bool) {
+	physical := strings.Split(strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n"), "\n")
+	nonblank := make([]string, 0, len(physical))
+	for _, line := range physical {
+		if strings.TrimSpace(line) != "" {
+			nonblank = append(nonblank, line)
+		}
+	}
+	if len(nonblank) < 2 {
+		return nil, "", false
+	}
+
+	last := nonblank[len(nonblank)-1]
+	lastHasMoney := lineHasMoney(last, now)
+	if !lastHasMoney {
+		// A date-only suffix belongs to the legacy date grammar, not to
+		// the shared Source footer. Falling back preserves its existing
+		// whole-message semantics instead of silently dropping it.
+		if _, _, found := ExtractTime(normalize(last), now); found {
+			return nil, "", false
+		}
+		footer = sourceFooterHint(last)
+		nonblank = nonblank[:len(nonblank)-1]
+	}
+	if len(nonblank) < 2 {
+		return nil, "", false
+	}
+	for _, line := range nonblank {
+		if !lineHasMoney(line, now) {
+			return nil, "", false
+		}
+	}
+	return nonblank, footer, true
+}
+
+func lineHasMoney(line string, now time.Time) bool {
+	rest, _, _ := ExtractTime(normalize(line), now)
+	return HasMoneyToken(rest)
+}
+
+func sourceFooterHint(line string) string {
+	hint := strings.Trim(normalize(line), " ,.;:!?\"'")
+	for _, marker := range []string{"dari", "from", "pakai", "pake"} {
+		if !strings.HasPrefix(hint, marker) {
+			continue
+		}
+		tail := hint[len(marker):]
+		if tail == "" {
+			break
+		}
+		trimmed := strings.TrimLeft(tail, " \t,.;:!?\"'")
+		if trimmed != tail {
+			return strings.Trim(trimmed, " ,.;:!?\"'")
+		}
+		break
+	}
+	return strings.Trim(hint, " ,.;:!?\"'")
+}
+
+func appendSegments(out *Parsed, norm string, now time.Time) {
 	for _, seg := range segmentRe.Split(norm, -1) {
 		for _, piece := range splitConjunctions(seg) {
 			// A segment may still open with the glue word that a comma
@@ -230,10 +316,6 @@ func Parse(text string, now time.Time) Parsed {
 			out.Drafts = append(out.Drafts, parseSegment(piece, now))
 		}
 	}
-	if len(out.Drafts) > 0 {
-		out.Lang = out.Drafts[0].Lang
-	}
-	return out
 }
 
 // splitConjunctions breaks "kopi 25k dan gojek 18k" into two captures

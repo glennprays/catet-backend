@@ -2,6 +2,7 @@ package bot_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/llm"
@@ -30,15 +30,16 @@ import (
 // them, so a test can prove a duplicate photo never reaches the model
 // and that a rules-answerable reply never reaches the router.
 type fakeVisionLLM struct {
-	mu          sync.Mutex
-	visionCalls int
-	intentCalls int
-	sourceCalls int
-	receipt     func() string
-	sourceID    func() uuid.UUID
-	intent      func() string
+	mu             sync.Mutex
+	visionCalls    int
+	intentCalls    int
+	sourceCalls    int
+	visionBlock    chan struct{}
+	visionCanceled chan struct{}
+	receipt        func() string
+	sourceID       func() uuid.UUID
+	intent         func() string
 }
-
 func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var content string
@@ -46,7 +47,16 @@ func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 	case bytes.Contains(body, []byte("image_url")):
 		f.mu.Lock()
 		f.visionCalls++
+		gate := f.visionBlock
 		f.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				select { case f.visionCanceled <- struct{}{}: default: }
+				return
+			}
+		}
 		content = f.receipt()
 	case bytes.Contains(body, []byte("(intent)")):
 		f.mu.Lock()
@@ -81,6 +91,12 @@ func (f *fakeVisionLLM) sourcePicks() int {
 }
 
 // unknownIntent is the router saying it has no idea: the default script
+
+func (f *fakeVisionLLM) blockVision() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.visionBlock = make(chan struct{})
+}
 // for a test that does not care what it says.
 const unknownIntent = `{"intent":"unknown","drafts":[],"correction":null,"undo_index":0,` +
 	`"period":"","balance_source_id":null,"answer":null}`
@@ -134,19 +150,74 @@ func (f *botFixture) sendPhoto(t *testing.T, messageID, url string, size int, ca
 // newPhotoFixture wires a bot whose LLM is the fake vision endpoint and
 // whose media comes from a local HTTP server.
 func newPhotoFixture(t *testing.T, receipt func(*botFixture) string) (*botFixture, *fakeVisionLLM, string, int) {
+	return newPhotoFixtureWithTimeout(t, receipt, 5*time.Second)
+}
+
+func newPhotoFixtureWithTimeout(
+	t *testing.T, receipt func(*botFixture) string, timeout time.Duration,
+) (*botFixture, *fakeVisionLLM, string, int) {
 	t.Helper()
 	img := jpegBytes(t)
 	media := mediaServer(t, img)
 
-	fake := &fakeVisionLLM{}
+	fake := &fakeVisionLLM{visionCanceled: make(chan struct{}, 2)}
 	llmSrv := httptest.NewServer(http.HandlerFunc(fake.serve))
 	t.Cleanup(llmSrv.Close)
 
-	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", 5*time.Second))
+	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", timeout))
 	fake.receipt = func() string { return receipt(f) }
 	fake.sourceID = func() uuid.UUID { return f.bca.ID }
 	fake.intent = func() string { return unknownIntent }
 	return f, fake, media.URL + "/storage/x.jpg", len(img)
+}
+
+func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
+	f, fake, url, size := newPhotoFixtureWithTimeout(t, func(*botFixture) string {
+		return `{"document_type":"receipt","legible":true,"issues":[],"merchant":"Indomaret","date":"","currency":"IDR","has_total_line":true,"total_minor":1000,"subtotal_minor":1000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,"payment_method":"cash","direction":"","counterparty":"","items":[]}`
+	}, 2*time.Second)
+	fake.blockVision()
+	ctx, cancel := context.WithTimeout(f.ctx, 24*time.Second)
+	defer cancel()
+
+	err := f.harness.Process(ctx, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming,
+		Chat: ownerPhone[1:] + "@s.whatsapp.net",
+		From: ownerPhone[1:] + ":42@s.whatsapp.net",
+		MessageId: "m-vision-timeout",
+		PushName: "Owner",
+		Timestamp: time.Now().Unix(),
+		Type: waga.IncomingMessageTypeImage,
+		Media: &waga.IncomingMessageMediaInfo{
+			Type: waga.IncomingMessageTypeImage, Url: url,
+			MimeType: "image/jpeg", Size: size,
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, fake.calls(), "vision provider is exhausted through both attempts")
+	_, ok := <-fake.visionCanceled
+	assert.True(t, ok, "vision request observes core-work cancellation before finalization")
+	_, ok = <-fake.visionCanceled
+	assert.True(t, ok, "vision retry also observes cancellation")
+	var status string
+	var reply, lastError *string
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT status, reply_text, last_error FROM inbound_messages WHERE message_id = $1`,
+		"m-vision-timeout").Scan(&status, &reply, &lastError))
+	require.NotNil(t, reply, "finalization must persist the user-facing error reply")
+	assert.NotEmpty(t, *reply)
+	assert.NotEqual(t, "👀", *reply)
+	require.NotNil(t, lastError)
+	assert.Equal(t, "photo_vision_timeout", *lastError)
+	assert.NotContains(t, *lastError, "http")
+	row, err := f.inbound.Get(f.ctx, "m-vision-timeout")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.NotNil(t, row.MediaSha256, "downloaded media is fingerprinted before vision")
+	assert.Len(t, *row.MediaSha256, 64)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+	assert.Equal(t, []string{"👀", "❌"}, f.sender.reactionsOn("m-vision-timeout"))
+	assert.Equal(t, *reply, f.sender.last())
 }
 
 // twoLineReceipt is the canonical reading: two items that add up to the
@@ -247,6 +318,140 @@ func TestPhotoParksReceiptThenYaWritesLines(t *testing.T) {
 	}
 }
 
+func TestPhotoFailedReplyStaysReadyAfterParkingReceipt(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	f.sender.setSendError(errors.New("gateway unavailable"))
+
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.Empty(t, f.live(t), "receipt arrival only parks a Hold Queue draft")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	assert.Equal(t, "receipt", open[0].Kind)
+
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, "ready", row.Status)
+	require.NotNil(t, row.ReplyText)
+	assert.Empty(t, row.TransactionIDs)
+	assert.Empty(t, f.sender.all(), "a failed receipt reply was not accepted")
+
+	f.sender.setSendError(nil)
+	f.sendPhoto(t, "m1", url, size, "")
+	assert.Empty(t, f.sender.all(), "a not-yet-due ready delivery cannot be retried immediately")
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1 RETURNING message_id`,
+		"m1",
+	).Scan(new(string)))
+	f.sendPhoto(t, "m1", url, size, "")
+
+	assert.Empty(t, f.live(t), "receipt delivery recovery never writes ledger money")
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "delivery recovery never creates a second Hold Queue draft")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, *row.ReplyText, sent[0].Text)
+	assert.Equal(t, "reply:m1", sent[0].IdempotencyKey)
+}
+
+
+// A receipt Hold is committed before the inbound reply result. If result
+// storage fails, retrying the same delivery must recover the original Hold
+// rather than creating a second dashboard action.
+func TestPhotoResultStoreFailureReusesReceiptHold(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_receipt_result_store() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.status = 'ready' AND OLD.status = 'processing' THEN
+				RAISE EXCEPTION 'forced receipt result-store failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_receipt_result_store_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_receipt_result_store();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_receipt_result_store_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_receipt_result_store();
+		`)
+	})
+
+	f.sendPhoto(t, "m-receipt-crash", url, size, "")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "the Hold is committed before result storage")
+	first := open[0]
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(first.Params, &params))
+	assert.Equal(t, "m-receipt-crash#receipt", params["external_id"])
+	row, err := f.inbound.Get(f.ctx, "m-receipt-crash")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "processing", row.Status)
+	assert.Empty(t, f.sender.all(), "result-store failure sends no reply")
+
+	_, err = f.pool.Exec(f.ctx, `
+		DROP TRIGGER IF EXISTS test_fail_receipt_result_store_trigger ON inbound_messages;
+		DROP FUNCTION IF EXISTS test_fail_receipt_result_store();
+		UPDATE inbound_messages
+		SET next_attempt_at = now() - interval '1 second'
+		WHERE message_id = 'm-receipt-crash'
+	`)
+	require.NoError(t, err)
+
+	f.sendPhoto(t, "m-receipt-crash", url, size, "")
+
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1, "retry reuses the receipt Hold")
+	assert.Equal(t, first.ID, open[0].ID)
+	assert.Empty(t, f.live(t), "receipt retries never write ledger money")
+	sent := f.sender.all()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "reply:m-receipt-crash", sent[0].IdempotencyKey)
+}
+
+func TestPhotoRetryDoesNotReopenTerminalReceiptHold(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	f.sendPhoto(t, "m-receipt-terminal", url, size, "")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	_, err = f.pending.Resolve(f.ctx, open[0].ID, "discard")
+	require.NoError(t, err)
+	_, err = f.pool.Exec(f.ctx, `
+		UPDATE bot_chat_state
+		SET open_pending_action_id = NULL, open_expect = NULL
+		WHERE chat = $1
+	`, ownerPhone[1:]+"@s.whatsapp.net")
+	require.NoError(t, err)
+	_, err = f.pool.Exec(f.ctx, `
+		UPDATE inbound_messages
+		SET status = 'processing', reply_text = NULL, outcome_reaction = NULL,
+		    next_attempt_at = now() - interval '1 second', lease_until = NULL
+		WHERE message_id = 'm-receipt-terminal'
+	`)
+	require.NoError(t, err)
+
+	f.sendPhoto(t, "m-receipt-terminal", url, size, "")
+
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open, "a terminal receipt Hold is not reopened")
+	assert.Empty(t, f.live(t), "receipt retries never write ledger money")
+	assert.Len(t, f.sender.all(), 2)
+}
 func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 
@@ -268,13 +473,11 @@ func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	assert.NotEqual(t, first, f.sender.last())
 }
 
-// A read that failed on our side is not a judgement on the bytes: the
-// same photo sent again must be read again, never replayed as "already
-// sent".
-func TestPhotoFailedReadIsRetriedNotReplayedAsDuplicate(t *testing.T) {
+// A fetched image is fingerprinted even when vision rejects it. A forwarded
+// copy then gets the durable duplicate refusal without a second vision call.
+func TestPhotoFailedReadIsReplayedAsDuplicate(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 	fake.receipt = func() string { return "upstream hiccup" }
-
 	f.sendPhoto(t, "m1", url, size, "")
 
 	assert.True(t, strings.HasPrefix(f.sender.last(), "Aduh, ada yang error"),
@@ -282,16 +485,18 @@ func TestPhotoFailedReadIsRetriedNotReplayedAsDuplicate(t *testing.T) {
 	row, err := f.inbound.Get(f.ctx, "m1")
 	require.NoError(t, err)
 	require.NotNil(t, row)
-	assert.Nil(t, row.MediaSha256, "a failed read leaves no fingerprint behind")
+	require.NotNil(t, row.MediaSha256, "a fetched image is fingerprinted even when vision rejects it")
+	assert.Len(t, *row.MediaSha256, 64)
 
 	fake.receipt = func() string { return twoLineReceipt(f) }
 	f.sendPhoto(t, "m2", url, size, "")
 
-	assert.Equal(t, 2, fake.calls(), "the resent photo reaches the model again")
-	assert.Contains(t, f.sender.last(), "Struk Indomaret")
+	assert.Equal(t, 1, fake.calls(), "a rejected image is not sent to vision twice")
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Foto ini sudah pernah kamu kirim"),
+		"reply was %q", f.sender.last())
 	open, err := f.pending.ListOpen(f.ctx)
 	require.NoError(t, err)
-	assert.Len(t, open, 1, "the retry parks the draft the failure never produced")
+	assert.Empty(t, open, "a duplicate refusal never parks a draft")
 }
 
 // A gateway that does not download media hands us WhatsApp's encrypted
@@ -315,6 +520,13 @@ func TestPhotoCiphertextIsUnreadable(t *testing.T) {
 	open, err := f.pending.ListOpen(f.ctx)
 	require.NoError(t, err)
 	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Nil(t, row.MediaSha256, "rejected bytes were never accepted or fingerprinted")
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
 // Without a vision model the bot says so instead of guessing.
@@ -596,6 +808,7 @@ func TestPhotoVisionOutageIsNotCalledNotAReceipt(t *testing.T) {
 
 	f.sendPhoto(t, "m1", url, size, "")
 
+
 	assert.True(t, strings.HasPrefix(f.sender.last(), "Aku lagi nggak bisa lihat foto"),
 		"reply was %q", f.sender.last())
 	assert.Equal(t, 1, fake.calls())
@@ -603,6 +816,148 @@ func TestPhotoVisionOutageIsNotCalledNotAReceipt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, open, "an outage parks nothing")
 	assert.Empty(t, f.live(t))
+}
+
+func TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(*botFixture) string {
+		return `{"image_received":true,"document_type":"receipt","legible":true,"issues":[],
+			"merchant":"Indomaret","date":"","currency":"IDR","has_total_line":false,
+			"total_minor":0,"subtotal_minor":1000,"discount_minor":0,"tax_minor":0,
+			"rounding_minor":0,"payment_method":"cash","direction":"","counterparty":"","items":[]}`
+	})
+
+	f.sendPhoto(t, "m-no-total", url, size, "")
+
+	assert.Equal(t, 1, fake.calls())
+	assert.Contains(t, f.sender.last(), "total")
+	assert.Empty(t, f.live(t))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m-no-total")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	require.NotNil(t, row.LastError)
+	assert.Equal(t, "photo_no_total", *row.LastError)
+	assert.NotContains(t, *row.LastError, "http")
+	require.NotNil(t, row.MediaSha256)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+}
+
+func TestPhotoRetryReusesOriginalReceiptActionParams(t *testing.T) {
+	receiptFor := func(merchant string) string {
+		return fmt.Sprintf(`{"document_type":"receipt","legible":true,"issues":[],
+			"merchant":%q,"date":"","currency":"IDR","has_total_line":true,
+			"total_minor":35000,"subtotal_minor":35000,"discount_minor":0,
+			"tax_minor":0,"rounding_minor":0,"payment_method":"DEBIT BCA",
+			"direction":"","counterparty":"",
+			"items":[{"name":"item","qty":1,"amount_minor":35000,
+			"category_id":%q,"category_confidence":0.9}]}`, merchant, "")
+	}
+	f, fake, url, size := newPhotoFixture(t, func(*botFixture) string {
+		return receiptFor("Original Shop")
+	})
+	visionIndex := 0
+	fake.receipt = func() string {
+		if visionIndex == 0 {
+			visionIndex++
+			return receiptFor("Original Shop")
+		}
+		return receiptFor("Changed Shop")
+	}
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_first_receipt_result() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.status = 'ready' AND OLD.status = 'processing' THEN
+				RAISE EXCEPTION 'forced first receipt result failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_first_receipt_result_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_first_receipt_result();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_first_receipt_result_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_first_receipt_result();
+		`)
+	})
+
+	f.sendPhoto(t, "m-photo-retry", url, size, "")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var firstParams map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &firstParams))
+	assert.Equal(t, "Original Shop", firstParams["merchant"])
+
+	_, err = f.pool.Exec(f.ctx, `
+		DROP TRIGGER test_fail_first_receipt_result_trigger ON inbound_messages;
+		DROP FUNCTION test_fail_first_receipt_result();
+		UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+		WHERE message_id = 'm-photo-retry'
+	`)
+	require.NoError(t, err)
+	f.sendPhoto(t, "m-photo-retry", url, size, "")
+
+	assert.Contains(t, f.sender.last(), "Original Shop")
+	assert.NotContains(t, f.sender.last(), "Changed Shop")
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var retriedParams map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &retriedParams))
+	assert.Equal(t, firstParams["merchant"], retriedParams["merchant"])
+	assert.Empty(t, f.live(t))
+}
+
+func TestPhotoHashPersistenceFailureRefusesBeforeVision(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_media_hash() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.media_sha256 IS DISTINCT FROM OLD.media_sha256
+				AND NEW.media_sha256 IS NOT NULL THEN
+				RAISE EXCEPTION 'forced media hash failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_media_hash_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_media_hash();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_media_hash_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_media_hash();
+		`)
+	})
+
+	f.sendPhoto(t, "m-hash-failure", url, size, "")
+
+	assert.Equal(t, 0, fake.calls(), "vision must not run before hash persistence")
+	assert.Empty(t, f.live(t))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m-hash-failure")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Nil(t, row.MediaSha256)
+	require.NotNil(t, row.ReplyText)
+	assert.NotEqual(t, "👀", *row.ReplyText)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
 // ------------------------------------------------ dashboard confirmation

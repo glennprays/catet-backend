@@ -274,17 +274,17 @@ func (h *Harness) executePending(
 ) (string, []uuid.UUID, bool, error) {
 	txs, err := h.Execute(ctx, pending, ov)
 	if err != nil {
-		return "", nil, false, err
-	}
-	if err := h.clearQuestion(ctx, state); err != nil {
-		return "", nil, false, err
+		return "", idsOfAll(txs), false, err
 	}
 	ids := idsOfAll(txs)
+	if err := h.clearQuestion(ctx, state); err != nil {
+		return "", ids, false, err
+	}
 	// The confirmed write is now the batch "batal" addresses.
 	if len(ids) > 0 {
 		state.LastBatchMessageID = &messageID
 		if err := h.saveState(ctx, state); err != nil {
-			return "", nil, false, err
+			return "", ids, false, err
 		}
 	}
 	reply := renderExecuted(pending.Kind, txs, lang)
@@ -620,6 +620,7 @@ func (h *Harness) startRefund(
 	state *repository.ChatState,
 	sources []entity.Source,
 	lang string,
+	externalID string,
 ) (string, bool, error) {
 	// "kembalian dari gojek" leaves the shop in a from-clause, not in
 	// the merchant: any of the three names the target.
@@ -659,6 +660,7 @@ func (h *Harness) startRefund(
 		SourceName:            sourceName,
 		OccurredAt:            target.OccurredAt,
 		MessageID:             p.MessageId,
+		ExternalID:            externalID,
 		OriginalText:          p.Text,
 		Chat:                  p.Chat,
 		From:                  p.From,
@@ -667,9 +669,12 @@ func (h *Harness) startRefund(
 		return "", false, err
 	}
 	summary := "Refund " + merchant + " " + money.FormatIDR(target.AmountMinor)
-	action, err := h.pending.Create(ctx, "refund", params, summary)
+	action, err := h.pending.FindOrCreateByExternalID(ctx, "refund", externalID, params, summary)
 	if err != nil {
 		return "", false, fmt.Errorf("park refund: %w", err)
+	}
+	if action.ResolvedAt != nil {
+		return tmpl.Render(lang, "no_open_question", nil), true, nil
 	}
 	expect := "refund_target"
 	state.OpenPendingActionID = &action.ID

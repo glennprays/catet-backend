@@ -41,7 +41,6 @@ type captureParams struct {
 	Chat string `json:"chat,omitempty"`
 	From string `json:"from,omitempty"`
 }
-
 // refundParams is the Hold Queue payload of a refund awaiting its yes/no.
 type refundParams struct {
 	ReversesTransactionID uuid.UUID `json:"reverses_transaction_id"`
@@ -50,6 +49,7 @@ type refundParams struct {
 	SourceName            string    `json:"source_name"`
 	OccurredAt            time.Time `json:"occurred_at"`
 	MessageID             string    `json:"message_id"`
+	ExternalID            string    `json:"external_id,omitempty"`
 	OriginalText          string    `json:"original_text"`
 	Chat                  string    `json:"chat,omitempty"`
 	From                  string    `json:"from,omitempty"`
@@ -70,15 +70,15 @@ type writtenItem struct {
 }
 
 // draft is one candidate the write path accepts. The embedded
-// parse.Draft is the deterministic reading of the text; the three ids
-// are set only by the intent stage, which resolved them against the
-// whitelist before we got here. Nil means "resolve from the hints", so
-// the regex path wraps its drafts unchanged.
+// parse.Draft is the deterministic reading of the text; ids from the
+// intent stage are whitelist-checked hints, while parser hints remain
+// authoritative when present.
 type draft struct {
 	parse.Draft
-	SourceID      *uuid.UUID
-	DestinationID *uuid.UUID
-	CategoryID    *uuid.UUID
+	SourceID           *uuid.UUID
+	DestinationID      *uuid.UUID
+	CategoryID         *uuid.UUID
+	SourceFromParser   bool
 }
 
 // wrapDrafts lifts the parser's output into the write path with nothing
@@ -86,10 +86,11 @@ type draft struct {
 func wrapDrafts(in []parse.Draft) []draft {
 	out := make([]draft, 0, len(in))
 	for _, d := range in {
-		out = append(out, draft{Draft: d})
+		out = append(out, draft{Draft: d, SourceFromParser: true})
 	}
 	return out
 }
+
 
 // capture resolves every draft, writes what the rules fully decided and
 // parks the rest. At most one clarifying question leaves the bot per
@@ -101,10 +102,22 @@ func (h *Harness) capture(
 	drafts []draft,
 	state *repository.ChatState,
 	lang string,
+	sourceFooter string,
 ) (string, []uuid.UUID, string, error) {
+	if strings.TrimSpace(sourceFooter) != "" {
+		ctx = context.WithValue(ctx, skipEnrichmentContextKey{}, true)
+	}
 	sources, err := h.sources.List(ctx, false)
+
 	if err != nil {
 		return "", nil, lang, fmt.Errorf("list sources: %w", err)
+	}
+	var footerSource *entity.Source
+	if strings.TrimSpace(sourceFooter) != "" {
+		// A shared footer is resolved once, deterministically. An
+		// unmatched or ambiguous hint intentionally stays nil so every
+		// affected draft reaches the normal Source Hold below.
+		footerSource = resolveSourceRules(sourceFooter, sources)
 	}
 	cats, err := h.categories.List(ctx, false)
 	if err != nil {
@@ -133,9 +146,15 @@ func (h *Harness) capture(
 		if err != nil {
 			return err
 		}
-		action, err := h.pending.Create(ctx, "capture", raw, summary)
+		action, err := h.pending.FindOrCreateByExternalID(ctx, "capture", params.ExternalID, raw, summary)
 		if err != nil {
 			return fmt.Errorf("park capture: %w", err)
+		}
+		if action.ResolvedAt != nil {
+			if len(questions) == 0 {
+				questions = append(questions, tmpl.Render(lang, "no_open_question", nil))
+			}
+			return nil
 		}
 		// The first unresolved draft owns the chat's single question; any
 		// further one is only answerable in the dashboard.
@@ -159,6 +178,13 @@ func (h *Harness) capture(
 		// parked capture that already knows its Source only has to ask
 		// about the one thing that is actually missing.
 		src, places, explicit := h.draftSource(ctx, d, sources)
+		footerAffected := strings.TrimSpace(sourceFooter) != "" && !parserSourceExplicit(d, sources)
+		if footerAffected {
+			// A shared footer wins over model hints. A nil result is
+			// intentional: it suppresses memory/default inference.
+			src = footerSource
+			explicit = true
+		}
 
 		// The first place is where the money went ("dari alfamart"); what
 		// the user typed around it is the note ("tissu").
@@ -189,7 +215,13 @@ func (h *Harness) capture(
 		// entity, so "alfamart" and "Alfamart Kebon Jeruk" share one.
 		var canonical *entity.Merchant
 		if merchant != "" {
-			m, err := h.merchants.Resolve(ctx, merchant, note)
+			var m *entity.Merchant
+			var err error
+			if strings.TrimSpace(sourceFooter) != "" {
+				m, err = h.merchants.ResolveUser(ctx, merchant)
+			} else if optionalEnrichmentEnabled(ctx) {
+				m, err = h.merchants.ResolveWithModelContext(ctx, enrichmentContext(ctx), merchant, note)
+			}
 			if err != nil {
 				h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
 			} else if m != nil {
@@ -229,8 +261,9 @@ func (h *Harness) capture(
 
 		params := captureParams{
 			Type: d.Type, AmountMinor: d.AmountMinor, Merchant: merchant, Note: note,
-			OccurredAt: d.OccurredAt, MessageID: p.MessageId, OriginalText: p.Text,
-			Chat: p.Chat, From: p.From,
+			OccurredAt: d.OccurredAt, MessageID: p.MessageId,
+			ExternalID: fmt.Sprintf("%s#%d", p.MessageId, n),
+			OriginalText: p.Text, Chat: p.Chat, From: p.From,
 		}
 		if canonical != nil {
 			params.MerchantID = &canonical.ID
@@ -247,17 +280,20 @@ func (h *Harness) capture(
 
 		if d.Hold != nil {
 			params.Missing = missingFor(d.Hold.Code)
+			if footerAffected && src == nil {
+				params.Missing = appendMissing(params.Missing, "source")
+			}
 			question := tmpl.Render(lang, d.Hold.Question, map[string]any{"Sources": sourceNames(sources)})
 			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			continue
 		}
 
 		if d.Type == "refund" {
-			reply, handled, err := h.startRefund(ctx, p, d.Draft, state, sources, lang)
+			reply, handled, err := h.startRefund(ctx, p, d.Draft, state, sources, lang, params.ExternalID)
 			if err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			if handled {
 				questions = append(questions, reply)
@@ -269,7 +305,7 @@ func (h *Harness) capture(
 			params.Missing = []string{"source"}
 			question := tmpl.Render(lang, "q_source", map[string]any{"Sources": sourceNames(sources)})
 			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			continue
 		}
@@ -286,7 +322,7 @@ func (h *Harness) capture(
 				params.Missing = []string{"destination"}
 				question := tmpl.Render(lang, "q_destination", map[string]any{"Sources": sourceNames(sources)})
 				if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-					return "", nil, lang, err
+					return "", txIDs, lang, err
 				}
 				continue
 			}
@@ -304,7 +340,11 @@ func (h *Harness) capture(
 				Source: &llmSource, ReviewStatus: "clean",
 			}
 		case d.Type == "expense" || d.Type == "income":
-			verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
+			if strings.TrimSpace(sourceFooter) == "" && optionalEnrichmentEnabled(ctx) {
+				verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
+			} else {
+				verdict = categoryVerdict{ReviewStatus: "needs_review"}
+			}
 		}
 
 		occurred := d.OccurredAt
@@ -340,11 +380,24 @@ func (h *Harness) capture(
 		if err != nil {
 			if errIsConflict(err) {
 				// The same message already wrote this line (a replayed
-				// delivery that crashed after the insert).
-				h.log.Warn(traceOf(ctx), "duplicate capture ignored", map[string]any{"external_id": externalID})
+				// delivery that crashed after the insert). Adopt it so
+				// the final reply still describes every ordered line.
+				existing, getErr := h.txRepo.GetByExternalID(ctx, externalID)
+				if getErr != nil {
+					return "", txIDs, lang, fmt.Errorf("load written capture line: %w", getErr)
+				}
+				if existing == nil {
+					return "", txIDs, lang, err
+				}
+				h.log.Warn(traceOf(ctx), "capture line already written", map[string]any{"external_id": externalID})
+				txIDs = append(txIDs, existing.ID)
+				written = append(written, writtenItemFromTransaction(existing, len(written)+1, lang))
 				continue
 			}
-			return "", nil, lang, fmt.Errorf("write capture: %w", err)
+			// Preserve every line already committed. The durable work
+			// runner releases this lease and retries the same message;
+			// no synthetic item is made for the failed line.
+			return "", txIDs, lang, fmt.Errorf("write capture: %w", err)
 		}
 		txIDs = append(txIDs, tx.ID)
 
@@ -370,7 +423,7 @@ func (h *Harness) capture(
 		state.LastBatchMessageID = &p.MessageId
 	}
 	if err := h.saveState(ctx, state); err != nil {
-		return "", nil, lang, err
+		return "", txIDs, lang, err
 	}
 
 	parts := make([]string, 0, 3)
@@ -382,6 +435,38 @@ func (h *Harness) capture(
 		parts = append(parts, tmpl.Render(lang, "hold_to_dashboard", nil))
 	}
 	return strings.Join(parts, "\n"), txIDs, lang, nil
+}
+
+func writtenItemFromTransaction(tx *entity.Transaction, n int, lang string) writtenItem {
+	item := writtenItem{N: n, Amount: money.FormatIDR(tx.AmountMinor), Type: tx.Type}
+	if tx.Merchant != nil {
+		item.Merchant = *tx.Merchant
+	}
+	if tx.Note != nil {
+		item.Note = *tx.Note
+	}
+	if tx.CategoryName != nil {
+		item.Category = *tx.CategoryName
+	}
+	if item.Category == "" {
+		item.Category = tmpl.Render(lang, "uncategorized", nil)
+	}
+	for _, leg := range tx.Legs {
+		if leg.SourceID == nil || leg.SourceName == nil {
+			continue
+		}
+		if tx.Type == "transfer" && leg.SignedAmount > 0 {
+			item.Destination = *leg.SourceName
+			continue
+		}
+		item.Source = *leg.SourceName
+	}
+	occurred := tx.OccurredAt.In(service.Jakarta())
+	if occurred.Format("2006-01-02") != service.JakartaDate() {
+		item.Backdated = true
+		item.Date = formatDay(occurred, lang)
+	}
+	return item
 }
 
 // renderWritten turns the confirmed lines into the reply body. It reads
@@ -470,4 +555,33 @@ func splitTrailingWord(s string) (string, string) {
 		return "", s
 	}
 	return fields[len(fields)-1], strings.Join(fields[:len(fields)-1], " ")
+}
+
+func parserSourceExplicit(d draft, sources []entity.Source) bool {
+	if !d.SourceFromParser {
+		return false
+	}
+	if len(d.Pays) > 0 {
+		return true
+	}
+	// draftSource intentionally treats refund "dari" clauses as merchant
+	// text, so they cannot suppress a shared footer Source.
+	if d.Type == parse.TypeRefund {
+		return false
+	}
+	for _, word := range d.Froms {
+		if resolveSourceRules(word, sources) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func appendMissing(missing []string, field string) []string {
+	for _, existing := range missing {
+		if existing == field {
+			return missing
+		}
+	}
+	return append(missing, field)
 }

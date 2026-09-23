@@ -202,17 +202,20 @@ func seedTenant(t *testing.T, ctx context.Context, r ledgerRepos, userID uuid.UU
 		Chat: rows.chat, OpenExpect: new("source"),
 	}))
 
-	// status 'replied' plus a media hash: that is the shape the photo
-	// replay reader looks for.
-	inserted, _, err := r.inbound.InsertProcessing(ctx, &repository.InboundMessage{
+	// A terminal photo delivery is created through the same lifecycle used
+	// by the bot: the result is durable before it becomes replied.
+	claim, err := r.inbound.ClaimInbound(ctx, &repository.InboundMessage{
 		MessageID: rows.messageID, Chat: rows.chat, FromJID: rows.chat,
 		UserID: &userID, OccurredAt: rows.occurredAt,
-		Body: "kopi 25rb", Kind: "photo", Status: "replied",
-		MediaSha256: &rows.mediaSha,
+		Body: "kopi 25rb", Kind: "photo", MediaSha256: &rows.mediaSha,
 	})
 	require.NoError(t, err)
-	require.True(t, inserted, "fixture message must be new")
-
+	require.Equal(t, repository.InboundClaimWork, claim.Kind)
+	delivery, err := r.inbound.StoreInboundResult(ctx, claim.Lease, repository.InboundResult{
+		ReplyText: "recorded", Lang: "id",
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.inbound.MarkInboundReplied(ctx, delivery))
 	require.NoError(t, r.settings.UpdateIncomeHorizon(ctx, tenantBHorizonDays))
 
 	return rows
