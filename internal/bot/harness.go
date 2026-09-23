@@ -288,7 +288,7 @@ func inboundPayload(m *repository.InboundMessage) *waga.IncomingWebhookPayload {
 	p := &waga.IncomingWebhookPayload{
 		Event: waga.IncomingEventMessageMessageIncoming, Chat: m.Chat, From: m.FromJID,
 		MessageId: m.MessageID, Timestamp: m.OccurredAt.Unix(), Text: m.Body,
-		Type: waga.IncomingMessageType(m.Kind),
+		Type: waga.IncomingMessageType(m.Kind), IsGroup: strings.HasSuffix(m.Chat, "@g.us"),
 	}
 	if m.MediaURL != nil {
 		p.Media = &waga.IncomingMessageMediaInfo{

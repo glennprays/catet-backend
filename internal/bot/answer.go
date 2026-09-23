@@ -274,7 +274,7 @@ func (h *Harness) executePending(
 ) (string, []uuid.UUID, bool, error) {
 	txs, err := h.Execute(ctx, pending, ov)
 	if err != nil {
-		return "", nil, false, err
+		return "", idsOfAll(txs), false, err
 	}
 	if err := h.clearQuestion(ctx, state); err != nil {
 		return "", nil, false, err
