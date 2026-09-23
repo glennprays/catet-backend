@@ -846,6 +846,77 @@ func TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney(t *testing.T) {
 	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
+func TestPhotoRetryReusesOriginalReceiptActionParams(t *testing.T) {
+	receiptFor := func(merchant string) string {
+		return fmt.Sprintf(`{"document_type":"receipt","legible":true,"issues":[],
+			"merchant":%q,"date":"","currency":"IDR","has_total_line":true,
+			"total_minor":35000,"subtotal_minor":35000,"discount_minor":0,
+			"tax_minor":0,"rounding_minor":0,"payment_method":"DEBIT BCA",
+			"direction":"","counterparty":"",
+			"items":[{"name":"item","qty":1,"amount_minor":35000,
+			"category_id":%q,"category_confidence":0.9}]}`, merchant, "")
+	}
+	f, fake, url, size := newPhotoFixture(t, func(*botFixture) string {
+		return receiptFor("Original Shop")
+	})
+	visionIndex := 0
+	fake.receipt = func() string {
+		if visionIndex == 0 {
+			visionIndex++
+			return receiptFor("Original Shop")
+		}
+		return receiptFor("Changed Shop")
+	}
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_first_receipt_result() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.status = 'ready' AND OLD.status = 'processing' THEN
+				RAISE EXCEPTION 'forced first receipt result failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_first_receipt_result_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_first_receipt_result();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_first_receipt_result_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_first_receipt_result();
+		`)
+	})
+
+	f.sendPhoto(t, "m-photo-retry", url, size, "")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var firstParams map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &firstParams))
+	assert.Equal(t, "Original Shop", firstParams["merchant"])
+
+	_, err = f.pool.Exec(f.ctx, `
+		DROP TRIGGER test_fail_first_receipt_result_trigger ON inbound_messages;
+		DROP FUNCTION test_fail_first_receipt_result();
+		UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+		WHERE message_id = 'm-photo-retry'
+	`)
+	require.NoError(t, err)
+	f.sendPhoto(t, "m-photo-retry", url, size, "")
+
+	assert.Contains(t, f.sender.last(), "Original Shop")
+	assert.NotContains(t, f.sender.last(), "Changed Shop")
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var retriedParams map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &retriedParams))
+	assert.Equal(t, firstParams["merchant"], retriedParams["merchant"])
+	assert.Empty(t, f.live(t))
+}
+
 func TestPhotoHashPersistenceFailureRefusesBeforeVision(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 	_, err := f.pool.Exec(f.ctx, `

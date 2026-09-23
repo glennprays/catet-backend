@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -199,6 +200,15 @@ func (h *Harness) readPhoto(
 	)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("park receipt: %w", err)
+	}
+	if len(action.Params) > 0 {
+		var stored receiptParams
+		if err := json.Unmarshal(action.Params, &stored); err == nil && stored.MessageID != "" {
+			// A durable retry must show and confirm the exact draft that
+			// created the action, never a changed vision/caption result.
+			params = &stored
+			summary = action.Summary
+		}
 	}
 	if action.ResolvedAt != nil {
 		return tmpl.Render(lang, "no_open_question", nil), nil, reactNone, nil
