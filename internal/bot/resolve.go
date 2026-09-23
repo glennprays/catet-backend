@@ -57,14 +57,15 @@ func (h *Harness) resolveSource(ctx context.Context, hint string, sources []enti
 	if hit := resolveSourceRules(hint, sources); hit != nil {
 		return hit
 	}
-	if hint == "" || !h.llm.Enabled(ctx) {
+	modelCtx := enrichmentContext(ctx)
+	if !optionalEnrichmentEnabled(ctx) || hint == "" || !h.llm.Enabled(modelCtx) {
 		return nil
 	}
 	cands := make([]llm.Candidate, 0, len(sources))
 	for _, s := range sources {
 		cands = append(cands, llm.Candidate{ID: s.ID, Name: s.Name, Hint: s.Type})
 	}
-	id, err := h.llm.PickSource(ctx, hint, cands)
+	id, err := h.llm.PickSource(modelCtx, hint, cands)
 	if err != nil {
 		h.log.Warn(traceOf(ctx), "llm source pick failed", map[string]any{"error": err.Error()})
 		return nil
@@ -183,7 +184,8 @@ func (h *Harness) resolveCategory(
 			}
 		}
 	}
-	if !h.llm.Enabled(ctx) || len(cats) == 0 {
+	modelCtx := enrichmentContext(ctx)
+	if !optionalEnrichmentEnabled(ctx) || !h.llm.Enabled(modelCtx) || len(cats) == 0 {
 		return needsReview
 	}
 
@@ -191,7 +193,7 @@ func (h *Harness) resolveCategory(
 	for _, c := range cats {
 		cands = append(cands, llm.Candidate{ID: c.ID, Name: c.Name, Hint: parentName(c, cats)})
 	}
-	id, confidence, err := h.llm.PickCategory(ctx, merchant, note, typ, cands)
+	id, confidence, err := h.llm.PickCategory(modelCtx, merchant, note, typ, cands)
 	if err != nil {
 		h.log.Warn(traceOf(ctx), "llm category pick failed", map[string]any{"error": err.Error()})
 		return needsReview

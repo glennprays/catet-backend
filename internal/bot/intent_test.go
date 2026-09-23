@@ -27,11 +27,16 @@ type scriptedLLM struct {
 	category string
 	source   string
 	merchant string
+	delay    time.Duration
 	calls    map[string]int
 	prompts  []string
 }
 
 func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
+	return newScriptedLLMWithTimeout(t, 2*time.Second)
+}
+
+func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLLM, *llm.Client) {
 	t.Helper()
 	s := &scriptedLLM{
 		category: `{"category_id":null,"confidence":0}`,
@@ -49,6 +54,13 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Len(t, body.Messages, 2)
+
+		s.mu.Lock()
+		delay := s.delay
+		s.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 
 		s.mu.Lock()
 		kind := "unknown"
@@ -77,7 +89,13 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 		})
 	}))
 	t.Cleanup(srv.Close)
-	return s, llm.New(srv.URL, "test-key", "test-model", 2*time.Second)
+	return s, llm.New(srv.URL, "test-key", "test-model", timeout)
+}
+
+func (s *scriptedLLM) setDelay(delay time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delay = delay
 }
 
 func (s *scriptedLLM) setIntent(body string) {

@@ -103,6 +103,9 @@ func (h *Harness) capture(
 	lang string,
 	sourceFooter string,
 ) (string, []uuid.UUID, string, error) {
+	if strings.TrimSpace(sourceFooter) != "" {
+		ctx = context.WithValue(ctx, skipEnrichmentContextKey{}, true)
+	}
 	sources, err := h.sources.List(ctx, false)
 
 	if err != nil {
@@ -205,7 +208,13 @@ func (h *Harness) capture(
 		// entity, so "alfamart" and "Alfamart Kebon Jeruk" share one.
 		var canonical *entity.Merchant
 		if merchant != "" {
-			m, err := h.merchants.Resolve(ctx, merchant, note)
+			var m *entity.Merchant
+			var err error
+			if strings.TrimSpace(sourceFooter) != "" {
+				m, err = h.merchants.ResolveUser(ctx, merchant)
+			} else if optionalEnrichmentEnabled(ctx) {
+				m, err = h.merchants.ResolveWithModelContext(ctx, enrichmentContext(ctx), merchant, note)
+			}
 			if err != nil {
 				h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
 			} else if m != nil {
@@ -323,7 +332,11 @@ func (h *Harness) capture(
 				Source: &llmSource, ReviewStatus: "clean",
 			}
 		case d.Type == "expense" || d.Type == "income":
-			verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
+			if strings.TrimSpace(sourceFooter) == "" && optionalEnrichmentEnabled(ctx) {
+				verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
+			} else {
+				verdict = categoryVerdict{ReviewStatus: "needs_review"}
+			}
 		}
 
 		occurred := d.OccurredAt

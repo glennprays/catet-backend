@@ -59,6 +59,9 @@ const (
 	// storing and delivering a durable result.
 	textFinalizationTail = 15 * time.Second
 	photoFinalizationTail = 20 * time.Second
+	// enrichmentTimeout is the one per-message budget shared by optional
+	// merchant, Source-alias, and category model calls.
+	enrichmentTimeout = 5 * time.Second
 	recoveryInterval = 30 * time.Second
 	recoveryBatchSize = 100
 	// botOrigin is the provenance every write from this surface carries.
@@ -75,6 +78,22 @@ type handlingResult struct {
 	Lang            string
 	OutcomeReaction string
 	Stage           string
+}
+
+type enrichmentContextKey struct{}
+
+func enrichmentContext(ctx context.Context) context.Context {
+	if modelCtx, ok := ctx.Value(enrichmentContextKey{}).(context.Context); ok {
+		return modelCtx
+	}
+	return ctx
+}
+
+type skipEnrichmentContextKey struct{}
+
+func optionalEnrichmentEnabled(ctx context.Context) bool {
+	_, skipped := ctx.Value(skipEnrichmentContextKey{}).(bool)
+	return !skipped
 }
 
 // inviter re-sends a register link to a number that was invited but has
@@ -436,10 +455,14 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	processedTotal.Add(1)
 	return nil
 }
-
 func reserveWorkContext(ctx context.Context, photo bool) (context.Context, context.CancelFunc) {
-	tail := textFinalizationTail; if photo { tail = photoFinalizationTail }
-	if deadline, ok := ctx.Deadline(); ok { return context.WithDeadline(ctx, deadline.Add(-tail)) }
+	tail := textFinalizationTail
+	if photo {
+		tail = photoFinalizationTail
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline.Add(-tail))
+	}
 	return context.WithCancel(ctx)
 }
 
@@ -449,6 +472,9 @@ func (h *Harness) finalizeContext(ctx context.Context) (context.Context, context
 func (h *Harness) runHandle(ctx context.Context, p *waga.IncomingWebhookPayload) (result handlingResult, err error, panicked bool) {
 	result.Stage = "text"
 	if p.Type == waga.IncomingMessageTypeImage { result.Stage = "photo" }
+	enrichmentCtx, cancelEnrichment := context.WithTimeout(ctx, enrichmentTimeout)
+	defer cancelEnrichment()
+	ctx = context.WithValue(ctx, enrichmentContextKey{}, enrichmentCtx)
 	defer func() {
 		if v := recover(); v != nil {
 			panicked = true
