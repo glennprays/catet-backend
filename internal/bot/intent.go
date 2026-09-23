@@ -204,7 +204,7 @@ func (h *Harness) runIntent(
 			}
 			reply, ids, handled, err := h.applyAnswer(ctx, edits, p.MessageId, state, lang)
 			if err != nil {
-				return "", nil, err
+				return "", ids, err
 			}
 			if handled {
 				return reply, ids, nil

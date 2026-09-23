@@ -595,8 +595,6 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 		items = append(items, writtenItem{N: i + 1, Amount: money.FormatIDR(tx.AmountMinor), Merchant: merchant})
 	}
 	reply := tmpl.Render(lang, "capture_incomplete", map[string]any{"Items": items})
-	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected, ErrorCode: errorCode})
-	if err != nil { return err }
 	if len(ids) > 0 {
 		state, stateErr := h.chats.Get(ctx, chat)
 		if stateErr != nil { return stateErr }
@@ -604,6 +602,8 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 		state.LastBatchMessageID = &messageID
 		if saveErr := h.saveState(ctx, state); saveErr != nil { return saveErr }
 	}
+	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected, ErrorCode: errorCode})
+	if err != nil { return err }
 	if err := h.send(ctx, chat, reply, "reply:"+messageID); err != nil { _ = h.inbound.RescheduleInbound(ctx, delivery, "reply_transport_timeout"); return nil }
 	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil {
 		_ = h.inbound.RescheduleInbound(ctx, delivery, "reply_finalize_failed")
@@ -684,7 +684,7 @@ func (h *Harness) handle(ctx context.Context, p *waga.IncomingWebhookPayload) (s
 		reply, ids, handled, err := h.applyAnswer(
 			ctx, parseBareAnswer(p.Text, expect, sources), p.MessageId, state, lang)
 		if err != nil {
-			return "", nil, lang, err
+			return "", ids, lang, err
 		}
 		if handled {
 			return reply, ids, lang, nil

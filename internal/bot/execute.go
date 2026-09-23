@@ -37,6 +37,20 @@ func (h *Harness) Execute(ctx context.Context, p *entity.PendingAction, ov *serv
 			txs = []*entity.Transaction{tx}
 		}
 	case "refund":
+		var params refundParams
+		if unmarshalErr := json.Unmarshal(p.Params, &params); unmarshalErr != nil {
+			err = unmarshalErr
+			break
+		}
+		existing, lookupErr := h.txRepo.GetReversalByOriginalID(ctx, params.ReversesTransactionID)
+		if lookupErr != nil {
+			err = lookupErr
+			break
+		}
+		if existing != nil {
+			txs = []*entity.Transaction{existing}
+			break
+		}
 		var tx *entity.Transaction
 		tx, err = h.executeRefund(ctx, p, ov)
 		if tx != nil {
