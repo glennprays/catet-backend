@@ -214,3 +214,19 @@ Output: focused tests passed; bot package compile check passed.
 ## Pointer and refund preflight commit
 
 `05fa717` — `Preserve recovery IDs and preflight refunds`
+
+## Residual review — voided reversal guard
+
+`GetReversalByOriginalID` now scopes recovery adoption to live reversals (`voided_at IS NULL`). A dashboard-voided reversal no longer suppresses a pending refund retry; the retry creates one new live reversal while retaining the voided row for audit. Added a DB-backed regression that creates a reversal, voids it, reopens the pending action, and asserts exactly two total reversals with one live.
+
+Focused race evidence:
+
+```
+go test ./internal/bot -run '^(TestRefundRetryAfterVoidedReversalWritesNewLiveReversal|TestRefundResolvedActionReplaysSafely)$' -race -count=1
+```
+
+Output: passed.
+
+## Voided reversal guard commit
+
+`6b92262` — `Guard refund recovery against voided reversals`
