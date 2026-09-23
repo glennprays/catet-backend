@@ -23,6 +23,16 @@ Focused green run after implementation:
 
 The green harness tests cover both required exact inputs, ordered `#1`/`#2` writes with BRI, zero intent/source-pick calls, blank-line/CRLF parser equivalence, explicit per-line Source override, and unknown/ambiguous footer Source Holds for every draft.
 
+## Fix round 1 evidence
+
+- Intent-derived drafts now retain parser-owned `pakai`/`dari` hints; model Source IDs augment only when no parser Source resolves, and a shared footer overrides model-only Source IDs.
+- Footer marker punctuation (`Dari: BRI`, `Pakai, BRI`) is stripped before deterministic resolution.
+- Date-only trailing lines fall back to the existing date grammar rather than becoming a Source footer.
+- Parser Hold missing fields retain `source` when an unknown/ambiguous footer suppresses Source inference.
+- `go test ./internal/bot/parse -race -count=1` — `ok`.
+- `go test ./internal/bot -run 'TestMultilineBatchCaptureUsesTrailingSourceWithoutIntent|TestUnknownOrAmbiguousBatchFooterHoldsEveryLine|TestBatchFooterDoesNotOverrideExplicitLineSource|TestIntentBatchPreservesParserSourceAndFooter' -race -count=1` — `ok`.
+- `go test ./internal/bot -race -count=1` — fails existing `TestGroupMessagesAreDropped` because the group row unexpectedly has a user id; unrelated to parser/capture changes.
+
 ## Changed files
 
 - `internal/bot/parse/parse.go`: physical-line batch segmentation, `Parsed.SourceFooter`, footer extraction, and shared segment helper.

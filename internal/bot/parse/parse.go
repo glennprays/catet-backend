@@ -260,6 +260,12 @@ func hardBatchLines(text string, now time.Time) (lines []string, footer string, 
 	last := nonblank[len(nonblank)-1]
 	lastHasMoney := lineHasMoney(last, now)
 	if !lastHasMoney {
+		// A date-only suffix belongs to the legacy date grammar, not to
+		// the shared Source footer. Falling back preserves its existing
+		// whole-message semantics instead of silently dropping it.
+		if _, _, found := ExtractTime(normalize(last), now); found {
+			return nil, "", false
+		}
 		footer = sourceFooterHint(last)
 		nonblank = nonblank[:len(nonblank)-1]
 	}
@@ -283,7 +289,8 @@ func sourceFooterHint(line string) string {
 	hint := strings.Trim(normalize(line), " ,.;:!?\"'")
 	fields := strings.Fields(hint)
 	if len(fields) > 1 {
-		switch fields[0] {
+		marker := strings.Trim(fields[0], " ,.;:!?\"'")
+		switch marker {
 		case "dari", "from", "pakai", "pake":
 			hint = strings.Join(fields[1:], " ")
 		}

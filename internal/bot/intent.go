@@ -46,7 +46,7 @@ func (h *Harness) intentStage(
 		return h.intentFallback(ctx, p, parsed, state, lang)
 	}
 
-	reply, ids, err := h.runIntent(ctx, p, in, state, lang, parsed.SourceFooter)
+	reply, ids, err := h.runIntent(ctx, p, in, state, lang, parsed)
 	return reply, ids, lang, err
 }
 
@@ -186,7 +186,7 @@ func (h *Harness) runIntent(
 	in *llm.Intent,
 	state *repository.ChatState,
 	lang string,
-	sourceFooter string,
+	parsed parse.Parsed,
 ) (string, []uuid.UUID, error) {
 	// The open question outlives almost everything: it is the only state
 	// a message can silently break, and a stranded draft is how a receipt
@@ -244,7 +244,7 @@ func (h *Harness) runIntent(
 		if len(in.Drafts) == 0 {
 			return h.remind(ctx, state, lang, "")
 		}
-		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang), state, lang, sourceFooter)
+		reply, ids, _, err := h.capture(ctx, p, h.intentDrafts(in.Drafts, p.Text, lang, parsed.Drafts), state, lang, parsed.SourceFooter)
 		return reply, ids, err
 
 	case llm.KindCorrect:
@@ -324,9 +324,9 @@ func withReminder(reply, reminder string) string {
 // amount is re-derived from the message: the model only points at the
 // token, the money grammar decides what it is worth, and a token that is
 // not in the message is no amount at all.
-func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string) []draft {
+func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string, parserDrafts []parse.Draft) []draft {
 	out := make([]draft, 0, len(in))
-	for _, d := range in {
+	for i, d := range in {
 		// The deterministic grammar saw the actual words, so it outranks
 		// the router's reading; capture() judges whatever comes out.
 		occurred := service.JakartaNow()
@@ -347,6 +347,15 @@ func (h *Harness) intentDrafts(in []llm.IntentDraft, text, lang string) []draft 
 			built.AmountMinor = amount
 		} else {
 			built.Hold = &parse.HoldReason{Code: parse.HoldNoAmount, Question: "q_amount"}
+		}
+		if i < len(parserDrafts) {
+			// Keep parser-owned Source clauses on the corresponding
+			// line. Model ids remain an augmenting hint for lines with
+			// no deterministic Source clause.
+			built.Pays = append([]string(nil), parserDrafts[i].Pays...)
+			built.Froms = append([]string(nil), parserDrafts[i].Froms...)
+			built.Places = append([]string(nil), parserDrafts[i].Places...)
+			built.SourceFromParser = true
 		}
 		built.SourceID = d.SourceID
 		built.DestinationID = d.DestinationSourceID

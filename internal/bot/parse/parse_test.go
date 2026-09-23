@@ -393,6 +393,23 @@ func TestParsePhysicalLineBatchEquivalenceAndFooter(t *testing.T) {
 	}
 }
 
+func TestParseFooterPunctuationAndDateSuffix(t *testing.T) {
+	for _, input := range []string{
+		"kopi 10k\nteh 5k\nDari: BRI",
+		"kopi 10k\nteh 5k\nPakai, BRI",
+	} {
+		got := parse.Parse(input, now)
+		require.Len(t, got.Drafts, 2)
+		assert.Equal(t, "bri", got.SourceFooter)
+	}
+
+	got := parse.Parse("kopi 10k\nteh 5k\nkemarin", now)
+	assert.Empty(t, got.SourceFooter)
+	require.Len(t, got.Drafts, 1)
+	assert.Equal(t, now.AddDate(0, 0, -1).Format("2006-01-02"), got.Drafts[0].OccurredAt.Format("2006-01-02"))
+}
+
+
 // TestLooksReferential covers the routing predicate: anything that
 // talks about an earlier transaction must reach the intent router
 // instead of the regex capture path.

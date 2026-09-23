@@ -91,12 +91,6 @@ func (h *Harness) draftSource(
 	d draft,
 	sources []entity.Source,
 ) (src *entity.Source, places []string, explicit bool) {
-	if d.SourceID != nil {
-		// The intent stage already matched this against the whitelist.
-		if hit := findSource(*d.SourceID, sources); hit != nil {
-			return hit, append(places, d.Places...), true
-		}
-	}
 	for _, word := range d.Pays {
 		if src != nil {
 			break
@@ -119,6 +113,14 @@ func (h *Harness) draftSource(
 		}
 	}
 	places = append(places, d.Places...)
+
+	// Intent Source IDs augment deterministic parser hints; they never
+	// erase a matching pakai/dari clause.
+	if src == nil && d.SourceID != nil {
+		if hit := findSource(*d.SourceID, sources); hit != nil {
+			src = hit
+		}
+	}
 
 	explicit = len(d.Pays) > 0 || src != nil
 	if src == nil && len(d.Pays) > 0 {

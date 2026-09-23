@@ -70,15 +70,15 @@ type writtenItem struct {
 }
 
 // draft is one candidate the write path accepts. The embedded
-// parse.Draft is the deterministic reading of the text; the three ids
-// are set only by the intent stage, which resolved them against the
-// whitelist before we got here. Nil means "resolve from the hints", so
-// the regex path wraps its drafts unchanged.
+// parse.Draft is the deterministic reading of the text; ids from the
+// intent stage are whitelist-checked hints, while parser hints remain
+// authoritative when present.
 type draft struct {
 	parse.Draft
-	SourceID      *uuid.UUID
-	DestinationID *uuid.UUID
-	CategoryID    *uuid.UUID
+	SourceID           *uuid.UUID
+	DestinationID      *uuid.UUID
+	CategoryID         *uuid.UUID
+	SourceFromParser   bool
 }
 
 // wrapDrafts lifts the parser's output into the write path with nothing
@@ -86,7 +86,7 @@ type draft struct {
 func wrapDrafts(in []parse.Draft) []draft {
 	out := make([]draft, 0, len(in))
 	for _, d := range in {
-		out = append(out, draft{Draft: d})
+		out = append(out, draft{Draft: d, SourceFromParser: true})
 	}
 	return out
 }
@@ -168,10 +168,10 @@ func (h *Harness) capture(
 		// parked capture that already knows its Source only has to ask
 		// about the one thing that is actually missing.
 		src, places, explicit := h.draftSource(ctx, d, sources)
-		if strings.TrimSpace(sourceFooter) != "" && !explicit {
-			// Every line without its own explicit Source shares the
-			// footer result. A nil result is intentional: it suppresses
-			// merchant memory/default inference and reaches Source Hold.
+		footerAffected := strings.TrimSpace(sourceFooter) != "" && !parserSourceExplicit(d, sources)
+		if footerAffected {
+			// A shared footer wins over model hints. A nil result is
+			// intentional: it suppresses memory/default inference.
 			src = footerSource
 			explicit = true
 		}
@@ -263,6 +263,9 @@ func (h *Harness) capture(
 
 		if d.Hold != nil {
 			params.Missing = missingFor(d.Hold.Code)
+			if footerAffected && src == nil {
+				params.Missing = appendMissing(params.Missing, "source")
+			}
 			question := tmpl.Render(lang, d.Hold.Question, map[string]any{"Sources": sourceNames(sources)})
 			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
 				return "", nil, lang, err
@@ -486,4 +489,28 @@ func splitTrailingWord(s string) (string, string) {
 		return "", s
 	}
 	return fields[len(fields)-1], strings.Join(fields[:len(fields)-1], " ")
+}
+
+func parserSourceExplicit(d draft, sources []entity.Source) bool {
+	if !d.SourceFromParser {
+		return false
+	}
+	if len(d.Pays) > 0 {
+		return true
+	}
+	for _, word := range d.Froms {
+		if resolveSourceRules(word, sources) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func appendMissing(missing []string, field string) []string {
+	for _, existing := range missing {
+		if existing == field {
+			return missing
+		}
+	}
+	return append(missing, field)
 }

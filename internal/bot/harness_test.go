@@ -436,6 +436,7 @@ func TestUnknownOrAmbiguousBatchFooterHoldsEveryLine(t *testing.T) {
 	}
 }
 
+
 func TestBatchFooterDoesNotOverrideExplicitLineSource(t *testing.T) {
 	fake := &fakeVisionLLM{
 		receipt:  func() string { return "" },
@@ -454,6 +455,32 @@ func TestBatchFooterDoesNotOverrideExplicitLineSource(t *testing.T) {
 	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
 	assert.Zero(t, fake.intents())
 	assert.Zero(t, fake.sourcePicks())
+}
+
+func TestIntentBatchPreservesParserSourceAndFooter(t *testing.T) {
+	fake := &fakeVisionLLM{
+		receipt:  func() string { return "" },
+		sourceID: func() uuid.UUID { return uuid.Nil },
+		intent:   func() string { return unknownIntent },
+	}
+	llmServer := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(llmServer.Close)
+	f := newBotFixture(t, llm.New(llmServer.URL, "test-key", "test-model", 2*time.Second))
+	fake.intent = func() string {
+		return fmt.Sprintf(`{"intent":"capture","drafts":[
+			{"type":"expense","merchant":"kopi","amount_text":"10k","source_id":%q},
+			{"type":"expense","merchant":"teh","amount_text":"5k","source_id":%q}],
+			"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`,
+			f.bca.ID, f.bca.ID)
+	}
+
+	f.say(t, "m1", "itu kopi 10k pakai DANA\nteh 5k\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	assert.Equal(t, f.dana.ID, legSourceID(t, txs[0].Legs))
+	assert.Equal(t, f.bri.ID, legSourceID(t, txs[1].Legs))
+	assert.Equal(t, 1, fake.intents())
 }
 
 
