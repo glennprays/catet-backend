@@ -1315,6 +1315,48 @@ func TestRefundResolvedActionReplaysSafely(t *testing.T) {
 	}
 }
 
+func TestRefundRetryAfterVoidedReversalWritesNewLiveReversal(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.say(t, "prior-voided-refund", "gojek 18k pakai cash")
+	original := f.live(t)[0]
+	f.say(t, "m-voided-refund", "refund gojek 18k")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+
+	first, err := f.harness.Execute(f.ctx, &open[0], nil)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.NoError(t, err)
+	require.NotNil(t, first[0].ReversesTransactionID)
+	require.Equal(t, original.ID, *first[0].ReversesTransactionID)
+	ok, err := f.txRepo.SetVoided(f.ctx, first[0].ID, time.Now().UTC())
+	require.NoError(t, err)
+	require.True(t, ok)
+	loaded, err := f.txRepo.Get(f.ctx, original.ID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	liveReversal, err := f.txRepo.GetReversalByOriginalID(f.ctx, original.ID)
+	require.NoError(t, err)
+	require.Nil(t, liveReversal)
+	_, err = f.pool.Exec(f.ctx, `UPDATE pending_actions SET action = NULL, resolved_at = NULL WHERE id = $1`, open[0].ID)
+	require.NoError(t, err)
+	second, err := f.harness.Execute(f.ctx, &open[0], nil)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.NotEqual(t, first[0].ID, second[0].ID)
+
+	var all, live int
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM transactions
+		 WHERE reverses_transaction_id = $1`, original.ID).Scan(&all))
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM transactions
+		 WHERE reverses_transaction_id = $1 AND voided_at IS NULL`, original.ID).Scan(&live))
+	assert.Equal(t, 2, all)
+	assert.Equal(t, 1, live)
+}
+
 func TestPendingActionExternalIDCreationIsAtomic(t *testing.T) {
 	f := newBotFixture(t, nil)
 	ctx := f.ctx
