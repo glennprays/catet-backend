@@ -399,7 +399,11 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 		msg.Status = "dropped"
 		claim, err = h.inbound.ClaimInbound(ctx, msg)
 		if err != nil { return fmt.Errorf("record dropped message: %w", err) }
-		if claim.Kind == repository.InboundClaimReplay || claim.Kind == repository.InboundClaimBusy || user == nil {
+		if claim.Kind == repository.InboundClaimBusy {
+			droppedTotal.Add(1)
+			return nil
+		}
+		if claim.Kind == repository.InboundClaimReplay || user == nil {
 			if claim.Kind == repository.InboundClaimReplay && claim.Message != nil && claim.Message.Status == "dropped" {
 				droppedTotal.Add(1)
 			}
@@ -475,7 +479,10 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 		_ = h.inbound.RescheduleInbound(fctx, delivery, "reply_transport_timeout")
 		return nil
 	}
-	if err := h.inbound.MarkInboundReplied(fctx, delivery); err != nil { return fmt.Errorf("mark replied: %w", err) }
+	if err := h.inbound.MarkInboundReplied(fctx, delivery); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, delivery, "reply_finalize_failed")
+		return fmt.Errorf("mark replied: %w", err)
+	}
 	h.react(fctx, p.Chat, p.MessageId, p.From, result.OutcomeReaction)
 	processedTotal.Add(1)
 	return nil
@@ -549,7 +556,10 @@ func (h *Harness) deliverClaim(ctx context.Context, claim *repository.InboundCla
 	if err := h.send(fctx, claim.Message.Chat, *claim.Message.ReplyText, "reply:"+claim.Message.MessageID); err != nil {
 		_ = h.inbound.RescheduleInbound(fctx, claim.Lease, "reply_transport_timeout"); return nil
 	}
-	if err := h.inbound.MarkInboundReplied(fctx, claim.Lease); err != nil { return err }
+	if err := h.inbound.MarkInboundReplied(fctx, claim.Lease); err != nil {
+		_ = h.inbound.RescheduleInbound(fctx, claim.Lease, "reply_finalize_failed")
+		return err
+	}
 	reaction, ok := outboundReaction(claim.Message.OutcomeReaction)
 	if ok { h.react(fctx, claim.Message.Chat, claim.Message.MessageID, claim.Message.FromJID, reaction) }
 	return nil
@@ -595,7 +605,10 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 		if saveErr := h.saveState(ctx, state); saveErr != nil { return saveErr }
 	}
 	if err := h.send(ctx, chat, reply, "reply:"+messageID); err != nil { _ = h.inbound.RescheduleInbound(ctx, delivery, "reply_transport_timeout"); return nil }
-	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil { return err }
+	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil {
+		_ = h.inbound.RescheduleInbound(ctx, delivery, "reply_finalize_failed")
+		return err
+	}
 	h.react(ctx, chat, messageID, from, reactRejected)
 	return nil
 }

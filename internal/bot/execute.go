@@ -82,7 +82,9 @@ func (h *Harness) recoverPendingTransactions(ctx context.Context, p *entity.Pend
 	case "refund":
 		var params refundParams
 		if err := json.Unmarshal(p.Params, &params); err != nil { return nil, err }
-		if params.ExternalID != "" { externalIDs = append(externalIDs, params.ExternalID) }
+		tx, err := h.txRepo.GetReversalByOriginalID(ctx, params.ReversesTransactionID)
+		if err != nil { return nil, err }
+		if tx != nil { return []*entity.Transaction{tx}, nil }
 	}
 	out := make([]*entity.Transaction, 0, len(externalIDs))
 	for _, externalID := range externalIDs {

@@ -303,6 +303,12 @@ func (r *TransactionRepository) GetByExternalID(ctx context.Context, externalID 
 	return r.getWhere(ctx, `t.external_id = $1`, externalID)
 }
 
+// GetReversalByOriginalID loads a reversal written before pending confirmation
+// failed while resolving its action.
+func (r *TransactionRepository) GetReversalByOriginalID(ctx context.Context, id uuid.UUID) (*entity.Transaction, error) {
+	return r.getWhere(ctx, `t.reverses_transaction_id = $1`, id)
+}
+
 // getWhere is the one place Get and GetByExternalID are scoped: each
 // passes a single lookup argument as $1, so the tenant is always $2.
 // A row belonging to someone else scans as no row at all.

@@ -276,15 +276,15 @@ func (h *Harness) executePending(
 	if err != nil {
 		return "", idsOfAll(txs), false, err
 	}
-	if err := h.clearQuestion(ctx, state); err != nil {
-		return "", nil, false, err
-	}
 	ids := idsOfAll(txs)
+	if err := h.clearQuestion(ctx, state); err != nil {
+		return "", ids, false, err
+	}
 	// The confirmed write is now the batch "batal" addresses.
 	if len(ids) > 0 {
 		state.LastBatchMessageID = &messageID
 		if err := h.saveState(ctx, state); err != nil {
-			return "", nil, false, err
+			return "", ids, false, err
 		}
 	}
 	reply := renderExecuted(pending.Kind, txs, lang)
