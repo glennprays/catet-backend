@@ -387,7 +387,7 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	mu := h.lockFor(p.Chat); mu.Lock(); defer mu.Unlock()
 	user, err := h.resolveSender(ctx, p.From)
 	if err != nil { return fmt.Errorf("resolve sender: %w", err) }
-	if user != nil {
+	if user != nil && !p.IsGroup {
 		ctx = scope.WithUserID(ctx, user.ID)
 		msg.UserID = &user.ID
 		if user.WhatsAppLID == nil && p.AddressingMode != "lid" { h.learnLID(ctx, user) }
