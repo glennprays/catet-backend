@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented as `c175c735b2444bb67f98318058b56598d54480f2` and review fixes committed as `b54faedb233ed6ad89064b5e28efcd9083f5c1f5` (`close task 7 replay safety review gaps`).
+Implemented as `c175c735b2444bb67f98318058b56598d54480f2`; review fixes are `b54faedb233ed6ad89064b5e28efcd9083f5c1f5` and `cc066e87a6bd9a29dbb52bc572800d34c3ca97a1` (`make pending action keys atomic across retries`).
 
 ## Conflict adoption and partial-id decisions
 
@@ -52,8 +52,9 @@ Implemented as `c175c735b2444bb67f98318058b56598d54480f2` and review fixes commi
 - `internal/bot/capture.go`: external-id adoption, persisted transaction-to-reply reconstruction, partial-ID returns on every post-write failure, and idempotent external keys on capture holds.
 - `internal/bot/answer.go`: idempotent external key on refund holds.
 - `internal/bot/harness.go`: partial-ID handle failures enter durable work release/retry/incomplete flow; retry errors merge durable claim IDs.
+- `internal/repository/pending_action.go`: atomic tenant/kind/external-key find-or-create using a transaction advisory lock, including resolved/discarded historical actions.
 - `internal/bot/photo.go`: media hash persistence moved before duplicate lookup and vision; hash persistence is fail-closed.
-- `internal/bot/harness_test.go`: DB-backed conflict adoption, forced post-write trigger, hold-action retry, and contiguous display-number/cancellation tests.
+- `internal/bot/harness_test.go`: DB-backed conflict adoption, forced post-write trigger, hold-action retry, resolved/discarded reuse, concurrent key creation, and contiguous display-number/cancellation tests.
 - `internal/bot/photo_test.go`: hash-before-vision, rejected outcome, no-total, ciphertext rejection, hash persistence failure, and failed-vision duplicate behavior assertions.
 
 ## Focused command/output summary
@@ -71,11 +72,10 @@ A complete `go test ./internal/bot/... -race -count=1` run also exercised `inter
 ## Review follow-up
 
 - Every capture return after ledger writes now carries accumulated transaction IDs, including Hold Queue creation failures, refund-hold failures, and external-id adoption lookup failures. `Process` also merges durable IDs from the claimed inbound row into a retry error before `ReleaseInboundWork`.
-- Hold and refund actions carry the per-line `message_id#N` external key in their persisted params. Retries search open actions by that key and reuse the action instead of creating a duplicate pending row.
-- A media hash persistence error is fail-closed: no vision call, duplicate lookup, or Hold Queue draft runs after a successful download whose fingerprint could not be durably recorded. The user receives the existing generic rejected reply through centralized finalization.
+- Hold and refund actions carry the per-line `message_id#N` external key in their persisted params. `FindOrCreateByExternalID` uses a tenant/kind/key advisory transaction lock and reuses open, resolved, or discarded rows, closing stale-worker races without a migration. Resolved/discarded actions are not reopened or duplicated.
 - Display item `N` is contiguous over successfully written items (`len(written)+1`), while financial external IDs remain parser/draft-indexed. A refund/hold followed by two writes therefore keeps `batal 1` mapped to the first written transaction.
 - Review-fix focused race command:
 
-  `go test ./internal/bot -race -run 'TestCaptureWritesExpenseAndReplaysDuplicate|TestCaptureConflictAdoptsExistingLine|TestCapturePostWriteFailurePreservesPartialIDs|TestCaptureRetryDoesNotDuplicateHoldAction|TestCaptureDisplayNumbersStayContiguousAfterHold|TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail|TestPhotoFailedReadIsReplayedAsDuplicate|TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney|TestPhotoHashPersistenceFailureRefusesBeforeVision|TestPhotoCiphertextIsUnreadable|TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction|TestPhotoParksReceiptThenYaWritesLines' -count=1`
+  `go test ./internal/bot -race -run 'TestCaptureWritesExpenseAndReplaysDuplicate|TestCaptureConflictAdoptsExistingLine|TestCapturePostWriteFailurePreservesPartialIDs|TestCaptureRetryDoesNotDuplicateHoldAction|TestCaptureDisplayNumbersStayContiguousAfterHold|TestCaptureResolvedOrDiscardedHoldIsNotRecreated|TestPendingActionExternalIDCreationIsAtomic|TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail|TestPhotoFailedReadIsReplayedAsDuplicate|TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney|TestPhotoHashPersistenceFailureRefusesBeforeVision|TestPhotoCiphertextIsUnreadable|TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction|TestPhotoParksReceiptThenYaWritesLines' -count=1`
 
-  Result: `ok github.com/glennprays/catet-backend/internal/bot 9.098s`.
+  Result: `ok github.com/glennprays/catet-backend/internal/bot 10.183s`.
