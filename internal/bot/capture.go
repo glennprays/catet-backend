@@ -151,7 +151,9 @@ func (h *Harness) capture(
 			return fmt.Errorf("park capture: %w", err)
 		}
 		if action.ResolvedAt != nil {
-			deferred++
+			if len(questions) == 0 {
+				questions = append(questions, tmpl.Render(lang, "no_open_question", nil))
+			}
 			return nil
 		}
 		// The first unresolved draft owns the chat's single question; any

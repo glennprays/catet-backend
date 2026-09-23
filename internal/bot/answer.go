@@ -674,7 +674,7 @@ func (h *Harness) startRefund(
 		return "", false, fmt.Errorf("park refund: %w", err)
 	}
 	if action.ResolvedAt != nil {
-		return "", false, nil
+		return tmpl.Render(lang, "no_open_question", nil), true, nil
 	}
 	expect := "refund_target"
 	state.OpenPendingActionID = &action.ID

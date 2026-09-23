@@ -1257,7 +1257,8 @@ func TestCaptureResolvedOrDiscardedHoldIsNotRecreated(t *testing.T) {
 			require.NoError(t, err)
 
 			f.say(t, "m-resolved", "tissu 20k")
-
+			assert.NotEmpty(t, f.sender.last())
+			assert.NotContains(t, f.sender.last(), "dashboard")
 			var count int
 			require.NoError(t, f.pool.QueryRow(f.ctx,
 				`SELECT COUNT(*) FROM pending_actions WHERE kind = 'capture'
@@ -1268,6 +1269,48 @@ func TestCaptureResolvedOrDiscardedHoldIsNotRecreated(t *testing.T) {
 			require.NoError(t, err)
 			assert.Empty(t, open)
 			assert.Empty(t, f.live(t))
+		})
+	}
+}
+
+func TestRefundResolvedActionReplaysSafely(t *testing.T) {
+	for _, actionName := range []string{"confirm", "discard"} {
+		t.Run(actionName, func(t *testing.T) {
+			f := newBotFixture(t, nil)
+			f.say(t, "prior-refund", "gojek 18k pakai cash")
+			f.say(t, "m-refund", "refund gojek 18k")
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			require.Len(t, open, 1)
+			_, err = f.pending.Resolve(f.ctx, open[0].ID, actionName)
+			require.NoError(t, err)
+
+			chat := ownerPhone[1:] + "@s.whatsapp.net"
+			_, err = f.pool.Exec(f.ctx, `
+				UPDATE bot_chat_state
+				SET open_pending_action_id = NULL, open_expect = NULL
+				WHERE chat = $1
+			`, chat)
+			require.NoError(t, err)
+			_, err = f.pool.Exec(f.ctx, `
+				UPDATE inbound_messages
+				SET status = 'processing', lease_until = NULL,
+					next_attempt_at = now() - interval '1 second'
+				WHERE message_id = 'm-refund'
+			`)
+			require.NoError(t, err)
+
+			f.say(t, "m-refund", "refund gojek 18k")
+
+			assert.NotEmpty(t, f.sender.last())
+			assert.Contains(t, f.sender.last(), "Nggak ada yang lagi nunggu")
+			var count int
+			require.NoError(t, f.pool.QueryRow(f.ctx,
+				`SELECT COUNT(*) FROM pending_actions
+				 WHERE kind = 'refund' AND params->>'external_id' = 'm-refund#1'`,
+			).Scan(&count))
+			assert.Equal(t, 1, count)
+			assert.Len(t, f.live(t), 1, "a terminal refund action never writes a second reversal")
 		})
 	}
 }
