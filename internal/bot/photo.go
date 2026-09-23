@@ -200,6 +200,9 @@ func (h *Harness) readPhoto(
 	if err != nil {
 		return "", nil, "", fmt.Errorf("park receipt: %w", err)
 	}
+	if action.ResolvedAt != nil {
+		return tmpl.Render(lang, "no_open_question", nil), nil, reactNone, nil
+	}
 
 	state, err := h.chats.Get(ctx, p.Chat)
 	if err != nil {

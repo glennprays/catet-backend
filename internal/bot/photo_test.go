@@ -418,6 +418,38 @@ func TestPhotoResultStoreFailureReusesReceiptHold(t *testing.T) {
 	require.Len(t, sent, 1)
 	assert.Equal(t, "reply:m-receipt-crash", sent[0].IdempotencyKey)
 }
+
+func TestPhotoRetryDoesNotReopenTerminalReceiptHold(t *testing.T) {
+	f, _, url, size := newPhotoFixture(t, twoLineReceipt)
+	f.sendPhoto(t, "m-receipt-terminal", url, size, "")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	_, err = f.pending.Resolve(f.ctx, open[0].ID, "discard")
+	require.NoError(t, err)
+	_, err = f.pool.Exec(f.ctx, `
+		UPDATE bot_chat_state
+		SET open_pending_action_id = NULL, open_expect = NULL
+		WHERE chat = $1
+	`, ownerPhone[1:]+"@s.whatsapp.net")
+	require.NoError(t, err)
+	_, err = f.pool.Exec(f.ctx, `
+		UPDATE inbound_messages
+		SET status = 'processing', reply_text = NULL, outcome_reaction = NULL,
+		    next_attempt_at = now() - interval '1 second', lease_until = NULL
+		WHERE message_id = 'm-receipt-terminal'
+	`)
+	require.NoError(t, err)
+
+	f.sendPhoto(t, "m-receipt-terminal", url, size, "")
+
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open, "a terminal receipt Hold is not reopened")
+	assert.Empty(t, f.live(t), "receipt retries never write ledger money")
+	assert.Len(t, f.sender.all(), 2)
+}
 func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 
