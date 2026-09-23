@@ -412,6 +412,16 @@ func TestParseFooterPunctuationAndDateSuffix(t *testing.T) {
 	assert.Equal(t, now.AddDate(0, 0, -1).Format("2006-01-02"), got.Drafts[0].OccurredAt.Format("2006-01-02"))
 }
 
+func TestParseBatchKeepsPerLineSourceHints(t *testing.T) {
+	got := parse.Parse("kopi 10k pakai dana\nteh 5k\nBRI", now)
+
+	require.Len(t, got.Drafts, 2)
+	assert.Equal(t, []string{"dana"}, got.Drafts[0].Pays)
+	assert.Empty(t, got.Drafts[1].Pays)
+	assert.Empty(t, got.Drafts[1].Froms)
+	assert.Equal(t, "bri", got.SourceFooter)
+}
+
 
 // TestLooksReferential covers the routing predicate: anything that
 // talks about an earlier transaction must reach the intent router
