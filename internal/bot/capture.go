@@ -372,16 +372,29 @@ func (h *Harness) capture(
 		if err != nil {
 			if errIsConflict(err) {
 				// The same message already wrote this line (a replayed
-				// delivery that crashed after the insert).
-				h.log.Warn(traceOf(ctx), "duplicate capture ignored", map[string]any{"external_id": externalID})
+				// delivery that crashed after the insert). Adopt it so
+				// the final reply still describes every ordered line.
+				existing, getErr := h.txRepo.GetByExternalID(ctx, externalID)
+				if getErr != nil {
+					return "", txIDs, lang, fmt.Errorf("load written capture line: %w", getErr)
+				}
+				if existing == nil {
+					return "", txIDs, lang, err
+				}
+				h.log.Warn(traceOf(ctx), "capture line already written", map[string]any{"external_id": externalID})
+				txIDs = append(txIDs, existing.ID)
+				written = append(written, writtenItemFromTransaction(existing, n, lang))
 				continue
 			}
-			return "", nil, lang, fmt.Errorf("write capture: %w", err)
+			// Preserve every line already committed. The durable work
+			// runner releases this lease and retries the same message;
+			// no synthetic item is made for the failed line.
+			return "", txIDs, lang, fmt.Errorf("write capture: %w", err)
 		}
 		txIDs = append(txIDs, tx.ID)
 
 		item := writtenItem{
-			N: len(written) + 1, Amount: money.FormatIDR(d.AmountMinor),
+			N: n, Amount: money.FormatIDR(d.AmountMinor),
 			Merchant: merchant, Note: note, Source: src.Name, Type: d.Type,
 			Category: verdict.Name,
 		}
@@ -402,7 +415,7 @@ func (h *Harness) capture(
 		state.LastBatchMessageID = &p.MessageId
 	}
 	if err := h.saveState(ctx, state); err != nil {
-		return "", nil, lang, err
+		return "", txIDs, lang, err
 	}
 
 	parts := make([]string, 0, 3)
@@ -414,6 +427,38 @@ func (h *Harness) capture(
 		parts = append(parts, tmpl.Render(lang, "hold_to_dashboard", nil))
 	}
 	return strings.Join(parts, "\n"), txIDs, lang, nil
+}
+
+func writtenItemFromTransaction(tx *entity.Transaction, n int, lang string) writtenItem {
+	item := writtenItem{N: n, Amount: money.FormatIDR(tx.AmountMinor), Type: tx.Type}
+	if tx.Merchant != nil {
+		item.Merchant = *tx.Merchant
+	}
+	if tx.Note != nil {
+		item.Note = *tx.Note
+	}
+	if tx.CategoryName != nil {
+		item.Category = *tx.CategoryName
+	}
+	if item.Category == "" {
+		item.Category = tmpl.Render(lang, "uncategorized", nil)
+	}
+	for _, leg := range tx.Legs {
+		if leg.SourceID == nil || leg.SourceName == nil {
+			continue
+		}
+		if tx.Type == "transfer" && leg.SignedAmount > 0 {
+			item.Destination = *leg.SourceName
+			continue
+		}
+		item.Source = *leg.SourceName
+	}
+	occurred := tx.OccurredAt.In(service.Jakarta())
+	if occurred.Format("2006-01-02") != service.JakartaDate() {
+		item.Backdated = true
+		item.Date = formatDay(occurred, lang)
+	}
+	return item
 }
 
 // renderWritten turns the confirmed lines into the reply body. It reads

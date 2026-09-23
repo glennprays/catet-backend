@@ -57,6 +57,12 @@ func (h *Harness) readPhoto(
 			return tmpl.Render(lang, "photo_unreadable", map[string]any{"Issue": "download"}), nil, reactRejected, nil
 		}
 	}
+	// The bytes' own fingerprint is durable as soon as download has
+	// succeeded, before duplicate checks or vision. A vision failure
+	// must still leave the exact fetched media addressable for recovery.
+	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
+		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
+	}
 
 	prev, err := h.inbound.FindRepliedByMediaSha256(ctx, sha, time.Now().UTC().Add(-photoDuplicateWindow))
 	if err != nil {
@@ -88,14 +94,6 @@ func (h *Harness) readPhoto(
 	if err != nil {
 		h.log.Warn(traceOf(ctx), "photo read failed", map[string]any{"error": err.Error()})
 		return tmpl.Render(lang, "error_generic", nil), nil, reactRejected, nil
-	}
-
-	// The bytes' own fingerprint: a forwarded duplicate must replay the
-	// earlier answer instead of paying for a second vision call.
-	// Recorded only once the model answered: a read that failed on our
-	// side must be retryable, not replayed as "already sent".
-	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
-		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
 	}
 
 	h.log.Info(traceOf(ctx), "photo read", map[string]any{

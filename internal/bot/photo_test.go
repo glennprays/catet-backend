@@ -207,6 +207,14 @@ func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
 	require.NotNil(t, reply, "finalization must persist the user-facing error reply")
 	assert.NotEmpty(t, *reply)
 	assert.NotEqual(t, "👀", *reply)
+	row, err := f.inbound.Get(f.ctx, "m-vision-timeout")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.NotNil(t, row.MediaSha256, "downloaded media is fingerprinted before vision")
+	assert.Len(t, *row.MediaSha256, 64)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+	assert.Equal(t, []string{"👀", "❌"}, f.sender.reactionsOn("m-vision-timeout"))
 	assert.Equal(t, *reply, f.sender.last())
 }
 
@@ -368,13 +376,11 @@ func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	assert.NotEqual(t, first, f.sender.last())
 }
 
-// A read that failed on our side is not a judgement on the bytes: the
-// same photo sent again must be read again, never replayed as "already
-// sent".
-func TestPhotoFailedReadIsRetriedNotReplayedAsDuplicate(t *testing.T) {
+// A fetched image is fingerprinted even when vision rejects it. A forwarded
+// copy then gets the durable duplicate refusal without a second vision call.
+func TestPhotoFailedReadIsReplayedAsDuplicate(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 	fake.receipt = func() string { return "upstream hiccup" }
-
 	f.sendPhoto(t, "m1", url, size, "")
 
 	assert.True(t, strings.HasPrefix(f.sender.last(), "Aduh, ada yang error"),
@@ -382,16 +388,18 @@ func TestPhotoFailedReadIsRetriedNotReplayedAsDuplicate(t *testing.T) {
 	row, err := f.inbound.Get(f.ctx, "m1")
 	require.NoError(t, err)
 	require.NotNil(t, row)
-	assert.Nil(t, row.MediaSha256, "a failed read leaves no fingerprint behind")
+	require.NotNil(t, row.MediaSha256, "a fetched image is fingerprinted even when vision rejects it")
+	assert.Len(t, *row.MediaSha256, 64)
 
 	fake.receipt = func() string { return twoLineReceipt(f) }
 	f.sendPhoto(t, "m2", url, size, "")
 
-	assert.Equal(t, 2, fake.calls(), "the resent photo reaches the model again")
-	assert.Contains(t, f.sender.last(), "Struk Indomaret")
+	assert.Equal(t, 1, fake.calls(), "a rejected image is not sent to vision twice")
+	assert.True(t, strings.HasPrefix(f.sender.last(), "Foto ini sudah pernah kamu kirim"),
+		"reply was %q", f.sender.last())
 	open, err := f.pending.ListOpen(f.ctx)
 	require.NoError(t, err)
-	assert.Len(t, open, 1, "the retry parks the draft the failure never produced")
+	assert.Empty(t, open, "a duplicate refusal never parks a draft")
 }
 
 // A gateway that does not download media hands us WhatsApp's encrypted
@@ -415,6 +423,13 @@ func TestPhotoCiphertextIsUnreadable(t *testing.T) {
 	open, err := f.pending.ListOpen(f.ctx)
 	require.NoError(t, err)
 	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m1")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Nil(t, row.MediaSha256, "rejected bytes were never accepted or fingerprinted")
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
 // Without a vision model the bot says so instead of guessing.
@@ -696,6 +711,7 @@ func TestPhotoVisionOutageIsNotCalledNotAReceipt(t *testing.T) {
 
 	f.sendPhoto(t, "m1", url, size, "")
 
+
 	assert.True(t, strings.HasPrefix(f.sender.last(), "Aku lagi nggak bisa lihat foto"),
 		"reply was %q", f.sender.last())
 	assert.Equal(t, 1, fake.calls())
@@ -703,6 +719,31 @@ func TestPhotoVisionOutageIsNotCalledNotAReceipt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, open, "an outage parks nothing")
 	assert.Empty(t, f.live(t))
+}
+
+func TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, func(*botFixture) string {
+		return `{"image_received":true,"document_type":"receipt","legible":true,"issues":[],
+			"merchant":"Indomaret","date":"","currency":"IDR","has_total_line":false,
+			"total_minor":0,"subtotal_minor":1000,"discount_minor":0,"tax_minor":0,
+			"rounding_minor":0,"payment_method":"cash","direction":"","counterparty":"","items":[]}`
+	})
+
+	f.sendPhoto(t, "m-no-total", url, size, "")
+
+	assert.Equal(t, 1, fake.calls())
+	assert.Contains(t, f.sender.last(), "total")
+	assert.Empty(t, f.live(t))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m-no-total")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	require.NotNil(t, row.MediaSha256)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
 // ------------------------------------------------ dashboard confirmation

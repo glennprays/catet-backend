@@ -434,6 +434,15 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 		result.Reply = tmpl.Render(result.Lang, "error_generic", nil)
 		result.OutcomeReaction = reactRejected
 	}
+	if handleErr != nil && len(result.TransactionIDs) > 0 && !panicked {
+		fctx, fcancel := h.finalizeContext(ctx)
+		defer fcancel()
+		stage := result.Stage
+		if stage == "" {
+			stage = "inbound_work"
+		}
+		return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, stage+"_partial", p.Chat, p.MessageId, p.From)
+	}
 	if result.OutcomeReaction == "" {
 		result.OutcomeReaction = h.outcomeReaction(ctx, handleErr, openBefore, result.TransactionIDs, p.Type == waga.IncomingMessageTypeImage)
 	}

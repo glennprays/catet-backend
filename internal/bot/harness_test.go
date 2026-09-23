@@ -1077,3 +1077,90 @@ func TestTwoUsersLedgersAreIsolated(t *testing.T) {
 	assert.Contains(t, recap, "Bakso", "the second account's own merchant is missing: %q", recap)
 	assert.NotContains(t, recap, "kopi", "another account's merchant leaked into the recap")
 }
+// A replay that collides on one line adopts the stored transaction so the
+// combined reply remains complete and ordered instead of silently dropping it.
+func TestCaptureConflictAdoptsExistingLine(t *testing.T) {
+	f := newBotFixture(t, nil)
+	merchant := "Nasi"
+	externalID := "m1#1"
+	occurred := service.JakartaNow()
+	existingID := uuid.New()
+	require.NoError(t, func() error {
+		_, err := f.txRepo.Insert(f.ctx, &entity.Transaction{
+			ID: existingID, OccurredAt: occurred, Origin: "whatsapp_text",
+			Type: "expense", Merchant: &merchant, AmountMinor: 22_000,
+			ReviewStatus: "needs_review", ExternalID: &externalID,
+			Legs: []entity.Leg{
+				{ID: uuid.New(), TransactionID: existingID, SourceID: &f.bri.ID, SignedAmount: -22_000},
+				{ID: uuid.New(), TransactionID: existingID, CategoryID: &f.makanan.ID, SignedAmount: 22_000},
+			},
+		})
+		return err
+	}())
+
+	f.say(t, "m1", "nasi 22k BRI\nes 12k BRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	require.NotNil(t, txs[0].ExternalID)
+	require.NotNil(t, txs[1].ExternalID)
+	assert.Equal(t, "m1#1", *txs[0].ExternalID)
+	assert.Equal(t, "m1#2", *txs[1].ExternalID)
+	assert.Equal(t, existingID, txs[0].ID)
+	assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+}
+
+// A retryable failure after line one must retain that line's id so the
+// durable worker can report it without manufacturing the failed line.
+func TestCapturePostWriteFailurePreservesPartialIDs(t *testing.T) {
+	f := newBotFixture(t, nil)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_capture_fail_line() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.external_id = 'm-partial#2' THEN
+				RAISE EXCEPTION 'forced capture failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_capture_fail_line_trigger
+		BEFORE INSERT ON transactions
+		FOR EACH ROW EXECUTE FUNCTION test_capture_fail_line();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_capture_fail_line_trigger ON transactions;
+			DROP FUNCTION IF EXISTS test_capture_fail_line();
+		`)
+	})
+
+	f.say(t, "m-partial", "nasi 22k BRI\nes 12k BRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	var ids []uuid.UUID
+	var status string
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT status, transaction_ids FROM inbound_messages WHERE message_id = $1`,
+		"m-partial").Scan(&status, &ids))
+	assert.NotEmpty(t, ids, "the written line must survive the failed second write")
+	assert.Equal(t, txs[0].ID, ids[0])
+	assert.NotEqual(t, "👀", f.sender.last())
+	for range 2 {
+		_, err = f.pool.Exec(f.ctx, `
+			UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+			WHERE message_id = 'm-partial'
+		`)
+		require.NoError(t, err)
+		f.say(t, "m-partial", "nasi 22k BRI\nes 12k BRI")
+	}
+	assert.Len(t, f.live(t), 1, "exhausted retry never duplicates the written line")
+	assert.Contains(t, f.sender.last(), "belum lengkap")
+	row, err := f.inbound.Get(f.ctx, "m-partial")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Len(t, row.TransactionIDs, 1)
+}
