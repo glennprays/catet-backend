@@ -11,7 +11,7 @@ Receipt acceptance now uses the existing atomic `PendingActionRepository.FindOrC
 - The receipt action kind remains `receipt`.
 - The stable action key is `<message_id>#receipt`, keeping retries for one inbound message on one pending action while allowing distinct message IDs to create distinct receipt actions.
 - The key is persisted as `external_id` in the pending action JSON. The existing `receiptParams` payload remains compatible because the additional JSON field is ignored by its decoder.
-- The existing receipt Hold Queue, no-money-before-confirmation, media hash-before-vision, and terminal action behavior are unchanged.
+- The receipt Hold Queue, no-money-before-confirmation, and media hash-before-vision semantics remain unchanged. Resolved/discarded receipt actions are not reopened on recovery; retries return `no_open_question` without creating a second action.
 
 ## Crash/retry coverage
 
@@ -23,19 +23,21 @@ Added `TestPhotoResultStoreFailureReusesReceiptHold`, a DB-backed race test that
 4. Redelivers the same message ID.
 5. Confirms the original pending action UUID is reused, exactly one receipt action remains, one reply is sent with `reply:m-receipt-crash`, and no ledger transactions exist.
 
+Added `TestPhotoRetryDoesNotReopenTerminalReceiptHold`, which resolves/discards the receipt action, resets the inbound row to due work, and redelivers the same message. It confirms the terminal action remains the only action, no ledger transaction is written, and the retry does not reopen the dashboard question.
+
 ## Focused evidence
 
 Passed:
 
-- `go test ./internal/bot -race -run '^TestPhotoResultStoreFailureReusesReceiptHold$' -count=1`
-- `go test ./internal/bot -race -run '^TestPhoto(ResultStoreFailureReusesReceiptHold|ParksReceiptThenYaWritesLines|NoTotalStoresRejectedOutcomeWithoutMoney|FailedReadIsReplayedAsDuplicate)$' -count=1`
+- `go test ./internal/bot -race -run '^TestPhoto(ResultStoreFailureReusesReceiptHold|RetryDoesNotReopenTerminalReceiptHold)$' -count=1`
+- `go test ./internal/bot -race -run '^TestPhoto(ResultStoreFailureReusesReceiptHold|RetryDoesNotReopenTerminalReceiptHold|ParksReceiptThenYaWritesLines|NoTotalStoresRejectedOutcomeWithoutMoney|FailedReadIsReplayedAsDuplicate|SameBytesTwiceIsNotReparsed)$' -count=1`
 
-The broader `go test ./internal/bot -race -run '^TestPhoto' -count=1` was also attempted. It reached the existing/in-flight harness lifecycle failure in `TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail` (`inbound lease no longer held`); this is outside the photo pending-action change. The receipt-specific tests above pass under `-race`.
+Both commands passed after the harness owner reported a clean compile. An earlier broad `^TestPhoto` attempt, while the harness lifecycle changes were still in flight, reached `TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail` with `inbound lease no longer held`; it was not caused by this photo-only change and was not rerun as part of this focused slice.
 
-## Commit
+## Commits
 
-`6de9c7f` — `bot: make receipt hold creation replay-safe`
-
+- `6de9c7f` — `bot: make receipt hold creation replay-safe`
+- `5d58fe9` — `bot: preserve terminal receipt action replay`
 ## Concerns
 
 - The full photo regex currently includes a harness lease-finalization failure unrelated to this slice; the main integration wave should re-run it after the durable harness/repository changes settle.
