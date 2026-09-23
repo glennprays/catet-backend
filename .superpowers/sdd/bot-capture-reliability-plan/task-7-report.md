@@ -67,7 +67,7 @@ A complete `go test ./internal/bot/... -race -count=1` run also exercised `inter
 
 - The existing group-drop user-scope failure remains outside Task 7's capture/photo changes and needs separate ownership.
 - Persisting a hash before vision intentionally changes a failed vision retry with a new message ID into a stored media-duplicate refusal; this follows the required hash-before-vision ordering and avoids re-paying for an identical failed image.
-- No migrations, repository lifecycle, parser segmentation/footer semantics, public API, OpenAPI, or generated clients were changed.
+- No migrations, parser segmentation/footer semantics, public API, OpenAPI, or generated clients were changed; the repository addition is confined to the pending-action atomic find-or-create seam.
 
 ## Review follow-up
 
