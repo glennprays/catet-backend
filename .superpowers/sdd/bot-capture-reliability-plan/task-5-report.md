@@ -39,4 +39,4 @@ The green harness tests cover both required exact inputs, ordered `#1`/`#2` writ
 
 ## Commit
 
-Commit hash is recorded below after committing the complete Task 5 changes.
+Implementation commit: `11856e9`.
