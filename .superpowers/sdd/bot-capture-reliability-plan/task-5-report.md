@@ -50,3 +50,14 @@ The green harness tests cover both required exact inputs, ordered `#1`/`#2` writ
 ## Commit
 
 Implementation commit: `11856e9`.
+
+Fix-round changed files:
+
+- `internal/bot/capture.go`: distinguish parser-owned Source hints from model IDs and merge `source` into affected Hold missing fields.
+- `internal/bot/resolve.go`: resolve deterministic parser Source clauses before model Source IDs.
+- `internal/bot/intent.go`: carry parser draft Source hints through model capture.
+- `internal/bot/parse/parse.go`: handle punctuation in footer markers and preserve date-only suffix behavior.
+- `internal/bot/parse/parse_test.go`: punctuation and date-suffix regressions.
+- `internal/bot/harness_test.go`: intent Source precedence regression.
+
+Fix-round commit: `b688ff76c14c0a671ef9c3cfea4f8cc2c8f66c9c`.
