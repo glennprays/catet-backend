@@ -105,13 +105,20 @@ func TestDroppedClaimTerminalizesDueProcessingAndReadyRows(t *testing.T) {
 				UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text",
 			}
 			work := claimWork(t, ctx, repo, m)
+			live := *m
+			live.UserID = nil
+			live.Status = "dropped"
+			liveClaim, err := repo.ClaimInbound(ctx, &live)
+			require.NoError(t, err)
+			assert.Equal(t, repository.InboundClaimBusy, liveClaim.Kind)
+
 			if tc.ready {
 				storeResult(t, ctx, repo, work.Lease, nil)
 			} else {
 				_, err := repo.ReleaseInboundWork(ctx, work.Lease, nil, "work_timeout")
 				require.NoError(t, err)
 			}
-			_, err := pool.Exec(ctx, `UPDATE inbound_messages
+			_, err = pool.Exec(ctx, `UPDATE inbound_messages
 				SET next_attempt_at = now() - interval '1 second', lease_until = now() - interval '1 second'
 				WHERE message_id = $1`, id)
 			require.NoError(t, err)
