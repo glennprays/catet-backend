@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -41,7 +42,6 @@ type captureParams struct {
 	Chat string `json:"chat,omitempty"`
 	From string `json:"from,omitempty"`
 }
-
 // refundParams is the Hold Queue payload of a refund awaiting its yes/no.
 type refundParams struct {
 	ReversesTransactionID uuid.UUID `json:"reverses_transaction_id"`
@@ -50,6 +50,7 @@ type refundParams struct {
 	SourceName            string    `json:"source_name"`
 	OccurredAt            time.Time `json:"occurred_at"`
 	MessageID             string    `json:"message_id"`
+	ExternalID            string    `json:"external_id,omitempty"`
 	OriginalText          string    `json:"original_text"`
 	Chat                  string    `json:"chat,omitempty"`
 	From                  string    `json:"from,omitempty"`
@@ -89,6 +90,28 @@ func wrapDrafts(in []parse.Draft) []draft {
 		out = append(out, draft{Draft: d, SourceFromParser: true})
 	}
 	return out
+}
+
+func (h *Harness) openActionByExternalID(ctx context.Context, externalID string) (*entity.PendingAction, error) {
+	if externalID == "" {
+		return nil, nil
+	}
+	open, err := h.pending.ListOpen(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range open {
+		var params struct {
+			ExternalID string `json:"external_id"`
+		}
+		if err := json.Unmarshal(open[i].Params, &params); err != nil {
+			continue
+		}
+		if params.ExternalID == externalID {
+			return &open[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // capture resolves every draft, writes what the rules fully decided and
@@ -141,13 +164,19 @@ func (h *Harness) capture(
 	)
 
 	askOrDefer := func(summary, question string, params captureParams) error {
-		raw, err := jsonParams(params)
+		action, err := h.openActionByExternalID(ctx, params.ExternalID)
 		if err != nil {
-			return err
+			return fmt.Errorf("find capture hold: %w", err)
 		}
-		action, err := h.pending.Create(ctx, "capture", raw, summary)
-		if err != nil {
-			return fmt.Errorf("park capture: %w", err)
+		if action == nil {
+			raw, err := jsonParams(params)
+			if err != nil {
+				return err
+			}
+			action, err = h.pending.Create(ctx, "capture", raw, summary)
+			if err != nil {
+				return fmt.Errorf("park capture: %w", err)
+			}
 		}
 		// The first unresolved draft owns the chat's single question; any
 		// further one is only answerable in the dashboard.
@@ -254,8 +283,9 @@ func (h *Harness) capture(
 
 		params := captureParams{
 			Type: d.Type, AmountMinor: d.AmountMinor, Merchant: merchant, Note: note,
-			OccurredAt: d.OccurredAt, MessageID: p.MessageId, OriginalText: p.Text,
-			Chat: p.Chat, From: p.From,
+			OccurredAt: d.OccurredAt, MessageID: p.MessageId,
+			ExternalID: fmt.Sprintf("%s#%d", p.MessageId, n),
+			OriginalText: p.Text, Chat: p.Chat, From: p.From,
 		}
 		if canonical != nil {
 			params.MerchantID = &canonical.ID
@@ -277,15 +307,15 @@ func (h *Harness) capture(
 			}
 			question := tmpl.Render(lang, d.Hold.Question, map[string]any{"Sources": sourceNames(sources)})
 			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			continue
 		}
 
 		if d.Type == "refund" {
-			reply, handled, err := h.startRefund(ctx, p, d.Draft, state, sources, lang)
+			reply, handled, err := h.startRefund(ctx, p, d.Draft, state, sources, lang, params.ExternalID)
 			if err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			if handled {
 				questions = append(questions, reply)
@@ -297,7 +327,7 @@ func (h *Harness) capture(
 			params.Missing = []string{"source"}
 			question := tmpl.Render(lang, "q_source", map[string]any{"Sources": sourceNames(sources)})
 			if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-				return "", nil, lang, err
+				return "", txIDs, lang, err
 			}
 			continue
 		}
@@ -314,7 +344,7 @@ func (h *Harness) capture(
 				params.Missing = []string{"destination"}
 				question := tmpl.Render(lang, "q_destination", map[string]any{"Sources": sourceNames(sources)})
 				if err := askOrDefer(summaryOf(merchant, note, d.AmountMinor, d.Type, dateLabel), question, params); err != nil {
-					return "", nil, lang, err
+					return "", txIDs, lang, err
 				}
 				continue
 			}
@@ -383,7 +413,7 @@ func (h *Harness) capture(
 				}
 				h.log.Warn(traceOf(ctx), "capture line already written", map[string]any{"external_id": externalID})
 				txIDs = append(txIDs, existing.ID)
-				written = append(written, writtenItemFromTransaction(existing, n, lang))
+				written = append(written, writtenItemFromTransaction(existing, len(written)+1, lang))
 				continue
 			}
 			// Preserve every line already committed. The durable work
@@ -394,7 +424,7 @@ func (h *Harness) capture(
 		txIDs = append(txIDs, tx.ID)
 
 		item := writtenItem{
-			N: n, Amount: money.FormatIDR(d.AmountMinor),
+			N: len(written) + 1, Amount: money.FormatIDR(d.AmountMinor),
 			Merchant: merchant, Note: note, Source: src.Name, Type: d.Type,
 			Category: verdict.Name,
 		}

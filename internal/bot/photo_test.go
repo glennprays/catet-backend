@@ -746,6 +746,49 @@ func TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney(t *testing.T) {
 	assert.Equal(t, "❌", *row.OutcomeReaction)
 }
 
+func TestPhotoHashPersistenceFailureRefusesBeforeVision(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_fail_media_hash() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.media_sha256 IS DISTINCT FROM OLD.media_sha256
+				AND NEW.media_sha256 IS NOT NULL THEN
+				RAISE EXCEPTION 'forced media hash failure';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_fail_media_hash_trigger
+		BEFORE UPDATE ON inbound_messages
+		FOR EACH ROW EXECUTE FUNCTION test_fail_media_hash();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_media_hash_trigger ON inbound_messages;
+			DROP FUNCTION IF EXISTS test_fail_media_hash();
+		`)
+	})
+
+	f.sendPhoto(t, "m-hash-failure", url, size, "")
+
+	assert.Equal(t, 0, fake.calls(), "vision must not run before hash persistence")
+	assert.Empty(t, f.live(t))
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Empty(t, open)
+	row, err := f.inbound.Get(f.ctx, "m-hash-failure")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "replied", row.Status)
+	assert.Nil(t, row.MediaSha256)
+	require.NotNil(t, row.ReplyText)
+	assert.NotEqual(t, "👀", *row.ReplyText)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction)
+}
+
 // ------------------------------------------------ dashboard confirmation
 
 // ptr is the one-liner the override structs need: every correction is a

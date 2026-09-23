@@ -1164,3 +1164,84 @@ func TestCapturePostWriteFailurePreservesPartialIDs(t *testing.T) {
 	assert.Equal(t, "replied", row.Status)
 	assert.Len(t, row.TransactionIDs, 1)
 }
+
+func TestCaptureRetryDoesNotDuplicateHoldAction(t *testing.T) {
+	f := newBotFixture(t, nil)
+	_, err := f.pool.Exec(f.ctx, `
+		CREATE FUNCTION test_capture_fail_after_hold() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.external_id = 'm-hold#3' THEN
+				RAISE EXCEPTION 'forced capture failure after hold';
+			END IF;
+			RETURN NEW;
+		END
+		$$;
+		CREATE TRIGGER test_capture_fail_after_hold_trigger
+		BEFORE INSERT ON transactions
+		FOR EACH ROW EXECUTE FUNCTION test_capture_fail_after_hold();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_capture_fail_after_hold_trigger ON transactions;
+			DROP FUNCTION IF EXISTS test_capture_fail_after_hold();
+		`)
+	})
+
+	f.say(t, "m-hold", "kopi 10k pakai DANA\ntissu 5k\nroti 7k pakai BRI")
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "m-hold#2", params["external_id"])
+	assert.Len(t, f.live(t), 1)
+
+	for range 2 {
+		_, err = f.pool.Exec(f.ctx, `
+			UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second'
+			WHERE message_id = 'm-hold'
+		`)
+		require.NoError(t, err)
+		f.say(t, "m-hold", "kopi 10k pakai DANA\ntissu 5k\nroti 7k pakai BRI")
+	}
+	open, err = f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	assert.Len(t, open, 1, "retry reuses the existing line hold")
+	assert.Len(t, f.live(t), 1, "failed line is never synthesized")
+}
+
+func TestCaptureDisplayNumbersStayContiguousAfterHold(t *testing.T) {
+	f := newBotFixture(t, nil)
+	f.say(t, "prior", "gojek 18k pakai cash")
+	f.say(t, "m-sparse", "refund gojek 18k\nkopi 10k pakai cash\ngojek 5k pakai cash")
+
+	txs := f.live(t)
+	var batch []entity.Transaction
+	for _, tx := range txs {
+		if tx.ExternalID != nil && strings.HasPrefix(*tx.ExternalID, "m-sparse#") {
+			batch = append(batch, tx)
+		}
+	}
+	require.Len(t, batch, 2)
+	require.NotNil(t, batch[0].ExternalID)
+	require.NotNil(t, batch[1].ExternalID)
+	assert.Equal(t, "m-sparse#2", *batch[0].ExternalID)
+	assert.Equal(t, "m-sparse#3", *batch[1].ExternalID)
+	assert.Contains(t, f.sender.last(), "2 transaksi tercatat")
+
+	f.say(t, "m-cancel", "batal 1")
+	txs = f.live(t)
+	var reversed int
+	for _, tx := range txs {
+		if tx.ReversesTransactionID != nil {
+			reversed++
+			target, err := f.txRepo.Get(f.ctx, *tx.ReversesTransactionID)
+			require.NoError(t, err)
+			require.NotNil(t, target.ExternalID)
+			assert.Equal(t, "m-sparse#2", *target.ExternalID)
+		}
+	}
+	assert.Equal(t, 1, reversed, "display item 1 maps to the first written line")
+}

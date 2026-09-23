@@ -620,6 +620,7 @@ func (h *Harness) startRefund(
 	state *repository.ChatState,
 	sources []entity.Source,
 	lang string,
+	externalID string,
 ) (string, bool, error) {
 	// "kembalian dari gojek" leaves the shop in a from-clause, not in
 	// the merchant: any of the three names the target.
@@ -659,6 +660,7 @@ func (h *Harness) startRefund(
 		SourceName:            sourceName,
 		OccurredAt:            target.OccurredAt,
 		MessageID:             p.MessageId,
+		ExternalID:            externalID,
 		OriginalText:          p.Text,
 		Chat:                  p.Chat,
 		From:                  p.From,
@@ -667,9 +669,15 @@ func (h *Harness) startRefund(
 		return "", false, err
 	}
 	summary := "Refund " + merchant + " " + money.FormatIDR(target.AmountMinor)
-	action, err := h.pending.Create(ctx, "refund", params, summary)
+	action, err := h.openActionByExternalID(ctx, externalID)
 	if err != nil {
-		return "", false, fmt.Errorf("park refund: %w", err)
+		return "", false, fmt.Errorf("find refund hold: %w", err)
+	}
+	if action == nil {
+		action, err = h.pending.Create(ctx, "refund", params, summary)
+		if err != nil {
+			return "", false, fmt.Errorf("park refund: %w", err)
+		}
 	}
 	expect := "refund_target"
 	state.OpenPendingActionID = &action.ID

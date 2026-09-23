@@ -427,6 +427,9 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	openBefore, err := h.pending.CountOpen(ctx); if err != nil { openBefore = 0 }
 	workCtx, cancel := reserveWorkContext(ctx, p.Type == waga.IncomingMessageTypeImage); defer cancel()
 	result, handleErr, panicked := h.runHandle(workCtx, p)
+	if handleErr != nil && claim.Message != nil && len(claim.Message.TransactionIDs) > 0 {
+		result.TransactionIDs = mergeTransactionIDs(claim.Message.TransactionIDs, result.TransactionIDs)
+	}
 	if result.Lang == "" { result.Lang = "id" }
 	if handleErr != nil {
 		errorsTotal.Add(1)
@@ -548,6 +551,19 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 	return nil
 }
 // outcomeReaction names what the message did to the ledger. A question
+func mergeTransactionIDs(existing, current []uuid.UUID) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(existing)+len(current))
+	seen := make(map[uuid.UUID]struct{}, cap(out))
+	for _, id := range append(existing, current...) {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 // it left open outranks a write: something still needs the user. A
 // message that only informed (a recap, a balance, an unknown) clears
 // the 👀 instead of claiming an effect it never had.

@@ -62,6 +62,7 @@ func (h *Harness) readPhoto(
 	// must still leave the exact fetched media addressable for recovery.
 	if err := h.inbound.SetMediaSha256(ctx, p.MessageId, sha); err != nil {
 		h.log.Warn(traceOf(ctx), "record media hash failed", map[string]any{"error": err.Error()})
+		return "", nil, "", fmt.Errorf("media_hash_persist_failed")
 	}
 
 	prev, err := h.inbound.FindRepliedByMediaSha256(ctx, sha, time.Now().UTC().Add(-photoDuplicateWindow))
