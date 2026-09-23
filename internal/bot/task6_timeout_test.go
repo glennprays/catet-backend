@@ -10,11 +10,11 @@ import (
 
 func TestEnrichmentTimeoutKeepsRawMerchantCaptureWritable(t *testing.T) {
 	script, client := newScriptedLLMWithTimeout(t, 10*time.Second)
-	script.setDelay(6 * time.Second)
+	script.blockCalls()
 	f := newBotFixture(t, client)
-	started := time.Now()
 	f.say(t, "m-enrich-merchant", "traktir temen 10k pakai cash")
-	assert.Less(t, time.Since(started), 11800*time.Millisecond, "the shared enrichment budget must avoid a third provider attempt")
+
+	assert.Equal(t, 1, script.callsOf("merchant_pick"), "merchant enrichment makes one bounded call")
 
 	txs := f.live(t)
 	require.Len(t, txs, 1)
@@ -25,12 +25,12 @@ func TestEnrichmentTimeoutKeepsRawMerchantCaptureWritable(t *testing.T) {
 
 func TestEnrichmentTimeoutOnUnmatchedSourceLeavesHoldWithoutDefault(t *testing.T) {
 	script, client := newScriptedLLMWithTimeout(t, 10*time.Second)
-	script.setDelay(6 * time.Second)
+	script.blockCalls()
 	f := newBotFixture(t, client)
 
-	started := time.Now()
 	f.say(t, "m-enrich-source", "kopi 10k pakai not-a-source")
-	assert.Less(t, time.Since(started), 6500*time.Millisecond, "optional Source repair must stop at its five-second budget")
+
+	assert.Equal(t, 1, script.callsOf("source_pick"), "unmatched Source alias makes one bounded repair call")
 
 	assert.Empty(t, f.live(t), "an unmatched Source alias must never write without a Source")
 	assert.Equal(t, 1, f.openActions(t))
@@ -39,12 +39,12 @@ func TestEnrichmentTimeoutOnUnmatchedSourceLeavesHoldWithoutDefault(t *testing.T
 
 func TestEnrichmentTimeoutOnCategoryStillWritesNeedsReview(t *testing.T) {
 	script, client := newScriptedLLMWithTimeout(t, 10*time.Second)
-	script.setDelay(6 * time.Second)
+	script.blockCalls()
 	f := newBotFixture(t, client)
 
-	started := time.Now()
 	f.say(t, "m-enrich-category", "10k pakai cash")
-	assert.Less(t, time.Since(started), 6500*time.Millisecond, "optional category enrichment must stop at its five-second budget")
+
+	assert.Equal(t, 1, script.callsOf("category_pick"), "category enrichment makes one bounded call")
 
 	txs := f.live(t)
 	require.Len(t, txs, 1)
@@ -55,12 +55,12 @@ func TestEnrichmentTimeoutOnCategoryStillWritesNeedsReview(t *testing.T) {
 
 func TestIntentProviderExhaustionStillStoresAndDeliversReply(t *testing.T) {
 	script, client := newScriptedLLMWithTimeout(t, 100*time.Millisecond)
-	script.setDelay(500 * time.Millisecond)
+	script.blockCalls()
 	script.setIntent(`{"intent":"unknown","drafts":[],"correction":null,"undo_index":0,"period":"","balance_source_id":null,"answer":null}`)
 	f := newBotFixture(t, client)
-
 	f.say(t, "m-intent-timeout", "tolong bantu")
 
+	assert.Equal(t, 2, script.callsOf("intent"), "provider exhaustion consumes both bounded attempts")
 	status, _ := f.inboundRow(t, "m-intent-timeout")
 	assert.Equal(t, "replied", status)
 	assert.NotEmpty(t, f.sender.last(), "intent failure must not leave only the seen reaction")
@@ -75,5 +75,6 @@ func TestDeterministicFooterCaptureSkipsOptionalEnrichment(t *testing.T) {
 	assert.Len(t, f.live(t), 2)
 	assert.Equal(t, 0, script.callsOf("merchant_pick"))
 	assert.Equal(t, 0, script.callsOf("category_pick"))
+	assert.Equal(t, 0, script.callsOf("intent"))
 	assert.Equal(t, 0, script.callsOf("source_pick"))
 }

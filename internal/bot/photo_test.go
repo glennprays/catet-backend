@@ -2,6 +2,7 @@ package bot_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 	"github.com/glennprays/catet-backend/internal/apperror"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/llm"
@@ -34,11 +34,11 @@ type fakeVisionLLM struct {
 	visionCalls int
 	intentCalls int
 	sourceCalls int
+	visionBlock chan struct{}
 	receipt     func() string
 	sourceID    func() uuid.UUID
 	intent      func() string
 }
-
 func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var content string
@@ -46,7 +46,15 @@ func (f *fakeVisionLLM) serve(w http.ResponseWriter, r *http.Request) {
 	case bytes.Contains(body, []byte("image_url")):
 		f.mu.Lock()
 		f.visionCalls++
+		gate := f.visionBlock
 		f.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		content = f.receipt()
 	case bytes.Contains(body, []byte("(intent)")):
 		f.mu.Lock()
@@ -81,6 +89,12 @@ func (f *fakeVisionLLM) sourcePicks() int {
 }
 
 // unknownIntent is the router saying it has no idea: the default script
+
+func (f *fakeVisionLLM) blockVision() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.visionBlock = make(chan struct{})
+}
 // for a test that does not care what it says.
 const unknownIntent = `{"intent":"unknown","drafts":[],"correction":null,"undo_index":0,` +
 	`"period":"","balance_source_id":null,"answer":null}`
@@ -134,6 +148,12 @@ func (f *botFixture) sendPhoto(t *testing.T, messageID, url string, size int, ca
 // newPhotoFixture wires a bot whose LLM is the fake vision endpoint and
 // whose media comes from a local HTTP server.
 func newPhotoFixture(t *testing.T, receipt func(*botFixture) string) (*botFixture, *fakeVisionLLM, string, int) {
+	return newPhotoFixtureWithTimeout(t, receipt, 5*time.Second)
+}
+
+func newPhotoFixtureWithTimeout(
+	t *testing.T, receipt func(*botFixture) string, timeout time.Duration,
+) (*botFixture, *fakeVisionLLM, string, int) {
 	t.Helper()
 	img := jpegBytes(t)
 	media := mediaServer(t, img)
@@ -142,11 +162,39 @@ func newPhotoFixture(t *testing.T, receipt func(*botFixture) string) (*botFixtur
 	llmSrv := httptest.NewServer(http.HandlerFunc(fake.serve))
 	t.Cleanup(llmSrv.Close)
 
-	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", 5*time.Second))
+	f := newBotFixture(t, llm.New(llmSrv.URL, "test-key", "test-model", timeout))
 	fake.receipt = func() string { return receipt(f) }
 	fake.sourceID = func() uuid.UUID { return f.bca.ID }
 	fake.intent = func() string { return unknownIntent }
 	return f, fake, media.URL + "/storage/x.jpg", len(img)
+}
+
+func TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail(t *testing.T) {
+	f, fake, url, size := newPhotoFixtureWithTimeout(t, func(*botFixture) string {
+		return `{"document_type":"receipt","legible":true,"issues":[],"merchant":"Indomaret","date":"","currency":"IDR","has_total_line":true,"total_minor":1000,"subtotal_minor":1000,"discount_minor":0,"tax_minor":0,"rounding_minor":0,"payment_method":"cash","direction":"","counterparty":"","items":[]}`
+	}, 100*time.Millisecond)
+	fake.blockVision()
+	ctx, cancel := context.WithTimeout(f.ctx, 22*time.Second)
+	defer cancel()
+
+	err := f.harness.Process(ctx, &waga.IncomingWebhookPayload{
+		Event: waga.IncomingEventMessageMessageIncoming,
+		Chat: ownerPhone[1:] + "@s.whatsapp.net",
+		From: ownerPhone[1:] + ":42@s.whatsapp.net",
+		MessageId: "m-vision-timeout",
+		PushName: "Owner",
+		Timestamp: time.Now().Unix(),
+		Type: waga.IncomingMessageTypeImage,
+		Media: &waga.IncomingMessageMediaInfo{
+			Type: waga.IncomingMessageTypeImage, Url: url,
+			MimeType: "image/jpeg", Size: size,
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, fake.calls(), "vision provider is exhausted through both attempts")
+	status, _ := f.inboundRow(t, "m-vision-timeout")
+	assert.Equal(t, "replied", status)
+	assert.NotEmpty(t, f.sender.last(), "vision exhaustion stores and delivers a refusal")
 }
 
 // twoLineReceipt is the canonical reading: two items that add up to the

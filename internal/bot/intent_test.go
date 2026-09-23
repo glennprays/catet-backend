@@ -27,7 +27,7 @@ type scriptedLLM struct {
 	category string
 	source   string
 	merchant string
-	delay    time.Duration
+	block    chan struct{}
 	calls    map[string]int
 	prompts  []string
 }
@@ -55,47 +55,47 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Len(t, body.Messages, 2)
 
-		s.mu.Lock()
-		delay := s.delay
-		s.mu.Unlock()
-		if delay > 0 {
-			time.Sleep(delay)
-		}
+	s.mu.Lock()
+	kind := "unknown"
+	switch {
+	case strings.Contains(body.Messages[0].Content, "(intent)"):
+		kind = "intent"
+	case strings.Contains(body.Messages[0].Content, "(category_pick)"):
+		kind = "category_pick"
+	case strings.Contains(body.Messages[0].Content, "(source_pick)"):
+		kind = "source_pick"
+	case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
+		kind = "merchant_pick"
+	}
+	s.calls[kind]++
+	s.prompts = append(s.prompts, body.Messages[1].Content)
+	content := map[string]string{
+		"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
+		"merchant_pick": s.merchant,
+	}[kind]
+	gate := s.block
+	s.mu.Unlock()
 
-		s.mu.Lock()
-		kind := "unknown"
-		switch {
-		case strings.Contains(body.Messages[0].Content, "(intent)"):
-			kind = "intent"
-		case strings.Contains(body.Messages[0].Content, "(category_pick)"):
-			kind = "category_pick"
-		case strings.Contains(body.Messages[0].Content, "(source_pick)"):
-			kind = "source_pick"
-		case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
-			kind = "merchant_pick"
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
 		}
-		s.calls[kind]++
-		s.prompts = append(s.prompts, body.Messages[1].Content)
-		content := map[string]string{
-			"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
-			"merchant_pick": s.merchant,
-		}[kind]
-		s.mu.Unlock()
-
-		require.NotEmpty(t, content, "no script for %s prompt", kind)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
-		})
+	}
+	require.NotEmpty(t, content, "no script for %s prompt", kind)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+	})
 	}))
 	t.Cleanup(srv.Close)
 	return s, llm.New(srv.URL, "test-key", "test-model", timeout)
 }
-
-func (s *scriptedLLM) setDelay(delay time.Duration) {
+func (s *scriptedLLM) blockCalls() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.delay = delay
+	s.block = make(chan struct{})
 }
 
 func (s *scriptedLLM) setIntent(body string) {
