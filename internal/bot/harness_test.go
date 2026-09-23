@@ -1245,3 +1245,70 @@ func TestCaptureDisplayNumbersStayContiguousAfterHold(t *testing.T) {
 	}
 	assert.Equal(t, 1, reversed, "display item 1 maps to the first written line")
 }
+
+func TestCaptureResolvedOrDiscardedHoldIsNotRecreated(t *testing.T) {
+	for _, actionName := range []string{"confirm", "discard"} {
+		t.Run(actionName, func(t *testing.T) {
+			f := newBotFixture(t, nil)
+			params := json.RawMessage(`{"message_id":"m-resolved","external_id":"m-resolved#1","missing":["source"]}`)
+			action, err := f.pending.Create(f.ctx, "capture", params, "tissu 20k")
+			require.NoError(t, err)
+			_, err = f.pending.Resolve(f.ctx, action.ID, actionName)
+			require.NoError(t, err)
+
+			f.say(t, "m-resolved", "tissu 20k")
+
+			var count int
+			require.NoError(t, f.pool.QueryRow(f.ctx,
+				`SELECT COUNT(*) FROM pending_actions WHERE kind = 'capture'
+				 AND params->>'external_id' = 'm-resolved#1'`,
+			).Scan(&count))
+			assert.Equal(t, 1, count)
+			open, err := f.pending.ListOpen(f.ctx)
+			require.NoError(t, err)
+			assert.Empty(t, open)
+			assert.Empty(t, f.live(t))
+		})
+	}
+}
+
+func TestPendingActionExternalIDCreationIsAtomic(t *testing.T) {
+	f := newBotFixture(t, nil)
+	ctx := f.ctx
+	params := json.RawMessage(`{"message_id":"m-concurrent","external_id":"m-concurrent#1","missing":["source"]}`)
+	const workers = 8
+	results := make(chan *entity.PendingAction, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			action, err := f.pending.FindOrCreateByExternalID(ctx, "capture", "m-concurrent#1", params, "tissu 20k")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- action
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	var first uuid.UUID
+	for action := range results {
+		if first == uuid.Nil {
+			first = action.ID
+		}
+		assert.Equal(t, first, action.ID)
+	}
+	var count int
+	require.NoError(t, f.pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM pending_actions
+		 WHERE kind = 'capture' AND params->>'external_id' = 'm-concurrent#1'`,
+	).Scan(&count))
+	assert.Equal(t, 1, count)
+}

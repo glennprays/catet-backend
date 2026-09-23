@@ -669,15 +669,12 @@ func (h *Harness) startRefund(
 		return "", false, err
 	}
 	summary := "Refund " + merchant + " " + money.FormatIDR(target.AmountMinor)
-	action, err := h.openActionByExternalID(ctx, externalID)
+	action, err := h.pending.FindOrCreateByExternalID(ctx, "refund", externalID, params, summary)
 	if err != nil {
-		return "", false, fmt.Errorf("find refund hold: %w", err)
+		return "", false, fmt.Errorf("park refund: %w", err)
 	}
-	if action == nil {
-		action, err = h.pending.Create(ctx, "refund", params, summary)
-		if err != nil {
-			return "", false, fmt.Errorf("park refund: %w", err)
-		}
+	if action.ResolvedAt != nil {
+		return "", false, nil
 	}
 	expect := "refund_target"
 	state.OpenPendingActionID = &action.ID

@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -92,27 +91,6 @@ func wrapDrafts(in []parse.Draft) []draft {
 	return out
 }
 
-func (h *Harness) openActionByExternalID(ctx context.Context, externalID string) (*entity.PendingAction, error) {
-	if externalID == "" {
-		return nil, nil
-	}
-	open, err := h.pending.ListOpen(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range open {
-		var params struct {
-			ExternalID string `json:"external_id"`
-		}
-		if err := json.Unmarshal(open[i].Params, &params); err != nil {
-			continue
-		}
-		if params.ExternalID == externalID {
-			return &open[i], nil
-		}
-	}
-	return nil, nil
-}
 
 // capture resolves every draft, writes what the rules fully decided and
 // parks the rest. At most one clarifying question leaves the bot per
@@ -164,19 +142,17 @@ func (h *Harness) capture(
 	)
 
 	askOrDefer := func(summary, question string, params captureParams) error {
-		action, err := h.openActionByExternalID(ctx, params.ExternalID)
+		raw, err := jsonParams(params)
 		if err != nil {
-			return fmt.Errorf("find capture hold: %w", err)
+			return err
 		}
-		if action == nil {
-			raw, err := jsonParams(params)
-			if err != nil {
-				return err
-			}
-			action, err = h.pending.Create(ctx, "capture", raw, summary)
-			if err != nil {
-				return fmt.Errorf("park capture: %w", err)
-			}
+		action, err := h.pending.FindOrCreateByExternalID(ctx, "capture", params.ExternalID, raw, summary)
+		if err != nil {
+			return fmt.Errorf("park capture: %w", err)
+		}
+		if action.ResolvedAt != nil {
+			deferred++
+			return nil
 		}
 		// The first unresolved draft owns the chat's single question; any
 		// further one is only answerable in the dashboard.
