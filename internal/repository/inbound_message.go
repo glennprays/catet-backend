@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	workLeaseInterval     = "3 minutes"
-	deliveryLeaseInterval = "30 seconds"
-	minimumRetryDelay     = 15 * time.Second
-	maximumRetryDelay     = 5 * time.Minute
-	maximumWorkAttempts   = 3
+	workLeaseInterval       = "3 minutes"
+	deliveryLeaseInterval   = "30 seconds"
+	minimumRetryDelay       = 15 * time.Second
+	maximumRetryDelay       = 5 * time.Minute
+	maximumWorkAttempts     = 3
+	maximumDeliveryAttempts = 5
 )
 
 var (
@@ -85,12 +86,15 @@ type InboundClaim struct {
 	Lease   *InboundLease
 }
 
-// InboundResult is committed before any outbound reply attempt.
+// InboundResult is committed before any outbound reply attempt. ErrorCode is
+// an internal stable stage identifier; StoreInboundResult sanitizes it before
+// writing the audit row.
 type InboundResult struct {
 	ReplyText       string
 	TransactionIDs  []uuid.UUID
 	Lang            string
 	OutcomeReaction string
+	ErrorCode       string
 }
 
 type InboundMessageRepository struct {
@@ -307,11 +311,11 @@ func (r *InboundMessageRepository) StoreInboundResult(ctx context.Context, lease
 	err := r.db.QueryRow(ctx,
 		`UPDATE inbound_messages
 		 SET status = 'ready', reply_text = $1, transaction_ids = $2, lang = $3, outcome_reaction = $4,
-		     lease_until = now() + $5::interval, next_attempt_at = now()
-		 WHERE message_id = $6 AND status = 'processing' AND lease_until = $7 AND work_attempts = $8
+		     last_error = $5, lease_until = now() + $6::interval, next_attempt_at = now()
+		 WHERE message_id = $7 AND status = 'processing' AND lease_until = $8 AND work_attempts = $9
 		 RETURNING `+inboundColumns,
-		result.ReplyText, ids, lang, nullIfEmpty(result.OutcomeReaction), deliveryLeaseInterval,
-		lease.messageID, lease.until, lease.workAttempts,
+		result.ReplyText, ids, lang, nullIfEmpty(result.OutcomeReaction), sanitizedOptionalStage(result.ErrorCode),
+		deliveryLeaseInterval, lease.messageID, lease.until, lease.workAttempts,
 	).Scan(row.scanTargets()...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrInboundLeaseLost
@@ -343,11 +347,28 @@ func (r *InboundMessageRepository) MarkInboundReplied(ctx context.Context, lease
 }
 
 // RescheduleInbound releases a failed delivery without losing its stored
-// result. Only a stable stage code enters the audit column.
+// result. Only a stable stage code enters the audit column. The final allowed
+// failed handoff is terminally dropped so recovery cannot retry forever.
 func (r *InboundMessageRepository) RescheduleInbound(ctx context.Context, lease *InboundLease, stage string) error {
 	if !validLease(lease, "ready") {
 		return ErrInboundLeaseLost
 	}
+	if lease.deliveryAttempts+1 >= maximumDeliveryAttempts {
+		tag, err := r.db.Exec(ctx,
+			`UPDATE inbound_messages
+			 SET status = 'dropped', delivery_attempts = delivery_attempts + 1, lease_until = NULL, last_error = $1
+			 WHERE message_id = $2 AND status = 'ready' AND lease_until = $3 AND delivery_attempts = $4`,
+			sanitizeStage(stage), lease.messageID, lease.until, lease.deliveryAttempts,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrInboundLeaseLost
+		}
+		return nil
+	}
+
 	delay := retryDelay(lease.deliveryAttempts + 1)
 	tag, err := r.db.Exec(ctx,
 		`UPDATE inbound_messages
@@ -562,6 +583,13 @@ func retryDelay(attempt int) time.Duration {
 		return maximumRetryDelay
 	}
 	return delay
+}
+
+func sanitizedOptionalStage(stage string) any {
+	if stage == "" {
+		return nil
+	}
+	return sanitizeStage(stage)
 }
 
 func sanitizeStage(stage string) string {

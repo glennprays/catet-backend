@@ -230,7 +230,7 @@ func TestRescheduleInboundSanitizesErrorsAndFencesStaleDeliveryLease(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, "reply_transport_timeout", *stored.LastError)
 	assert.WithinDuration(t, time.Now().Add(30*time.Second), stored.NextAttemptAt, 2*time.Second)
-	for attempt := 3; attempt <= 6; attempt++ {
+	for attempt := 3; attempt <= 4; attempt++ {
 		_, err = pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
 		require.NoError(t, err)
 		retry, err = repo.ClaimInbound(ctx, m)
@@ -241,7 +241,94 @@ func TestRescheduleInboundSanitizesErrorsAndFencesStaleDeliveryLease(t *testing.
 		require.NoError(t, err)
 		assert.LessOrEqual(t, stored.NextAttemptAt.Sub(time.Now()), 5*time.Minute+2*time.Second)
 	}
-	assert.WithinDuration(t, time.Now().Add(5*time.Minute), stored.NextAttemptAt, 2*time.Second)
+	assert.WithinDuration(t, time.Now().Add(2*time.Minute), stored.NextAttemptAt, 2*time.Second)
+}
+
+// A delivery that repeatedly fails must eventually become terminal; otherwise
+// startup recovery retries the same reply forever despite a bounded policy.
+func TestRescheduleInboundDropsAtDeliveryAttemptLimit(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000810", "Inbound delivery drop")
+	repo := repository.NewInboundMessageRepository(pool)
+	m := &repository.InboundMessage{MessageID: "wamid.delivery-drop", Chat: "628111000810@s.whatsapp.net", FromJID: "628111000810@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+	id := uuid.New()
+	lease := storeResult(t, ctx, repo, claimWork(t, ctx, repo, m).Lease, []uuid.UUID{id})
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		require.NoError(t, repo.RescheduleInbound(ctx, lease, "reply_transport_timeout"))
+		if attempt == 5 {
+			break
+		}
+		_, err := pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+		require.NoError(t, err)
+		claim, err := repo.ClaimInbound(ctx, m)
+		require.NoError(t, err)
+		require.Equal(t, repository.InboundClaimDelivery, claim.Kind)
+		lease = claim.Lease
+	}
+
+	stored, err := repo.Get(ctx, m.MessageID)
+	require.NoError(t, err)
+	assert.Equal(t, "dropped", stored.Status)
+	assert.Equal(t, 5, stored.DeliveryAttempts)
+	assert.Equal(t, "Sip, tercatat.", *stored.ReplyText)
+	assert.Equal(t, []uuid.UUID{id}, stored.TransactionIDs)
+	assert.Equal(t, "accepted", *stored.OutcomeReaction)
+	assert.Equal(t, "reply_transport_timeout", *stored.LastError)
+	_, err = pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+	require.NoError(t, err)
+	due, err := repo.ListDueInbound(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due)
+}
+
+func TestMarkInboundRepliedSucceedsBeforeDeliveryAttemptLimit(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000811", "Inbound delivery reply")
+	repo := repository.NewInboundMessageRepository(pool)
+	m := &repository.InboundMessage{MessageID: "wamid.delivery-reply", Chat: "628111000811@s.whatsapp.net", FromJID: "628111000811@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+	lease := storeResult(t, ctx, repo, claimWork(t, ctx, repo, m).Lease, nil)
+	for attempt := 1; attempt <= 4; attempt++ {
+		require.NoError(t, repo.RescheduleInbound(ctx, lease, "reply_transport_timeout"))
+		_, err := pool.Exec(context.Background(), `UPDATE inbound_messages SET next_attempt_at = now() - interval '1 second' WHERE message_id = $1`, m.MessageID)
+		require.NoError(t, err)
+		claim, err := repo.ClaimInbound(ctx, m)
+		require.NoError(t, err)
+		lease = claim.Lease
+	}
+	require.NoError(t, repo.MarkInboundReplied(ctx, lease))
+	stored, err := repo.Get(ctx, m.MessageID)
+	require.NoError(t, err)
+	assert.Equal(t, "replied", stored.Status)
+}
+
+// Work failures are stored before delivery, but only a stable stage code may
+// survive in the audit row; provider URLs and raw error text are not safe.
+func TestStoreInboundResultPersistsOnlySanitizedErrorCode(t *testing.T) {
+	pool := testkit.NewDB(t)
+	ctx, userID := testkit.Scoped(t, pool, "+628111000812", "Inbound result error")
+	repo := repository.NewInboundMessageRepository(pool)
+	makeMessage := func(id string) *repository.InboundMessage {
+		return &repository.InboundMessage{MessageID: id, Chat: "628111000812@s.whatsapp.net", FromJID: "628111000812@s.whatsapp.net", UserID: &userID, OccurredAt: time.Now().UTC(), Body: "kopi 25k", Kind: "text"}
+	}
+	store := func(m *repository.InboundMessage, code string) *repository.InboundMessage {
+		work := claimWork(t, ctx, repo, m)
+		_, err := repo.StoreInboundResult(ctx, work.Lease, repository.InboundResult{
+			ReplyText: "Aduh, belum lengkap.", Lang: "id", ErrorCode: code,
+		})
+		require.NoError(t, err)
+		stored, err := repo.Get(ctx, m.MessageID)
+		require.NoError(t, err)
+		return stored
+	}
+
+	valid := store(makeMessage("wamid.result-error.valid"), "photo_vision_timeout")
+	require.NotNil(t, valid.LastError)
+	assert.Equal(t, "photo_vision_timeout", *valid.LastError)
+	raw := store(makeMessage("wamid.result-error.raw"), "provider timeout https://vision.example/upload?prompt=receipt")
+	require.NotNil(t, raw.LastError)
+	assert.Equal(t, "internal_error", *raw.LastError)
+	assert.NotContains(t, *raw.LastError, "https")
 }
 
 // A regression here loses the ids already written by a partial batch, or
