@@ -399,6 +399,9 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 		claim, err = h.inbound.ClaimInbound(ctx, msg)
 		if err != nil { return fmt.Errorf("record dropped message: %w", err) }
 		if claim.Kind == repository.InboundClaimReplay || claim.Kind == repository.InboundClaimBusy || user == nil {
+			if claim.Kind == repository.InboundClaimReplay && claim.Message != nil && claim.Message.Status == "dropped" {
+				droppedTotal.Add(1)
+			}
 			if user == nil && !p.IsGroup && h.inviter != nil { _, _ = h.inviter.Reissue(ctx, gateway.UserPart(p.From)) }
 			return nil
 		}
@@ -424,8 +427,10 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 	h.react(ctx, p.Chat, p.MessageId, p.From, reactSeen)
 	h.typing(ctx, p.Chat, true)
 	defer func() { fctx, cancel := h.finalizeContext(ctx); defer cancel(); h.typing(fctx, p.Chat, false) }()
-	openBefore, err := h.pending.CountOpen(ctx); if err != nil { openBefore = 0 }
-	workCtx, cancel := reserveWorkContext(ctx, p.Type == waga.IncomingMessageTypeImage); defer cancel()
+	openBefore, err := h.pending.CountOpen(ctx)
+	if err != nil { openBefore = 0 }
+	workCtx, cancel := reserveWorkContext(ctx, p.Type == waga.IncomingMessageTypeImage)
+	defer cancel()
 	result, handleErr, panicked := h.runHandle(workCtx, p)
 	if handleErr != nil && claim.Message != nil && len(claim.Message.TransactionIDs) > 0 {
 		result.TransactionIDs = mergeTransactionIDs(claim.Message.TransactionIDs, result.TransactionIDs)
@@ -437,14 +442,13 @@ func (h *Harness) Process(ctx context.Context, p *waga.IncomingWebhookPayload) e
 		result.Reply = tmpl.Render(result.Lang, "error_generic", nil)
 		result.OutcomeReaction = reactRejected
 	}
-	if handleErr != nil && len(result.TransactionIDs) > 0 && !panicked {
+	if handleErr != nil && !panicked {
 		fctx, fcancel := h.finalizeContext(ctx)
 		defer fcancel()
 		stage := result.Stage
-		if stage == "" {
-			stage = "inbound_work"
-		}
-		return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, stage+"_partial", p.Chat, p.MessageId, p.From)
+		if stage == "" { stage = "inbound_work" }
+		if len(result.TransactionIDs) > 0 { stage += "_partial" } else { stage += "_error" }
+		return h.releaseWork(fctx, claim.Lease, result.TransactionIDs, result.Lang, stage, p.Chat, p.MessageId, p.From)
 	}
 	if result.OutcomeReaction == "" {
 		result.OutcomeReaction = h.outcomeReaction(ctx, handleErr, openBefore, result.TransactionIDs, p.Type == waga.IncomingMessageTypeImage)
@@ -545,6 +549,18 @@ func (h *Harness) storeIncomplete(ctx context.Context, lease *repository.Inbound
 	reply := tmpl.Render(lang, "capture_incomplete", map[string]any{"Items": items})
 	delivery, err := h.inbound.StoreInboundResult(ctx, lease, repository.InboundResult{ReplyText: reply, TransactionIDs: ids, Lang: lang, OutcomeReaction: reactRejected})
 	if err != nil { return err }
+	if len(ids) > 0 {
+		state, stateErr := h.chats.Get(ctx, chat)
+		if stateErr == nil {
+			if state == nil { state = &repository.ChatState{Chat: chat} }
+			state.LastBatchMessageID = &messageID
+			if saveErr := h.saveState(ctx, state); saveErr != nil {
+				h.log.Warn(traceOf(ctx), "save incomplete batch pointer failed", map[string]any{"error": saveErr.Error()})
+			}
+		} else {
+			h.log.Warn(traceOf(ctx), "load chat state for incomplete batch failed", map[string]any{"error": stateErr.Error()})
+		}
+	}
 	if err := h.send(ctx, chat, reply, "reply:"+messageID); err != nil { _ = h.inbound.RescheduleInbound(ctx, delivery, "reply_transport_timeout"); return nil }
 	if err := h.inbound.MarkInboundReplied(ctx, delivery); err != nil { return err }
 	h.react(ctx, chat, messageID, from, reactRejected)
