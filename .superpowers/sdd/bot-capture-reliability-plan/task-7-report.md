@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented as `c175c735b2444bb67f98318058b56598d54480f2`; review fixes are `b54faedb233ed6ad89064b5e28efcd9083f5c1f5`, `cc066e87a6bd9a29dbb52bc572800d34c3ca97a1`, and `f311361067e0608737e03e52481bb2b7315568f5` (`replay terminal pending actions safely`).
+Implemented as `c175c735b2444bb67f98318058b56598d54480f2`; review fixes are `b54faedb233ed6ad89064b5e28efcd9083f5c1f5`, `cc066e87a6bd9a29dbb52bc572800d34c3ca97a1`, `f311361067e0608737e03e52481bb2b7315568f5`, and `466ee50f9442a5ea7bf44cdf1878d1da79288f10` (`reuse original receipt draft on photo retry`).
 
 ## Conflict adoption and partial-id decisions
 
@@ -90,3 +90,8 @@ A complete `go test ./internal/bot/... -race -count=1` run also exercised `inter
   `go test ./internal/bot -race -run 'TestCaptureWritesExpenseAndReplaysDuplicate|TestCaptureConflictAdoptsExistingLine|TestCapturePostWriteFailurePreservesPartialIDs|TestCaptureRetryDoesNotDuplicateHoldAction|TestCaptureDisplayNumbersStayContiguousAfterHold|TestCaptureResolvedOrDiscardedHoldIsNotRecreated|TestRefundResolvedActionReplaysSafely|TestPendingActionExternalIDCreationIsAtomic|TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail|TestPhotoFailedReadIsReplayedAsDuplicate|TestPhotoNoTotalStoresRejectedOutcomeWithoutMoney|TestPhotoHashPersistenceFailureRefusesBeforeVision|TestPhotoCiphertextIsUnreadable|TestImageWithoutMediaGetsUnsupportedReplyAndRejectedReaction|TestPhotoParksReceiptThenYaWritesLines' -count=1`
 
   Result: `ok github.com/glennprays/catet-backend/internal/bot 10.307s`.
+## Photo action-param replay follow-up
+
+- When `FindOrCreateByExternalID` reuses an unresolved receipt action, `readPhoto` now unmarshals the action's stored Params and replaces fresh vision/caption-derived receipt data before rendering summary, Hold Queue state, or confirmation payloads. A changed retry cannot alter what the user approves.
+- Added a deterministic DB-backed test that forces the first inbound result store to fail, changes the vision merchant on retry, and proves the original merchant/Params remain with one action and no ledger transaction.
+- Focused race result: `go test ./internal/bot -race -run '^TestPhotoRetryReusesOriginalReceiptActionParams$' -count=1` → `ok github.com/glennprays/catet-backend/internal/bot 1.647s`. The full 16-test Task 7 focused race expression including this recovery test passed: `ok github.com/glennprays/catet-backend/internal/bot 11.009s`.
