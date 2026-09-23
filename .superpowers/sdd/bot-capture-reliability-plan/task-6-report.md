@@ -1,8 +1,9 @@
 # Task 6 report — bounded enrichment and core-tail deadlines
 
-## Commit
+## Commits
 
-Implementation commit: `bda26d158dfb97bd872246252d783b5c05ba37e7` (`bound bot enrichment and reserve core deadlines`).
+- Implementation: `bda26d158dfb97bd872246252d783b5c05ba37e7` (`bound bot enrichment and reserve core deadlines`).
+- Focused-test corrections: `fd1ea59908d1a4e18ae00144a8f137b7f630bddc` (`test bot enrichment cancellation and vision tail`).
 
 ## Context tree and deadline decisions
 
@@ -17,7 +18,7 @@ Implementation commit: `bda26d158dfb97bd872246252d783b5c05ba37e7` (`bound bot en
 - Merchant model timeout/cancellation: canonicalization returns to raw/tidied merchant creation under the core context; the capture remains writable and the reply is delivered.
 - Unmatched `pakai` Source alias: deterministic rules run first; a model result is accepted only if it is whitelisted. Timeout, cancellation, null, or invalid id returns no Source, suppresses memory/default inference, and parks the normal Source Hold rather than inventing an account.
 - Category timeout/cancellation/null/invalid result: merchant category memory is checked with the core context first; otherwise the transaction writes with no category and `needs_review` (the existing uncategorized safe state).
-- A deterministic multiline capture with a shared trailing Source footer skips optional merchant/source/category AI entirely. The footer is resolved by deterministic Source rules, merchant memory uses `ResolveUser` on the core context to avoid a second model call from ledger persistence, and category remains `needs_review` unless the user supplied an explicit whitelisted category.
+- A deterministic multiline capture with a shared trailing Source footer skips optional merchant/source/category AI entirely. The footer is resolved by deterministic Source rules, merchant memory uses `ResolveUser` on the core context to avoid a second model call from ledger persistence, and category remains `needs_review` unless the user supplied an explicit whitelisted category. The focused test also asserts zero intent-router calls.
 - Intent/vision provider exhaustion remains on the reserved core work context and follows the existing safe intent/vision refusal/fallback. Durable result storage and reply delivery use fresh finalization contexts, so the user receives a stored response instead of only `👀` or a canceled-context persistence failure.
 
 ## Red evidence (before production changes)
@@ -27,13 +28,15 @@ Implementation commit: `bda26d158dfb97bd872246252d783b5c05ba37e7` (`bound bot en
 
 ## Green evidence
 
-- `go test ./internal/bot -run 'Test(EnrichmentTimeout|IntentProviderExhaustion|DeterministicFooterCapture)' -race -count=1`
-  - `ok github.com/glennprays/catet-backend/internal/bot 20.592s`
+- `go test ./internal/bot -run 'Test(EnrichmentTimeout|IntentProviderExhaustion|DeterministicFooterCapture|PhotoVisionExhaustion)' -race -count=1`
+  - `ok github.com/glennprays/catet-backend/internal/bot 18.702s`
+- `go test ./internal/bot -run '^TestPhotoVisionExhaustionStoresRejectedReplyWithCoreTail$' -count=1`
+  - `ok github.com/glennprays/catet-backend/internal/bot 0.597s`
 - `go test ./internal/bot -run 'Test(MultilineBatchCaptureUsesTrailingSourceWithoutIntent|CaptureWritesExpenseAndReplaysDuplicate|CaptureCanonicalMerchant|EnrichmentTimeout|IntentProviderExhaustion|DeterministicFooterCapture)' -race -count=1`
   - `ok github.com/glennprays/catet-backend/internal/bot 21.846s`
 - `go test ./internal/service -run '^TestMerchant|^TestResolveUser' -race -count=1`
   - `ok github.com/glennprays/catet-backend/internal/service 3.562s`
-- Focused timeout/boundary coverage verifies: raw merchant writes and replies after delayed enrichment, unmatched Source creates a Hold with no ledger row, delayed category writes `needs_review`, exhausted intent still reaches `replied`, and deterministic footer batches make zero merchant/category/source model calls.
+- The corrected delayed-provider tests use request-context cancellation gates rather than wall-clock sleeps. They assert bounded call counts and observable outcomes: raw merchant writes/replies, unmatched Source Hold with no ledger row, delayed category `needs_review`, two exhausted intent attempts with `replied`, two exhausted vision attempts with a persisted `replied` error response under an actual 22-second outer deadline, and deterministic footer batches with zero merchant/category/source/intent model calls.
 
 ## Changed files
 
@@ -42,11 +45,12 @@ Implementation commit: `bda26d158dfb97bd872246252d783b5c05ba37e7` (`bound bot en
 - `internal/bot/resolve.go`: enrichment context for Source alias/category model calls, deterministic-first and Hold/needs-review fallbacks.
 - `internal/bot/photo.go`: receipt merchant canonicalization now uses the core/model context seam while vision remains on the reserved core work context.
 - `internal/service/merchant.go`: minimal `ResolveWithModelContext` split so model timeout cannot poison core merchant memory writes.
-- `internal/bot/intent_test.go`: deterministic delayed HTTP scripted LLM support.
-- `internal/bot/task6_timeout_test.go`: red/green focused timeout and model-call-boundary tests.
+- `internal/bot/intent_test.go`: deterministic context-aware blocking scripted LLM support and call counting.
+- `internal/bot/task6_timeout_test.go`: deterministic cancellation-gate enrichment, intent, and footer boundary tests.
+- `internal/bot/photo_test.go`: delayed two-attempt vision test with an actual outer deadline and durable reply assertion.
 
 ## Concerns
 
 - The full `go test ./internal/bot -race -count=1` package run reached an existing unrelated failure in `TestGroupMessagesAreDropped` (expected nil user id but observed a UUID); the Task 6 focused regression commands above pass. No formatter, linter, `make test`, or project-wide suite was run.
-- The delayed HTTP tests intentionally use six-second provider responses to prove the five-second budget and therefore make the focused run take about twenty seconds.
+- The delayed enrichment tests still wait for the real five-second production budget, but the provider itself is controlled by cancellation-aware gates rather than arbitrary sleeps or narrow elapsed-time margins.
 - No public API, migration, parser segmentation/footer rule, repository lease lifecycle, generated client, or OpenAPI file was changed.
