@@ -32,7 +32,6 @@ type scriptedLLM struct {
 	calls         map[string]int
 	prompts       []string
 	deadline      time.Duration
-	deadlines     map[string][]time.Duration
 	cancellations map[string]int
 }
 
@@ -48,7 +47,6 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 		merchant:      `{"merchant_id":null,"name":"","confidence":0}`,
 		calls:         map[string]int{},
 		blocks:        map[string]chan struct{}{},
-		deadlines:     map[string][]time.Duration{},
 		cancellations: map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +83,6 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 		if deadline, ok := r.Context().Deadline(); ok {
 			remaining := deadline.Sub(time.Now())
 			s.deadline = remaining
-			s.deadlines[kind] = append(s.deadlines[kind], remaining)
 		}
 		s.mu.Unlock()
 
@@ -150,21 +147,12 @@ func (s *scriptedLLM) requestDeadline() time.Duration {
 	return s.deadline
 }
 
-func (s *scriptedLLM) requestDeadlineOf(kind string) time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	values := s.deadlines[kind]
-	if len(values) == 0 {
-		return 0
-	}
-	return values[len(values)-1]
-}
-
 func (s *scriptedLLM) cancellationsOf(kind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cancellations[kind]
 }
+
 
 func (s *scriptedLLM) lastPrompt() string {
 	s.mu.Lock()

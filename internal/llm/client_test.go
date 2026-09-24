@@ -43,6 +43,7 @@ func jsonString(s string) string {
 func newTestClient(url string) *llm.Client {
 	return llm.New(url, "test-key", "test-model", 2*time.Second)
 }
+
 func TestRequestTimeoutUsesNormalizedTextSettings(t *testing.T) {
 	ctx := context.Background()
 	const providerSecret = "provider-secret-must-not-escape"

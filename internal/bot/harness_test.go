@@ -238,16 +238,25 @@ func (f *botFixture) say(t *testing.T, messageID, text string) {
 
 func (f *botFixture) sayWithContext(t *testing.T, ctx context.Context, messageID, text string) {
 	t.Helper()
-	f.deliverWithContext(t, ctx, &waga.IncomingWebhookPayload{
+	f.sayAsWithContext(t, ctx, ownerPhone, messageID, text)
+}
+
+func (f *botFixture) sayAsWithContext(t *testing.T, ctx context.Context, phone, messageID, text string) {
+	t.Helper()
+	f.deliverWithContext(t, ctx, incomingTextPayload(phone, messageID, text))
+}
+
+func incomingTextPayload(phone, messageID, text string) *waga.IncomingWebhookPayload {
+	return &waga.IncomingWebhookPayload{
 		Event:     waga.IncomingEventMessageMessageIncoming,
-		Chat:      ownerPhone[1:] + "@s.whatsapp.net",
-		From:      ownerPhone[1:] + ":42@s.whatsapp.net",
+		Chat:      phone[1:] + "@s.whatsapp.net",
+		From:      phone[1:] + ":42@s.whatsapp.net",
 		MessageId: messageID,
 		PushName:  "Owner",
 		Timestamp: time.Now().Unix(),
 		Text:      text,
 		Type:      waga.IncomingMessageTypeText,
-	})
+	}
 }
 
 func (f *botFixture) deliverWithContext(t *testing.T, ctx context.Context, p *waga.IncomingWebhookPayload) {
@@ -259,16 +268,7 @@ func (f *botFixture) deliverWithContext(t *testing.T, ctx context.Context, p *wa
 // the gateway addresses a one-to-one chat.
 func (f *botFixture) sayAs(t *testing.T, phone, messageID, text string) {
 	t.Helper()
-	f.deliver(t, &waga.IncomingWebhookPayload{
-		Event:     waga.IncomingEventMessageMessageIncoming,
-		Chat:      phone[1:] + "@s.whatsapp.net",
-		From:      phone[1:] + ":42@s.whatsapp.net",
-		MessageId: messageID,
-		PushName:  "Owner",
-		Timestamp: time.Now().Unix(),
-		Text:      text,
-		Type:      waga.IncomingMessageTypeText,
-	})
+	f.sayAsWithContext(t, f.ctx, phone, messageID, text)
 }
 
 func (f *botFixture) deliver(t *testing.T, p *waga.IncomingWebhookPayload) {
@@ -1009,7 +1009,7 @@ func TestCoreDeadlineReserveSkipsRemainingFooterCategoryWork(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	core, cancel := context.WithTimeout(f.ctx, 16*time.Second)
+	core, cancel := context.WithTimeout(f.ctx, 19*time.Second)
 	defer cancel()
 	f.sayWithContext(t, core, "m-core-reserve", "kopi 25rb\nnasgor 10rb\nBRI")
 

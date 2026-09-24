@@ -33,6 +33,7 @@ func TestCategoryModelContextCapsAndReservesCoreDeadline(t *testing.T) {
 	require.True(t, hasDeadline)
 	require.WithinDuration(t, deadline.Add(-categoryWriteReserve), modelDeadline, 100*time.Millisecond)
 }
+
 func TestCategoryModelContextSkipsWithoutUsefulCoreTime(t *testing.T) {
 	h := &Harness{llm: llm.New("https://provider.example", "key", "model", time.Second)}
 

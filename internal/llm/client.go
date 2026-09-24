@@ -120,6 +120,7 @@ func (c *Client) Enabled(ctx context.Context) bool {
 	}
 	return strings.TrimSpace(c.source.Current(ctx).APIKey) != ""
 }
+
 // RequestTimeout reports the normalised text-request timeout currently
 // configured for the provider. It is safe on a nil client and returns only
 // the duration, never provider settings such as the API key.

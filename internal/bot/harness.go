@@ -536,7 +536,6 @@ func (h *Harness) categoryModelContext(ctx context.Context) (context.Context, co
 	return modelCtx, cancel, true
 }
 
-
 func (h *Harness) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }

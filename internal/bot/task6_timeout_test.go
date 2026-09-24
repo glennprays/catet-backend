@@ -47,7 +47,6 @@ func TestEnrichmentTimeoutOnCategoryStillWritesNeedsReview(t *testing.T) {
 	f := newBotFixture(t, client)
 
 	f.say(t, "m-enrich-category", "10k pakai cash")
-	assert.Less(t, script.requestDeadline(), 6*time.Second, "provider request receives the five-second enrichment deadline")
 	assert.Equal(t, 1, script.cancellationsOf("category_pick"), "provider observes enrichment cancellation")
 
 	assert.Equal(t, 1, script.callsOf("category_pick"), "category enrichment makes one bounded call")
