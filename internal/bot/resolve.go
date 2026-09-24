@@ -184,10 +184,14 @@ func (h *Harness) resolveCategory(
 			}
 		}
 	}
-	modelCtx := auxiliaryEnrichmentContext(ctx)
-	if !optionalAuxiliaryEnrichmentEnabled(ctx) || !h.llm.Enabled(modelCtx) || len(cats) == 0 {
+	if !h.llm.Enabled(ctx) || len(cats) == 0 {
 		return needsReview
 	}
+	modelCtx, cancel, ok := h.categoryModelContext(ctx)
+	if !ok {
+		return needsReview
+	}
+	defer cancel()
 
 	cands := make([]llm.Candidate, 0, len(cats))
 	for _, c := range cats {

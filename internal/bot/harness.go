@@ -62,6 +62,12 @@ const (
 	// auxiliaryEnrichmentTimeout is the one per-message budget shared by
 	// optional merchant and Source-alias model calls.
 	auxiliaryEnrichmentTimeout = 5 * time.Second
+	// categoryModelMaxTimeout caps a category call independently of
+	// auxiliary merchant and Source-alias enrichment.
+	categoryModelMaxTimeout = 20 * time.Second
+	// categoryWriteReserve leaves the core pipeline time to persist the
+	// transaction and construct its result after a category call.
+	categoryWriteReserve = 5 * time.Second
 	recoveryInterval = 30 * time.Second
 	recoveryBatchSize = 100
 	// botOrigin is the provenance every write from this surface carries.
@@ -497,6 +503,39 @@ func reserveWorkContext(ctx context.Context, photo bool) (context.Context, conte
 	}
 	return context.WithCancel(ctx)
 }
+// categoryModelContext bounds a category request independently of the
+// auxiliary merchant/Source budget while reserving core time for the write.
+func (h *Harness) categoryModelContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	if ctx == nil || ctx.Err() != nil {
+		return nil, nil, false
+	}
+	budget := h.llm.RequestTimeout(ctx)
+	if budget <= 0 {
+		return nil, nil, false
+	}
+	if budget > categoryModelMaxTimeout {
+		budget = categoryModelMaxTimeout
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= categoryWriteReserve {
+			return nil, nil, false
+		}
+		if available := remaining - categoryWriteReserve; budget > available {
+			budget = available
+		}
+	}
+	if budget <= 0 {
+		return nil, nil, false
+	}
+	modelCtx, cancel := context.WithTimeout(ctx, budget)
+	if modelCtx.Err() != nil {
+		cancel()
+		return nil, nil, false
+	}
+	return modelCtx, cancel, true
+}
+
 
 func (h *Harness) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
