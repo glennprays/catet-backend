@@ -81,7 +81,7 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 			gate = operationGate
 		}
 		if deadline, ok := r.Context().Deadline(); ok {
-			remaining := deadline.Sub(time.Now())
+			remaining := time.Until(deadline)
 			s.deadline = remaining
 		}
 		s.mu.Unlock()
