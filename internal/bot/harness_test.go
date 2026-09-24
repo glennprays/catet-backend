@@ -236,6 +236,25 @@ func (f *botFixture) say(t *testing.T, messageID, text string) {
 	f.sayAs(t, ownerPhone, messageID, text)
 }
 
+func (f *botFixture) sayWithContext(t *testing.T, ctx context.Context, messageID, text string) {
+	t.Helper()
+	f.deliverWithContext(t, ctx, &waga.IncomingWebhookPayload{
+		Event:     waga.IncomingEventMessageMessageIncoming,
+		Chat:      ownerPhone[1:] + "@s.whatsapp.net",
+		From:      ownerPhone[1:] + ":42@s.whatsapp.net",
+		MessageId: messageID,
+		PushName:  "Owner",
+		Timestamp: time.Now().Unix(),
+		Text:      text,
+		Type:      waga.IncomingMessageTypeText,
+	})
+}
+
+func (f *botFixture) deliverWithContext(t *testing.T, ctx context.Context, p *waga.IncomingWebhookPayload) {
+	t.Helper()
+	require.NoError(t, f.harness.Process(ctx, p))
+}
+
 // sayAs delivers one text message from any number, addressed the way
 // the gateway addresses a one-to-one chat.
 func (f *botFixture) sayAs(t *testing.T, phone, messageID, text string) {
@@ -932,6 +951,80 @@ func TestMerchantMemoryBeatsTheModel(t *testing.T) {
 	require.NotNil(t, captured.CategorySource)
 	assert.Equal(t, "rules", *captured.CategorySource)
 	assert.Equal(t, "clean", captured.ReviewStatus)
+}
+
+func TestSharedFooterPreservesMerchantCategoryMemory(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.transpor.ID.String() + `","confidence":0.99}`)
+
+	merchant := "kopi"
+	_, err := service.NewTransactionService(
+		repository.NewTransactionRepository(f.pool),
+		repository.NewSourceRepository(f.pool),
+		repository.NewCategoryRepository(f.pool),
+		service.NewMerchantService(repository.NewMerchantRepository(f.pool), nil, f.logger),
+		repository.NewBillPaymentRepository(f.pool),
+		repository.NewBillRepository(f.pool),
+		f.logger,
+	).Create(f.ctx, service.CreateInput{
+		Type: "expense", AmountMinor: 20_000, SourceID: f.cash.ID,
+		CategoryID: &f.makanan.ID, Merchant: &merchant, Origin: "dashboard_manual",
+	})
+	require.NoError(t, err)
+
+	f.say(t, "m-footer-memory", "kopi 25rb\nkopi 10rb\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 3)
+	for _, tx := range txs[1:] {
+		require.NotNil(t, tx.CategoryID)
+		assert.Equal(t, f.makanan.ID, *tx.CategoryID)
+		require.NotNil(t, tx.CategorySource)
+		assert.Equal(t, "rules", *tx.CategorySource)
+		assert.Equal(t, "clean", tx.ReviewStatus)
+		assert.Equal(t, f.bri.ID, legSourceID(t, tx.Legs))
+	}
+	assert.Equal(t, 0, script.callsOf("category_pick"))
+	assert.Equal(t, 0, script.callsOf("merchant_pick"))
+}
+
+func TestCoreDeadlineReserveSkipsRemainingFooterCategoryWork(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.transpor.ID.String() + `","confidence":0.99}`)
+
+	merchant := "kopi"
+	_, err := service.NewTransactionService(
+		repository.NewTransactionRepository(f.pool),
+		repository.NewSourceRepository(f.pool),
+		repository.NewCategoryRepository(f.pool),
+		service.NewMerchantService(repository.NewMerchantRepository(f.pool), nil, f.logger),
+		repository.NewBillPaymentRepository(f.pool),
+		repository.NewBillRepository(f.pool),
+		f.logger,
+	).Create(f.ctx, service.CreateInput{
+		Type: "expense", AmountMinor: 20_000, SourceID: f.cash.ID,
+		CategoryID: &f.makanan.ID, Merchant: &merchant, Origin: "dashboard_manual",
+	})
+	require.NoError(t, err)
+
+	core, cancel := context.WithTimeout(f.ctx, 16*time.Second)
+	defer cancel()
+	f.sayWithContext(t, core, "m-core-reserve", "kopi 25rb\nnasgor 10rb\nBRI")
+
+	txs := f.live(t)
+	require.Len(t, txs, 3)
+	require.NotNil(t, txs[1].CategoryID)
+	assert.Equal(t, f.makanan.ID, *txs[1].CategoryID)
+	require.NotNil(t, txs[1].CategorySource)
+	assert.Equal(t, "rules", *txs[1].CategorySource)
+	assert.Equal(t, "clean", txs[1].ReviewStatus)
+	assert.Nil(t, txs[2].CategoryID)
+	assert.Nil(t, txs[2].CategorySource)
+	assert.Equal(t, "needs_review", txs[2].ReviewStatus)
+	assert.Equal(t, 0, script.callsOf("category_pick"))
+	assert.NotEmpty(t, f.sender.last())
 }
 
 // legSourceID returns the party a transaction is spent from.

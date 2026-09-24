@@ -340,11 +340,7 @@ func (h *Harness) capture(
 				Source: &llmSource, ReviewStatus: "clean",
 			}
 		case d.Type == "expense" || d.Type == "income":
-			if strings.TrimSpace(sourceFooter) == "" && optionalAuxiliaryEnrichmentEnabled(ctx) {
-				verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
-			} else {
-				verdict = categoryVerdict{ReviewStatus: "needs_review"}
-			}
+			verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
 		}
 
 		occurred := d.OccurredAt

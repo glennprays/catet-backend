@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,9 +41,8 @@ func TestEnrichmentTimeoutOnUnmatchedSourceLeavesHoldWithoutDefault(t *testing.T
 	assert.Equal(t, 1, f.openActions(t))
 	assert.Contains(t, f.sender.last(), "sumber")
 }
-
 func TestEnrichmentTimeoutOnCategoryStillWritesNeedsReview(t *testing.T) {
-	script, client := newScriptedLLMWithTimeout(t, 10*time.Second)
+	script, client := newScriptedLLMWithTimeout(t, 100*time.Millisecond)
 	script.blockCalls()
 	f := newBotFixture(t, client)
 
@@ -75,12 +75,110 @@ func TestIntentProviderExhaustionStillStoresAndDeliversReply(t *testing.T) {
 func TestDeterministicFooterCaptureSkipsOptionalEnrichment(t *testing.T) {
 	script, client := newScriptedLLM(t)
 	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.makanan.ID.String() + `","confidence":0.9}`)
 
 	f.say(t, "m-footer-no-ai", "sarapan bubur ayam 16k\ncilok 10k\nBRI")
 
-	assert.Len(t, f.live(t), 2)
+	txs := f.live(t)
+	require.Len(t, txs, 2)
+	for _, tx := range txs {
+		require.NotNil(t, tx.CategoryID)
+		assert.Equal(t, f.makanan.ID, *tx.CategoryID)
+		require.NotNil(t, tx.CategorySource)
+		assert.Equal(t, "llm", *tx.CategorySource)
+		assert.Equal(t, "clean", tx.ReviewStatus)
+		assert.Equal(t, f.bri.ID, legSourceID(t, tx.Legs))
+	}
 	assert.Equal(t, 0, script.callsOf("merchant_pick"))
-	assert.Equal(t, 0, script.callsOf("category_pick"))
+	assert.Equal(t, 2, script.callsOf("category_pick"))
 	assert.Equal(t, 0, script.callsOf("intent"))
 	assert.Equal(t, 0, script.callsOf("source_pick"))
+}
+
+func TestCategoryDeadlineIsIndependentAfterMerchantAuxiliaryTimeout(t *testing.T) {
+	script, client := newScriptedLLMWithTimeout(t, 10*time.Second)
+	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.makanan.ID.String() + `","confidence":0.9}`)
+	script.blockOperation("merchant_pick")
+
+	f.say(t, "m-category-after-merchant", "nasgor 18k bri")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	assert.Equal(t, 1, script.callsOf("category_pick"))
+	require.NotNil(t, txs[0].CategoryID)
+	require.NotNil(t, txs[0].CategorySource)
+	assert.Equal(t, "llm", *txs[0].CategorySource)
+	assert.Equal(t, "clean", txs[0].ReviewStatus)
+	assert.Equal(t, 1, script.callsOf("merchant_pick"))
+	assert.Equal(t, 1, script.cancellationsOf("merchant_pick"))
+	assert.Equal(t, 0, script.cancellationsOf("category_pick"))
+}
+
+func TestLowConfidenceCategoryStillWritesNeedsReview(t *testing.T) {
+	script, client := newScriptedLLM(t)
+	f := newBotFixture(t, client)
+	script.setCategory(`{"category_id":"` + f.makanan.ID.String() + `","confidence":0.4}`)
+
+	f.say(t, "m-low-confidence", "kopi 10k cash")
+
+	txs := f.live(t)
+	require.Len(t, txs, 1)
+	require.NotNil(t, txs[0].CategoryID)
+	assert.Equal(t, f.makanan.ID, *txs[0].CategoryID)
+	require.NotNil(t, txs[0].CategorySource)
+	assert.Equal(t, "llm", *txs[0].CategorySource)
+	assert.Equal(t, "needs_review", txs[0].ReviewStatus)
+}
+
+func TestCategoryCandidatesGuardNullUnknownAndEmptyLists(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   func(*botFixture) string
+		archiveAll bool
+	}{
+		{
+			name: "null model id",
+			response: func(*botFixture) string {
+				return `{"category_id":null,"confidence":0}`
+			},
+		},
+		{
+			name: "unknown model id",
+			response: func(*botFixture) string {
+				return `{"category_id":"` + uuid.New().String() + `","confidence":0.99}`
+			},
+		},
+		{
+			name: "no active categories",
+			response: func(*botFixture) string {
+				return `{"category_id":null,"confidence":0}`
+			},
+			archiveAll: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script, client := newScriptedLLM(t)
+			f := newBotFixture(t, client)
+			script.setCategory(tc.response(f))
+			if tc.archiveAll {
+				_, err := f.pool.Exec(f.ctx, `UPDATE categories SET archived_at = now() WHERE user_id = $1`, f.userID)
+				require.NoError(t, err)
+			}
+
+			f.say(t, "m-category-edge", "kopi 10k cash")
+
+			txs := f.live(t)
+			require.Len(t, txs, 1)
+			assert.Nil(t, txs[0].CategoryID)
+			assert.Nil(t, txs[0].CategorySource)
+			assert.Equal(t, "needs_review", txs[0].ReviewStatus)
+			if tc.archiveAll {
+				assert.Equal(t, 0, script.callsOf("category_pick"))
+			} else {
+				assert.Equal(t, 1, script.callsOf("category_pick"))
+			}
+		})
+	}
 }
