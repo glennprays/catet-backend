@@ -134,7 +134,7 @@ func (h *Harness) readPhoto(
 	// The paper's spelling of the shop becomes the same canonical
 	// merchant a typed capture would produce, so memory, analytics and
 	// the reply all agree on one name.
-	if m, err := h.merchants.ResolveWithModelContext(ctx, enrichmentContext(ctx), params.Merchant, ""); err != nil {
+	if m, err := h.merchants.ResolveWithModelContext(ctx, auxiliaryEnrichmentContext(ctx), params.Merchant, ""); err != nil {
 		h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
 	} else if m != nil {
 		params.MerchantID = &m.ID

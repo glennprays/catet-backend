@@ -121,6 +121,13 @@ func (c *Client) Enabled(ctx context.Context) bool {
 	return strings.TrimSpace(c.source.Current(ctx).APIKey) != ""
 }
 
+// RequestTimeout reports the normalised text-request timeout currently
+// configured for the provider. It is safe on a nil client and returns only
+// the duration, never provider settings such as the API key.
+func (c *Client) RequestTimeout(ctx context.Context) time.Duration {
+	return c.resolve(ctx).timeout
+}
+
 // PickCategory chooses one category id for a transaction. An id the
 // model made up, or one missing from cats, is read as "no answer".
 func (c *Client) PickCategory(ctx context.Context, merchant, note, typ string, cats []Candidate) (*uuid.UUID, float64, error) {

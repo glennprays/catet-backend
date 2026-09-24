@@ -105,7 +105,7 @@ func (h *Harness) capture(
 	sourceFooter string,
 ) (string, []uuid.UUID, string, error) {
 	if strings.TrimSpace(sourceFooter) != "" {
-		ctx = context.WithValue(ctx, skipEnrichmentContextKey{}, true)
+		ctx = context.WithValue(ctx, skipAuxiliaryEnrichmentContextKey{}, true)
 	}
 	sources, err := h.sources.List(ctx, false)
 
@@ -219,8 +219,8 @@ func (h *Harness) capture(
 			var err error
 			if strings.TrimSpace(sourceFooter) != "" {
 				m, err = h.merchants.ResolveUser(ctx, merchant)
-			} else if optionalEnrichmentEnabled(ctx) {
-				m, err = h.merchants.ResolveWithModelContext(ctx, enrichmentContext(ctx), merchant, note)
+			} else if optionalAuxiliaryEnrichmentEnabled(ctx) {
+				m, err = h.merchants.ResolveWithModelContext(ctx, auxiliaryEnrichmentContext(ctx), merchant, note)
 			}
 			if err != nil {
 				h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
@@ -340,11 +340,7 @@ func (h *Harness) capture(
 				Source: &llmSource, ReviewStatus: "clean",
 			}
 		case d.Type == "expense" || d.Type == "income":
-			if strings.TrimSpace(sourceFooter) == "" && optionalEnrichmentEnabled(ctx) {
-				verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
-			} else {
-				verdict = categoryVerdict{ReviewStatus: "needs_review"}
-			}
+			verdict = h.resolveCategory(ctx, params.MerchantID, merchant, note, d.Type, cats)
 		}
 
 		occurred := d.OccurredAt

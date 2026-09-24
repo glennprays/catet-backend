@@ -22,12 +22,13 @@ import (
 // endpoint can stand in for the intent router and the category picker at
 // the same time.
 type scriptedLLM struct {
-	mu       sync.Mutex
-	intent   string
-	category string
-	source   string
-	merchant string
+	mu            sync.Mutex
+	intent        string
+	category      string
+	source        string
+	merchant      string
 	block         chan struct{}
+	blocks        map[string]chan struct{}
 	calls         map[string]int
 	prompts       []string
 	deadline      time.Duration
@@ -41,10 +42,11 @@ func newScriptedLLM(t *testing.T) (*scriptedLLM, *llm.Client) {
 func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLLM, *llm.Client) {
 	t.Helper()
 	s := &scriptedLLM{
-		category:  `{"category_id":null,"confidence":0}`,
-		source:    `{"source_id":null}`,
-		merchant:  `{"merchant_id":null,"name":"","confidence":0}`,
+		category:      `{"category_id":null,"confidence":0}`,
+		source:        `{"source_id":null}`,
+		merchant:      `{"merchant_id":null,"name":"","confidence":0}`,
 		calls:         map[string]int{},
+		blocks:        map[string]chan struct{}{},
 		cancellations: map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,45 +58,49 @@ func newScriptedLLMWithTimeout(t *testing.T, timeout time.Duration) (*scriptedLL
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Len(t, body.Messages, 2)
 
-	s.mu.Lock()
-	kind := "unknown"
-	switch {
-	case strings.Contains(body.Messages[0].Content, "(intent)"):
-		kind = "intent"
-	case strings.Contains(body.Messages[0].Content, "(category_pick)"):
-		kind = "category_pick"
-	case strings.Contains(body.Messages[0].Content, "(source_pick)"):
-		kind = "source_pick"
-	case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
-		kind = "merchant_pick"
-	}
-	s.calls[kind]++
-	s.prompts = append(s.prompts, body.Messages[1].Content)
-	content := map[string]string{
-		"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
-		"merchant_pick": s.merchant,
-	}[kind]
-	gate := s.block
-	if deadline, ok := r.Context().Deadline(); ok {
-		s.deadline = deadline.Sub(time.Now())
-	}
-	s.mu.Unlock()
-
-	if gate != nil {
-		select {
-		case <-gate:
-		case <-r.Context().Done():
-			s.mu.Lock()
-			s.cancellations[kind]++
-			s.mu.Unlock()
-			return
+		s.mu.Lock()
+		kind := "unknown"
+		switch {
+		case strings.Contains(body.Messages[0].Content, "(intent)"):
+			kind = "intent"
+		case strings.Contains(body.Messages[0].Content, "(category_pick)"):
+			kind = "category_pick"
+		case strings.Contains(body.Messages[0].Content, "(source_pick)"):
+			kind = "source_pick"
+		case strings.Contains(body.Messages[0].Content, "(merchant_pick)"):
+			kind = "merchant_pick"
 		}
-	}
-	require.NotEmpty(t, content, "no script for %s prompt", kind)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
-	})
+		s.calls[kind]++
+		s.prompts = append(s.prompts, body.Messages[1].Content)
+		content := map[string]string{
+			"intent": s.intent, "category_pick": s.category, "source_pick": s.source,
+			"merchant_pick": s.merchant,
+		}[kind]
+		gate := s.block
+		if operationGate, ok := s.blocks[kind]; ok {
+			gate = operationGate
+		}
+		if deadline, ok := r.Context().Deadline(); ok {
+			remaining := time.Until(deadline)
+			s.deadline = remaining
+		}
+		s.mu.Unlock()
+
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				s.mu.Lock()
+				s.cancellations[kind]++
+				s.mu.Unlock()
+				return
+			}
+		}
+		require.NotEmpty(t, content, "no script for %s prompt", kind)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		})
 	}))
 	t.Cleanup(srv.Close)
 	return s, llm.New(srv.URL, "test-key", "test-model", timeout)
@@ -103,6 +109,12 @@ func (s *scriptedLLM) blockCalls() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.block = make(chan struct{})
+}
+
+func (s *scriptedLLM) blockOperation(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocks[kind] = make(chan struct{})
 }
 
 func (s *scriptedLLM) setIntent(body string) {
@@ -140,6 +152,7 @@ func (s *scriptedLLM) cancellationsOf(kind string) int {
 	defer s.mu.Unlock()
 	return s.cancellations[kind]
 }
+
 
 func (s *scriptedLLM) lastPrompt() string {
 	s.mu.Lock()

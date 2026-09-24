@@ -44,6 +44,28 @@ func newTestClient(url string) *llm.Client {
 	return llm.New(url, "test-key", "test-model", 2*time.Second)
 }
 
+func TestRequestTimeoutUsesNormalizedTextSettings(t *testing.T) {
+	ctx := context.Background()
+	const providerSecret = "provider-secret-must-not-escape"
+
+	static := llm.New("https://provider.example", providerSecret, "model", 3*time.Second)
+	staticTimeout := static.RequestTimeout(ctx)
+	assert.Equal(t, 3*time.Second, staticTimeout)
+	assert.NotContains(t, staticTimeout.String(), providerSecret)
+
+	dashboard := &fakeSource{settings: llm.Settings{
+		APIKey: providerSecret,
+		Timeout: 11 * time.Second,
+	}}
+	assert.Equal(t, 11*time.Second, llm.NewWithSource(dashboard).RequestTimeout(ctx))
+
+	unset := &fakeSource{settings: llm.Settings{APIKey: providerSecret}}
+	assert.Equal(t, 8*time.Second, llm.NewWithSource(unset).RequestTimeout(ctx))
+
+	var absent *llm.Client
+	assert.Equal(t, 8*time.Second, absent.RequestTimeout(ctx))
+}
+
 func TestPickCategoryValid(t *testing.T) {
 	food := llm.Candidate{ID: uuid.New(), Name: "Makanan & Minuman", Hint: "Kebutuhan"}
 	transport := llm.Candidate{ID: uuid.New(), Name: "Transportasi"}

@@ -57,8 +57,8 @@ func (h *Harness) resolveSource(ctx context.Context, hint string, sources []enti
 	if hit := resolveSourceRules(hint, sources); hit != nil {
 		return hit
 	}
-	modelCtx := enrichmentContext(ctx)
-	if !optionalEnrichmentEnabled(ctx) || hint == "" || !h.llm.Enabled(modelCtx) {
+	modelCtx := auxiliaryEnrichmentContext(ctx)
+	if !optionalAuxiliaryEnrichmentEnabled(ctx) || hint == "" || !h.llm.Enabled(modelCtx) {
 		return nil
 	}
 	cands := make([]llm.Candidate, 0, len(sources))
@@ -184,10 +184,14 @@ func (h *Harness) resolveCategory(
 			}
 		}
 	}
-	modelCtx := enrichmentContext(ctx)
-	if !optionalEnrichmentEnabled(ctx) || !h.llm.Enabled(modelCtx) || len(cats) == 0 {
+	if !h.llm.Enabled(ctx) || len(cats) == 0 {
 		return needsReview
 	}
+	modelCtx, cancel, ok := h.categoryModelContext(ctx)
+	if !ok {
+		return needsReview
+	}
+	defer cancel()
 
 	cands := make([]llm.Candidate, 0, len(cats))
 	for _, c := range cats {
