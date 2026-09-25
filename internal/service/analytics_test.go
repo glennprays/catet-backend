@@ -99,9 +99,9 @@ func TestCategoryBreakdownSumsDescendantsIntoParents(t *testing.T) {
 	jajan := f.category(t, "Jajan", &makanan.ID)
 	permen := f.category(t, "Permen", &jajan.ID)
 
-	f.spend(t, bca.Source.ID, makanan.ID, 100_000)
-	f.spend(t, bca.Source.ID, jajan.ID, 30_000)
-	f.spend(t, bca.Source.ID, permen.ID, 20_000)
+	f.spend(t, bca.ID, makanan.ID, 100_000)
+	f.spend(t, bca.ID, jajan.ID, 30_000)
+	f.spend(t, bca.ID, permen.ID, 20_000)
 
 	to := service.JakartaNow().Add(time.Hour)
 	from := to.AddDate(0, 0, -30)
@@ -137,9 +137,9 @@ func TestTransactionListCategoryIncludesDescendants(t *testing.T) {
 	jajan := f.category(t, "Jajan", &makanan.ID)
 	permen := f.category(t, "Permen", &jajan.ID)
 
-	f.spend(t, bca.Source.ID, makanan.ID, 100_000)
-	f.spend(t, bca.Source.ID, jajan.ID, 30_000)
-	f.spend(t, bca.Source.ID, permen.ID, 20_000)
+	f.spend(t, bca.ID, makanan.ID, 100_000)
+	f.spend(t, bca.ID, jajan.ID, 30_000)
+	f.spend(t, bca.ID, permen.ID, 20_000)
 
 	exact, err := f.tx.List(f.ctx, service.ListInput{CategoryID: &makanan.ID, Limit: 50})
 	require.NoError(t, err)
