@@ -24,8 +24,10 @@ type Cursor struct {
 
 // ListFilter mirrors the GET /transactions query parameters.
 type ListFilter struct {
-	SourceID     *uuid.UUID
-	CategoryID   *uuid.UUID
+	SourceID *uuid.UUID
+	// CategoryIDs narrows to any of these categories; nil = any. A parent
+	// filter arrives as its whole subtree.
+	CategoryIDs  []uuid.UUID
 	ReviewStatus *string
 	Query        *string
 	From         *time.Time
@@ -496,8 +498,9 @@ func (r *TransactionRepository) buildWhere(f ListFilter, args []any, uid uuid.UU
 		conds = append(conds, `EXISTS (SELECT 1 FROM legs ls WHERE ls.transaction_id = t.id AND ls.source_id = $`+fmt.Sprint(len(args)+1)+`)`)
 		args = append(args, *f.SourceID)
 	}
-	if f.CategoryID != nil {
-		add("t.category_id =", *f.CategoryID)
+	if len(f.CategoryIDs) > 0 {
+		args = append(args, f.CategoryIDs)
+		conds = append(conds, fmt.Sprintf("t.category_id = ANY($%d)", len(args)))
 	}
 	if f.ReviewStatus != nil {
 		add("t.review_status =", *f.ReviewStatus)

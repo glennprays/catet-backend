@@ -653,6 +653,13 @@ paths:
         - name: category_id
           in: query
           schema: { type: string, format: uuid }
+        - name: include_descendants
+          in: query
+          description: >-
+            With `category_id`, also match every descendant of that category.
+            The dashboard sets this so a parent filter agrees with the subtree
+            totals the Analytics donut and the budgets screen show.
+          schema: { type: boolean, default: false }
         - name: review_status
           in: query
           description: "`needs_review` also hides originals that have a live reversal."
