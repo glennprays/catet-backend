@@ -356,13 +356,17 @@ func (s *TransactionService) Get(ctx context.Context, id uuid.UUID) (*entity.Tra
 
 // ListInput carries the parsed GET /transactions query.
 type ListInput struct {
-	SourceID     *uuid.UUID
-	CategoryID   *uuid.UUID
-	ReviewStatus *string
-	Query        *string
-	FromDate     *string
-	ToDate       *string
-	Direction    *string
+	SourceID   *uuid.UUID
+	CategoryID *uuid.UUID
+	// IncludeDescendants widens CategoryID to that category's whole
+	// subtree, so a parent filter agrees with the subtree totals the
+	// Analytics donut and the budgets screen show.
+	IncludeDescendants bool
+	ReviewStatus       *string
+	Query              *string
+	FromDate           *string
+	ToDate             *string
+	Direction          *string
 	// Voided is "exclude" (default), "include" or "only".
 	Voided     *string
 	MerchantID *uuid.UUID
@@ -380,10 +384,26 @@ type ListPage struct {
 // List resolves filters, decodes the cursor and returns a page with
 // the matching total count.
 func (s *TransactionService) List(ctx context.Context, in ListInput) (*ListPage, error) {
+	// A category filter means the category and everything under it when
+	// the dashboard asks for it: the parent's own rows alone would not
+	// add up to the subtree amount the user just clicked.
+	var categoryIDs []uuid.UUID
+	if in.CategoryID != nil {
+		categoryIDs = []uuid.UUID{*in.CategoryID}
+		if in.IncludeDescendants {
+			subtree, err := s.categories.Subtree(ctx, *in.CategoryID)
+			if err != nil {
+				return nil, apperror.Internal("failed to load category subtree").Wrap(err)
+			}
+			if len(subtree) > 0 {
+				categoryIDs = subtree
+			}
+		}
+	}
 	f := repository.ListFilter{
-		SourceID:   in.SourceID,
-		CategoryID: in.CategoryID,
-		MerchantID: in.MerchantID,
+		SourceID:    in.SourceID,
+		CategoryIDs: categoryIDs,
+		MerchantID:  in.MerchantID,
 	}
 
 	if in.FromDate != nil && *in.FromDate != "" {

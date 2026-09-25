@@ -47,6 +47,7 @@ func (h *TransactionHandler) List(c *fiber.Ctx) error {
 	}
 	in.SourceID = sourceID
 	in.CategoryID = categoryID
+	in.IncludeDescendants = c.Query("include_descendants") == "true"
 	in.MerchantID = merchantID
 	in.ReviewStatus = qptr(c, "review_status")
 	in.Query = qptr(c, "q")

@@ -112,14 +112,45 @@ func (s *AnalyticsService) CategoryBreakdown(ctx context.Context, from, to time.
 		}
 	}
 
-	// Roll descendants into parents (iterative, cycle-safe depth cap).
+	// Roll descendants into parents: a node's amount is its own direct
+	// spend plus every descendant's, so a drill-down always reconciles
+	// with the parent slice. Children are summed before their parents by
+	// processing the deepest nodes first; the parent walk that ranks them
+	// is capped at 32, the same cycle belt as CategoryRepository.Subtree.
+	childrenOf := make(map[uuid.UUID][]uuid.UUID, len(nodes))
 	for id, n := range nodes {
-		amount := n.direct
-		cur := n.parent
-		for depth := 0; depth < 32 && cur != nil; depth++ {
-			amount += nodes[*cur].direct
-			cur = nodes[*cur].parent
+		if n.parent == nil {
+			continue
 		}
+		if _, ok := nodes[*n.parent]; !ok {
+			continue
+		}
+		childrenOf[*n.parent] = append(childrenOf[*n.parent], id)
+	}
+	depthOf := make(map[uuid.UUID]int, len(nodes))
+	for id, n := range nodes {
+		depth := 0
+		for cur := n.parent; cur != nil && depth < 32; depth++ {
+			next, ok := nodes[*cur]
+			if !ok {
+				break
+			}
+			cur = next.parent
+		}
+		depthOf[id] = depth
+	}
+	order := make([]uuid.UUID, 0, len(nodes))
+	for id := range nodes {
+		order = append(order, id)
+	}
+	sort.Slice(order, func(i, j int) bool { return depthOf[order[i]] > depthOf[order[j]] })
+	subtree := make(map[uuid.UUID]int64, len(nodes))
+	for _, id := range order {
+		amount := nodes[id].direct
+		for _, child := range childrenOf[id] {
+			amount += subtree[child]
+		}
+		subtree[id] = amount
 		nodes[id].item.AmountMinor = amount
 	}
 
@@ -146,9 +177,24 @@ func (s *AnalyticsService) CategoryBreakdown(ctx context.Context, from, to time.
 		sort.Slice(list, func(i, j int) bool { return list[i].AmountMinor > list[j].AmountMinor })
 		children[parentID] = list
 	}
-	// Attach children after sorting (values copied above).
+	// Attach children after sorting (values copied above), walking the
+	// whole tree so a drill-down descends past one level. The depth cap
+	// is the same cycle belt the rollup above uses.
+	var attach func(node response.CategoryBreakdownNode, depth int) response.CategoryBreakdownNode
+	attach = func(node response.CategoryBreakdownNode, depth int) response.CategoryBreakdownNode {
+		list := children[node.CategoryID]
+		if len(list) == 0 || depth >= 32 {
+			return node
+		}
+		kids := make([]response.CategoryBreakdownNode, 0, len(list))
+		for _, child := range list {
+			kids = append(kids, attach(child, depth+1))
+		}
+		node.Children = kids
+		return node
+	}
 	for i := range roots {
-		roots[i].Children = children[roots[i].CategoryID]
+		roots[i] = attach(roots[i], 0)
 	}
 
 	return &response.CategoryBreakdownData{TotalMinor: total, Categories: roots}, nil
