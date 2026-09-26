@@ -134,6 +134,9 @@ var (
 
 	payHintRe  = regexp.MustCompile(`(?:^|\s)(?:pakai|pake|via|dgn|dengan|with|by)\s+(\S+)`)
 	fromHintRe = regexp.MustCompile(`(?:^|\s)(?:dari|from)\s+(\S+)`)
+	// A category name is often more than one word ("Date & Social"), so
+	// the clause runs to punctuation or the end of the segment.
+	categoryHintRe = regexp.MustCompile(`(?:^|\s)(?:kategori|category)\s+(.+?)(?:\s*[,.;]|$)`)
 	// The place is the whole clause, not one word: "di ayam balado" names
 	// a warung, and keeping only "ayam" leaves "balado" in the merchant.
 	// Pay/from/dest clauses are already consumed when this runs, so the
@@ -413,6 +416,15 @@ func SourceHint(text string) (hint, rest string) {
 		return trimClause(hint), rest
 	}
 	rest, hint = takeHint(norm, fromHintRe)
+	return trimClause(hint), rest
+}
+
+// CategoryHint pulls a category clause out of a message and returns what
+// is left, the way SourceHint does for a Source clause. An empty hint
+// means the message named no category by keyword.
+func CategoryHint(text string) (hint, rest string) {
+	norm := normalize(text)
+	rest, hint = takeHint(norm, categoryHintRe)
 	return trimClause(hint), rest
 }
 

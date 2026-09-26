@@ -220,7 +220,12 @@ func (h *Harness) capture(
 			if strings.TrimSpace(sourceFooter) != "" {
 				m, err = h.merchants.ResolveUser(ctx, merchant)
 			} else if optionalAuxiliaryEnrichmentEnabled(ctx) {
-				m, err = h.merchants.ResolveWithModelContext(ctx, auxiliaryEnrichmentContext(ctx), merchant, note)
+				if modelCtx, cancel, ok := h.auxiliaryModelContext(ctx); ok {
+					m, err = h.merchants.ResolveWithModelContext(ctx, modelCtx, merchant, note)
+					cancel()
+				} else {
+					m, err = h.merchants.ResolveUser(ctx, merchant)
+				}
 			}
 			if err != nil {
 				h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})

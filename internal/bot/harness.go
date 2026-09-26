@@ -59,9 +59,12 @@ const (
 	// storing and delivering a durable result.
 	textFinalizationTail = 15 * time.Second
 	photoFinalizationTail = 20 * time.Second
-	// auxiliaryEnrichmentTimeout is the one per-message budget shared by
-	// optional merchant and Source-alias model calls.
+	// auxiliaryEnrichmentTimeout bounds one optional merchant or
+	// Source-alias model call.
 	auxiliaryEnrichmentTimeout = 5 * time.Second
+	// auxiliaryWriteReserve leaves the core pipeline time to persist the
+	// transaction after an optional enrichment call.
+	auxiliaryWriteReserve = 2 * time.Second
 	// categoryModelMaxTimeout caps a category call independently of
 	// auxiliary merchant and Source-alias enrichment.
 	categoryModelMaxTimeout = 20 * time.Second
@@ -85,15 +88,6 @@ type handlingResult struct {
 	OutcomeReaction string
 	Stage           string
 	ErrorCode       string
-}
-
-type auxiliaryEnrichmentContextKey struct{}
-
-func auxiliaryEnrichmentContext(ctx context.Context) context.Context {
-	if modelCtx, ok := ctx.Value(auxiliaryEnrichmentContextKey{}).(context.Context); ok {
-		return modelCtx
-	}
-	return ctx
 }
 
 type skipAuxiliaryEnrichmentContextKey struct{}
@@ -536,15 +530,43 @@ func (h *Harness) categoryModelContext(ctx context.Context) (context.Context, co
 	return modelCtx, cancel, true
 }
 
+// auxiliaryModelContext bounds one optional enrichment call (merchant
+// canonicalisation, Source-alias repair) so a hung provider cannot hold
+// the reply. The budget starts now, not when the message arrived: a
+// photo spends up to photoProcessTimeout on the vision read first, so a
+// budget created in runHandle is already spent by the time either caller
+// runs.
+func (h *Harness) auxiliaryModelContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	if ctx == nil || ctx.Err() != nil {
+		return nil, nil, false
+	}
+	budget := auxiliaryEnrichmentTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= auxiliaryWriteReserve {
+			return nil, nil, false
+		}
+		if available := remaining - auxiliaryWriteReserve; budget > available {
+			budget = available
+		}
+	}
+	if budget <= 0 {
+		return nil, nil, false
+	}
+	modelCtx, cancel := context.WithTimeout(ctx, budget)
+	if modelCtx.Err() != nil {
+		cancel()
+		return nil, nil, false
+	}
+	return modelCtx, cancel, true
+}
+
 func (h *Harness) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 func (h *Harness) runHandle(ctx context.Context, p *waga.IncomingWebhookPayload) (result handlingResult, err error, panicked bool) {
 	result.Stage = "text"
 	if p.Type == waga.IncomingMessageTypeImage { result.Stage = "photo" }
-	auxiliaryCtx, cancelAuxiliary := context.WithTimeout(ctx, auxiliaryEnrichmentTimeout)
-	defer cancelAuxiliary()
-	ctx = context.WithValue(ctx, auxiliaryEnrichmentContextKey{}, auxiliaryCtx)
 	defer func() {
 		if v := recover(); v != nil {
 			panicked = true
@@ -715,12 +737,16 @@ func (h *Harness) handle(ctx context.Context, p *waga.IncomingWebhookPayload) (s
 		if err != nil {
 			return "", nil, lang, fmt.Errorf("list sources: %w", err)
 		}
+		cats, err := h.categories.List(ctx, false)
+		if err != nil {
+			return "", nil, lang, fmt.Errorf("list categories: %w", err)
+		}
 		expect := ""
 		if state.OpenExpect != nil {
 			expect = *state.OpenExpect
 		}
 		reply, ids, handled, err := h.applyAnswer(
-			ctx, parseBareAnswer(p.Text, expect, sources), p.MessageId, state, lang)
+			ctx, parseBareAnswer(p.Text, expect, sources, cats), p.MessageId, state, lang)
 		if err != nil {
 			return "", ids, lang, err
 		}

@@ -198,7 +198,8 @@ so the user knows when a correction is expected of them. */}}
 {{range .Items}}• {{.Name}} {{.Amount}}{{if .Category}} · {{.Category}}{{end}}
 {{end}}{{if gt .More 0}}…dan {{.More}} lainnya
 {{end}}{{if .AskSource}}Bayar dari mana? {{join .Sources " / "}}{{else}}Bayar dari {{.Source}}{{if or (eq .Basis "memory") (eq .Basis "default")}} (biasanya).{{else if eq .Basis "guess"}}?{{else}}.{{end}}
-Balas "ya" kalau sudah pas, "tidak" untuk buang. Mau ganti sumber atau kategori? Tinggal bilang.{{end}}
+{{if .Unread}}Catatan "{{.Unread}}" belum kebaca — coba sebut ulang.
+{{end}}Balas "ya" kalau sudah pas, "tidak" untuk buang. Mau ganti sumber atau kategori? Tinggal bilang.{{end}}
 {{- end}}
 
 {{define "receipt_recorded" -}}

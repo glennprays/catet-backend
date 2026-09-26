@@ -183,7 +183,8 @@ Receipt reading is off right now. Just type the amount.
 {{range .Items}}• {{.Name}} {{.Amount}}{{if .Category}} · {{.Category}}{{end}}
 {{end}}{{if gt .More 0}}…and {{.More}} more
 {{end}}{{if .AskSource}}Which source paid? {{join .Sources " / "}}{{else}}Paid from {{.Source}}{{if or (eq .Basis "memory") (eq .Basis "default")}} (usually).{{else if eq .Basis "guess"}}?{{else}}.{{end}}
-Reply "yes" if that looks right, "no" to discard. Want a different source or category? Just say so.{{end}}
+{{if .Unread}}I couldn't read the note "{{.Unread}}" — try rephrasing.
+{{end}}Reply "yes" if that looks right, "no" to discard. Want a different source or category? Just say so.{{end}}
 {{- end}}
 
 {{define "receipt_recorded" -}}

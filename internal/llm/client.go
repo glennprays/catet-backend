@@ -449,8 +449,12 @@ func (c *Client) completeWith(
 	defer cancel()
 
 	var lastErr error
-	for range maxAttempts {
-		content, u, retryable, err := c.attempt(budget, settings, timeout, body)
+	for attempt := range maxAttempts {
+		perAttempt := attemptTimeout(budget, maxAttempts-attempt, timeout)
+		if perAttempt <= 0 {
+			break
+		}
+		content, u, retryable, err := c.attempt(budget, settings, perAttempt, body)
 		if u != nil {
 			used = *u
 		}
@@ -470,6 +474,57 @@ func (c *Client) completeWith(
 		}
 	}
 	return used, lastErr
+}
+
+// minSplitAttempt is the smallest per-attempt share worth splitting a
+// budget for; below it the current attempt takes the whole remainder.
+const minSplitAttempt = time.Second
+
+// attemptTimeout divides what is left of a call's budget across the
+// attempts that remain, capped by the configured timeout. Giving the
+// first attempt the whole timeout is how a retry becomes a promise the
+// budget cannot keep: the vision call shares its deadline with the photo
+// pipeline, so 2 x 90s never fitted in the 130s available and the second
+// attempt always began expired.
+//
+// A budget that cannot fit even one configured timeout is not split: the
+// caller handed out the whole remainder on purpose (an auxiliary
+// enrichment call gets exactly its five seconds), and halving it would
+// turn one bounded call into two useless fragments.
+func attemptTimeout(budget context.Context, attemptsLeft int, configured time.Duration) time.Duration {
+	if attemptsLeft < 1 {
+		return 0
+	}
+	deadline, hasDeadline := budget.Deadline()
+	if !hasDeadline {
+		return configured
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	share := configured
+	switch {
+	case remaining < configured:
+		// One timeout does not fit: this attempt takes the remainder.
+		share = remaining
+	case remaining < time.Duration(attemptsLeft)*configured:
+		// The full retries do not fit: split what is left evenly.
+		share = remaining / time.Duration(attemptsLeft)
+	}
+	if share < minSplitAttempt {
+		// Below the floor a split is two useless fragments: this attempt
+		// takes the whole remainder, capped by the configured timeout —
+		// today's single-call behaviour.
+		share = configured
+		if remaining < share {
+			share = remaining
+		}
+	}
+	if share <= 0 {
+		return 0
+	}
+	return share
 }
 
 // extractJSONObject pulls the JSON object out of a model reply that may

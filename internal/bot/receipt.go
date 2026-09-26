@@ -62,8 +62,12 @@ type receiptParams struct {
 	PaymentMethod       string        `json:"payment_method,omitempty"`
 	MessageID           string        `json:"message_id"`
 	OriginalText        string        `json:"original_text"` // the caption, may be ""
-	ContentHash         string        `json:"content_hash"`
-	DuplicateOf         *uuid.UUID    `json:"duplicate_of,omitempty"`
+	// Unread is the caption the rules could not explain and the router
+	// could not read either; the reply names it so nothing is dropped
+	// silently.
+	Unread      string     `json:"unread,omitempty"`
+	ContentHash string     `json:"content_hash"`
+	DuplicateOf *uuid.UUID `json:"duplicate_of,omitempty"`
 	// Inconsistent marks a draft whose printed breakdown missed the
 	// printed total by more than `receiptTolerance`: the lines are
 	// proportional shares of the total, never the printed item prices.

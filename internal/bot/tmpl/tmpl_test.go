@@ -345,6 +345,29 @@ func TestReceiptHoldWordsTheSourceBasis(t *testing.T) {
 	ask := tmpl.Render("id", "receipt_hold", with("AskSource", true))
 	assert.Contains(t, ask, "Bayar dari mana? BCA / GoPay / Cash")
 	assert.NotContains(t, ask, "Bayar dari BCA")
+
+	assert.NotContains(t, tmpl.Render("id", "receipt_hold", base), "belum kebaca",
+		"an absent Unread key renders nothing")
+}
+
+// A caption the rules could not read is named in the question rather
+// than dropped: the note line quotes the user's own words back.
+func TestReceiptHoldNamesAnUnreadCaption(t *testing.T) {
+	base, ok := fixtures["receipt_hold"].data.(map[string]any)
+	require.True(t, ok)
+	with := func(key string, value any) map[string]any {
+		out := make(map[string]any, len(base))
+		for k, v := range base {
+			out[k] = v
+		}
+		out[key] = value
+		return out
+	}
+	id := tmpl.Render("id", "receipt_hold", with("Unread", "dari BNI"))
+	assert.Contains(t, id, `Catatan "dari BNI" belum kebaca`)
+	assert.Contains(t, id, "Bayar dari BCA.", "the Source line still stands")
+	en := tmpl.Render("en", "receipt_hold", with("Unread", "dari BNI"))
+	assert.Contains(t, en, `I couldn't read the note "dari BNI"`)
 }
 
 func TestUnknownLangFallsBackToIndonesian(t *testing.T) {

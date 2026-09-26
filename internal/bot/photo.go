@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/glennprays/catet-backend/internal/bot/parse"
 	"github.com/glennprays/catet-backend/internal/bot/tmpl"
 	"github.com/glennprays/catet-backend/internal/domain/entity"
 	"github.com/glennprays/catet-backend/internal/llm"
@@ -80,7 +81,7 @@ func (h *Harness) readPhoto(
 	if err != nil {
 		return "", nil, "", fmt.Errorf("find duplicate photo: %w", err)
 	}
-	if prev != nil && prev.MessageID != p.MessageId {
+	if prev != nil && prev.MessageID != p.MessageId && !readFailed(prev) {
 		summary := ""
 		if prev.ReplyText != nil {
 			summary = firstLine(*prev.ReplyText)
@@ -134,7 +135,16 @@ func (h *Harness) readPhoto(
 	// The paper's spelling of the shop becomes the same canonical
 	// merchant a typed capture would produce, so memory, analytics and
 	// the reply all agree on one name.
-	if m, err := h.merchants.ResolveWithModelContext(ctx, auxiliaryEnrichmentContext(ctx), params.Merchant, ""); err != nil {
+	if modelCtx, cancel, ok := h.auxiliaryModelContext(ctx); ok {
+		m, err := h.merchants.ResolveWithModelContext(ctx, modelCtx, params.Merchant, "")
+		cancel()
+		if err != nil {
+			h.log.Warn(traceOf(ctx), "merchant resolve degraded", map[string]any{"error": err.Error()})
+		} else if m != nil {
+			params.MerchantID = &m.ID
+			params.Merchant = m.Name
+		}
+	} else if m, err := h.merchants.ResolveUser(ctx, params.Merchant); err != nil {
 		h.log.Warn(traceOf(ctx), "merchant resolve failed", map[string]any{"error": err.Error()})
 	} else if m != nil {
 		params.MerchantID = &m.ID
@@ -144,9 +154,9 @@ func (h *Harness) readPhoto(
 	// The caption is the user's own instruction about this photo. It may
 	// name the Source outright, or need the router to read "bayarnya
 	// separuh cash" — but it never confirms: a picture is not a "ya".
-	captionHint, captionAnswer := h.readCaption(ctx, caption, params, sources, cats, lang)
+	captionRead := h.readCaption(ctx, caption, params, sources, cats, lang)
 
-	pick := h.resolveReceiptSource(ctx, read, captionHint, params.MerchantID, sources)
+	pick := h.resolveReceiptSource(ctx, read, captionRead.Source, params.MerchantID, sources)
 	if pick.Source != nil {
 		params.SourceID = &pick.Source.ID
 		params.SourceName = pick.Source.Name
@@ -155,18 +165,17 @@ func (h *Harness) readPhoto(
 		params.Missing = []string{"source"}
 	}
 
-	if captionAnswer != nil {
-		if captionAnswer.CategoryID != nil {
-			applyReceiptCategory(params, *captionAnswer.CategoryID, cats)
-		}
-		if len(captionAnswer.Payments) > 1 {
-			if reject := applySplit(params, captionAnswer.Payments, sources); reject != nil {
-				// A caption whose split does not add up is a note, not a
-				// refusal: the draft stands and the question still asks.
-				h.log.Warn(traceOf(ctx), "caption split ignored", map[string]any{"reason": reject.Template})
-			}
+	if captionRead.CategoryID != nil {
+		applyReceiptCategory(params, *captionRead.CategoryID, cats)
+	}
+	if captionRead.Answer != nil && len(captionRead.Answer.Payments) > 1 {
+		if reject := applySplit(params, captionRead.Answer.Payments, sources); reject != nil {
+			// A caption whose split does not add up is a note, not a
+			// refusal: the draft stands and the question still asks.
+			h.log.Warn(traceOf(ctx), "caption split ignored", map[string]any{"reason": reject.Template})
 		}
 	}
+	params.Unread = captionRead.Unread
 
 	// Money received in a payment screenshot is income — unless the other
 	// party is one of the user's own Sources, which makes it a transfer
@@ -243,12 +252,53 @@ func (h *Harness) readPhoto(
 	return tmpl.Render(lang, "receipt_hold", receiptHoldData(params, summary, sources, lang)), nil, reactParked, nil
 }
 
-// readCaption reads the words the user sent with the picture. A caption
-// that is plainly a Source name is resolved by the rules alone; anything
-// longer is worth one router call, which can also carry a category for
-// the whole receipt or a split payment. Whatever it returns is a hint —
-// the caption can never confirm the draft, so Confirm, Merchant and
-// OccurredDate are deliberately ignored here.
+// readFailed reports whether an earlier delivery of these exact bytes
+// ended in a failure the user was told to retry. A failure recorded
+// nothing, so the same photo must be readable again; the hash stays on
+// the row because the fetched bytes are still the recovery anchor.
+func readFailed(m *repository.InboundMessage) bool {
+	return m.OutcomeReaction != nil && *m.OutcomeReaction == reactRejected
+}
+
+// captionRead is what a caption told us: the Source and category it
+// named, the router's answer when the rules needed help, and — when
+// nothing could read it — the note to quote back to the user.
+type captionRead struct {
+	Source     *entity.Source
+	CategoryID *uuid.UUID
+	Answer     *llm.AnswerFields
+	Unread     string
+}
+
+// trimClause drops the punctuation that glues a clause to the rest of a
+// caption ("date, dari BRI" leaves "date,"): the same rule parse applies
+// before a clause is matched against a name.
+func trimClause(s string) string {
+	return strings.Trim(s, ",.;:!?\"'")
+}
+
+// explainedRemainder drops the politeness words a caption may carry
+// around a clause ("semuanya kategori date"): a remainder that is only
+// filler is explained, exactly as bareConfirm treats it for a reply.
+func explainedRemainder(rest string) string {
+	var kept []string
+	for _, word := range strings.Fields(rest) {
+		if !answerFiller[word] {
+			kept = append(kept, word)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
+// readCaption reads the words the user sent with the picture. The rules
+// get first refusal — a Source or category clause they can resolve costs
+// no model call, which is what makes a caption readable on a slow
+// provider — and only a remainder they cannot explain is worth one
+// router call, which can also carry a split payment. Whatever it returns
+// is a hint — the caption can never confirm the draft, so Confirm,
+// Merchant and OccurredDate are deliberately ignored here. A caption
+// nothing could read comes back as Unread: the reply names the note
+// instead of dropping it silently.
 func (h *Harness) readCaption(
 	ctx context.Context,
 	caption string,
@@ -256,15 +306,42 @@ func (h *Harness) readCaption(
 	sources []entity.Source,
 	cats []entity.Category,
 	lang string,
-) (*entity.Source, *llm.AnswerFields) {
+) captionRead {
+	var out captionRead
 	if caption == "" {
-		return nil, nil
+		return out
 	}
 	if hit := resolveSourceRules(caption, sources); hit != nil {
-		return hit, nil
+		out.Source = hit
+		return out
+	}
+	rest := caption
+	if hint, without := parse.SourceHint(caption); hint != "" {
+		// A Source clause the rules cannot resolve is not consumed: the
+		// clause stays in the remainder so the reply can name it.
+		if hit := resolveSourceRules(hint, sources); hit != nil {
+			out.Source = hit
+			rest = without
+		}
+	}
+	if hint, without := parse.CategoryHint(rest); hint != "" {
+		if hit := resolveCategoryRules(hint, cats); hit != nil {
+			out.CategoryID = &hit.ID
+			rest = without
+		}
+	} else if hit := resolveCategoryRules(trimClause(rest), cats); hit != nil {
+		// Without the keyword the whole remainder is the candidate, so a
+		// bare "date" labels the receipt; the resolve gate keeps an
+		// unreadable caption from consuming itself here.
+		out.CategoryID = &hit.ID
+		rest = ""
+	}
+	if explainedRemainder(trimClause(rest)) == "" {
+		return out
 	}
 	if !h.llm.Enabled(ctx) {
-		return nil, nil
+		out.Unread = caption
+		return out
 	}
 	in, err := h.llm.Intent(ctx, llm.IntentRequest{
 		Lang:  lang,
@@ -281,16 +358,22 @@ func (h *Harness) readCaption(
 		if !errors.Is(err, llm.ErrUnavailable) {
 			h.log.Warn(traceOf(ctx), "caption router failed", map[string]any{"error": err.Error()})
 		}
-		return nil, nil
+		out.Unread = caption
+		return out
 	}
 	if in.Answer == nil {
-		return nil, nil
+		out.Unread = caption
+		return out
 	}
-	var hint *entity.Source
-	if in.Answer.SourceID != nil {
-		hint = findSource(*in.Answer.SourceID, sources)
+	// The rules win: the router only fills what they left open.
+	if out.Source == nil && in.Answer.SourceID != nil {
+		out.Source = findSource(*in.Answer.SourceID, sources)
 	}
-	return hint, in.Answer
+	if out.CategoryID == nil && in.Answer.CategoryID != nil {
+		out.CategoryID = in.Answer.CategoryID
+	}
+	out.Answer = in.Answer
+	return out
 }
 
 // applyReceiptCategory labels every line of a receipt with one category
@@ -373,6 +456,7 @@ func receiptHoldData(p *receiptParams, summary string, sources []entity.Source, 
 		"Basis":     p.SourceBasis,
 		"Sources":   sourceNames(sources),
 		"AskSource": p.SourceID == nil,
+		"Unread":    p.Unread,
 	}
 }
 

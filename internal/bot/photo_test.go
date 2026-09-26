@@ -473,9 +473,11 @@ func TestPhotoSameBytesTwiceIsNotReparsed(t *testing.T) {
 	assert.NotEqual(t, first, f.sender.last())
 }
 
-// A fetched image is fingerprinted even when vision rejects it. A forwarded
-// copy then gets the durable duplicate refusal without a second vision call.
-func TestPhotoFailedReadIsReplayedAsDuplicate(t *testing.T) {
+// A fetched image is fingerprinted even when vision rejects it, and the
+// hash stays the recovery anchor. A failure recorded nothing, so the same
+// bytes must be readable again — not refused as a duplicate of a reply
+// that only said "try again".
+func TestPhotoFailedReadIsRetryable(t *testing.T) {
 	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
 	fake.receipt = func() string { return "upstream hiccup" }
 	f.sendPhoto(t, "m1", url, size, "")
@@ -487,16 +489,18 @@ func TestPhotoFailedReadIsReplayedAsDuplicate(t *testing.T) {
 	require.NotNil(t, row)
 	require.NotNil(t, row.MediaSha256, "a fetched image is fingerprinted even when vision rejects it")
 	assert.Len(t, *row.MediaSha256, 64)
+	require.NotNil(t, row.OutcomeReaction)
+	assert.Equal(t, "❌", *row.OutcomeReaction, "the failure is what makes the retry legal")
 
 	fake.receipt = func() string { return twoLineReceipt(f) }
 	f.sendPhoto(t, "m2", url, size, "")
 
-	assert.Equal(t, 1, fake.calls(), "a rejected image is not sent to vision twice")
-	assert.True(t, strings.HasPrefix(f.sender.last(), "Foto ini sudah pernah kamu kirim"),
+	assert.Equal(t, 2, fake.calls(), "a failed read is retried, not replayed as a duplicate")
+	assert.NotContains(t, f.sender.last(), "sudah pernah kamu kirim",
 		"reply was %q", f.sender.last())
 	open, err := f.pending.ListOpen(f.ctx)
 	require.NoError(t, err)
-	assert.Empty(t, open, "a duplicate refusal never parks a draft")
+	assert.Len(t, open, 1, "the retried photo parks the draft it could not park before")
 }
 
 // A gateway that does not download media hands us WhatsApp's encrypted
@@ -794,6 +798,57 @@ func TestPhotoCaptionCategoryLabelsEveryLine(t *testing.T) {
 		assert.Equal(t, "user", *tx.CategorySource, "a label the user gave is not a guess")
 		assert.Equal(t, "clean", tx.ReviewStatus)
 	}
+}
+
+// The evening incident: the caption named a Source and a category the
+// rules could resolve, so the deterministic layer reads it end to end
+// and a slow (or dead) router never gets the chance to lose it.
+func TestPhotoCaptionRulesReadSourceAndCategory(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt) // prints "DEBIT BCA"
+	date := f.category(t, "Date & Social")
+	fake.intent = func() string { return unknownIntent }
+
+	f.sendPhoto(t, "m1", url, size, "date, dari BRI")
+
+	open, err := f.pending.ListOpen(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	var params map[string]any
+	require.NoError(t, json.Unmarshal(open[0].Params, &params))
+	assert.Equal(t, "BRI", params["source_name"], "the caption's Source beats the printed BCA")
+	assert.Equal(t, "hint", params["source_basis"])
+	items, ok := params["items"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+	for _, it := range items {
+		item, ok := it.(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, date.ID.String(), item["category_id"], "every line carries the caption's category")
+	}
+	assert.Equal(t, 0, fake.intents(), "the rules explained the caption end to end")
+	assert.Contains(t, f.sender.last(), "Bayar dari BRI.")
+	assert.NotContains(t, f.sender.last(), "belum kebaca")
+}
+
+// A caption nothing could read is named in the reply instead of being
+// dropped silently; a caption the rules read is not.
+func TestPhotoCaptionNamesWhatItCouldNotRead(t *testing.T) {
+	f, fake, url, size := newPhotoFixture(t, twoLineReceipt)
+	fake.intent = func() string { return unknownIntent }
+
+	// No BNI Source exists in the fixture, so "dari BNI" resolves to
+	// nothing and the clause must survive to the reply.
+	f.sendPhoto(t, "m1", url, size, "dari BNI")
+
+	assert.Contains(t, f.sender.last(), "belum kebaca", "reply was %q", f.sender.last())
+	assert.Contains(t, f.sender.last(), "dari BNI", "the reply quotes the caption as written")
+
+	// The same fixture with a caption the rules explain end to end.
+	img := jpegBytes(t)
+	other := mediaServer(t, append(img, 0x00))
+	f.sendPhoto(t, "m2", other.URL+"/storage/y.jpg", len(img)+1, "date, dari BRI")
+
+	assert.NotContains(t, f.sender.last(), "belum kebaca", "reply was %q", f.sender.last())
 }
 
 // A vision model that reports it never received the image is our outage,

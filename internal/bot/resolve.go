@@ -50,6 +50,46 @@ func resolveSourceRules(hint string, sources []entity.Source) *entity.Source {
 	return nil
 }
 
+// matchCategories returns every category whose name equals the hint or
+// contains it as a whole word ("date" → "Date & Social"), the same law
+// matchSources applies to Source names.
+func matchCategories(hint string, cats []entity.Category) []entity.Category {
+	needle := strings.ToLower(strings.TrimSpace(hint))
+	if needle == "" {
+		return nil
+	}
+	var exact, partial []entity.Category
+	for _, c := range cats {
+		name := strings.ToLower(c.Name)
+		if name == needle {
+			exact = append(exact, c)
+			continue
+		}
+		for _, w := range strings.FieldsFunc(name, func(r rune) bool {
+			return r == ' ' || r == '-' || r == '_' || r == '/'
+		}) {
+			if w == needle {
+				partial = append(partial, c)
+				break
+			}
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return partial
+}
+
+// resolveCategoryRules is the deterministic half of category resolution:
+// a unique name match, or nothing.
+func resolveCategoryRules(hint string, cats []entity.Category) *entity.Category {
+	hits := matchCategories(hint, cats)
+	if len(hits) == 1 {
+		return &hits[0]
+	}
+	return nil
+}
+
 // resolveSource applies the rules first and only then asks the LLM to
 // repair a typo'd alias. Whatever the model returns must be one of the
 // whitelisted ids (ADR-0003) or it is discarded.
@@ -57,8 +97,15 @@ func (h *Harness) resolveSource(ctx context.Context, hint string, sources []enti
 	if hit := resolveSourceRules(hint, sources); hit != nil {
 		return hit
 	}
-	modelCtx := auxiliaryEnrichmentContext(ctx)
-	if !optionalAuxiliaryEnrichmentEnabled(ctx) || hint == "" || !h.llm.Enabled(modelCtx) {
+	if !optionalAuxiliaryEnrichmentEnabled(ctx) || hint == "" {
+		return nil
+	}
+	modelCtx, cancel, ok := h.auxiliaryModelContext(ctx)
+	if !ok {
+		return nil
+	}
+	defer cancel()
+	if !h.llm.Enabled(modelCtx) {
 		return nil
 	}
 	cands := make([]llm.Candidate, 0, len(sources))

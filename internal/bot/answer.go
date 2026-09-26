@@ -44,6 +44,7 @@ var answerFiller = map[string]bool{
 	"please": true, "bayar": true, "bayarnya": true, "pay": true, "it": true,
 	"itu": true, "tadi": true, "yang": true, "buat": true, "untuk": true,
 	"kemarin": true, "oke": true, "ok": true, "sip": true,
+	"semua": true, "semuanya": true,
 }
 
 // parseBareAnswer explains a message with rules alone, or gives up.
@@ -51,7 +52,7 @@ var answerFiller = map[string]bool{
 // are visible to a regex — spending seven seconds of LLM latency on it
 // would be theatre. So is "dari BRI, itu kemaren tanggal 17": a Source,
 // a date and nothing else. nil means the intent router has to look.
-func parseBareAnswer(text, expect string, sources []entity.Source) *answerEdits {
+func parseBareAnswer(text, expect string, sources []entity.Source, cats []entity.Category) *answerEdits {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return nil
@@ -76,6 +77,19 @@ func parseBareAnswer(text, expect string, sources []entity.Source) *answerEdits 
 
 	rest, when, dated := parse.ExtractTime(rest, service.JakartaNow())
 
+	// A category clause is the other half of the Source law: "semuanya
+	// kategori date" labels the draft the same way "dari BRI" names the
+	// Source. Without the keyword the whole remainder is the candidate,
+	// so a bare "date" works; only a resolved name is consumed.
+	var category *entity.Category
+	if hint, without := parse.CategoryHint(rest); hint != "" {
+		if category = resolveCategoryRules(hint, cats); category != nil {
+			rest = without
+		}
+	} else if category = resolveCategoryRules(trimClause(rest), cats); category != nil {
+		rest = ""
+	}
+
 	// One money token in the remainder is the amount; two is an
 	// ambiguity only the router can read.
 	var amount *int64
@@ -92,10 +106,13 @@ func parseBareAnswer(text, expect string, sources []entity.Source) *answerEdits 
 	}
 
 	confirm, explained := bareConfirm(strings.Join(words, " "))
-	if explained && (confirm != "" || src != nil || dated || amount != nil) {
+	if explained && (confirm != "" || src != nil || dated || amount != nil || category != nil) {
 		out := &answerEdits{AnswerFields: llm.AnswerFields{Confirm: confirm}, AmountMinor: amount}
 		if src != nil {
 			out.SourceID = &src.ID
+		}
+		if category != nil {
+			out.CategoryID = &category.ID
 		}
 		if dated {
 			at := when

@@ -17,6 +17,7 @@ func TestParseBareAnswer(t *testing.T) {
 	bca := entity.Source{ID: uuid.New(), Name: "BCA", Type: "bank"}
 	gopay := entity.Source{ID: uuid.New(), Name: "GoPay", Type: "ewallet"}
 	sources := []entity.Source{bca, gopay}
+	cats := []entity.Category{{ID: uuid.New(), Name: "Makanan & Minuman"}}
 
 	cases := []struct {
 		name    string
@@ -49,7 +50,7 @@ func TestParseBareAnswer(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := parseBareAnswer(c.text, c.expect, sources)
+			got := parseBareAnswer(c.text, c.expect, sources, cats)
 			if c.nilOut {
 				assert.Nil(t, got, "the rules must defer to the router")
 				return
@@ -75,7 +76,8 @@ func TestParseBareAnswer(t *testing.T) {
 // A message that says both yes and no says nothing the rules can act on.
 func TestParseBareAnswerRefusesContradictions(t *testing.T) {
 	sources := []entity.Source{{ID: uuid.New(), Name: "BCA", Type: "bank"}}
-	assert.Nil(t, parseBareAnswer("ya tidak", "yes_no", sources))
+	cats := []entity.Category{{ID: uuid.New(), Name: "Makanan & Minuman"}}
+	assert.Nil(t, parseBareAnswer("ya tidak", "yes_no", sources, cats))
 }
 
 // The message that motivated the date grammar: a Source clause, a
@@ -83,7 +85,7 @@ func TestParseBareAnswerRefusesContradictions(t *testing.T) {
 // nothing a model is needed for.
 func TestParseBareAnswerReadsSourceAndDate(t *testing.T) {
 	bri := entity.Source{ID: uuid.New(), Name: "BRI", Type: "bank"}
-	got := parseBareAnswer("dari BRI, itu kemaren tanggal 17", "source", []entity.Source{bri})
+	got := parseBareAnswer("dari BRI, itu kemaren tanggal 17", "source", []entity.Source{bri}, nil)
 
 	require.NotNil(t, got, "the rules explain this message word for word")
 	require.NotNil(t, got.SourceID)
@@ -93,4 +95,19 @@ func TestParseBareAnswerReadsSourceAndDate(t *testing.T) {
 	assert.Equal(t, 12, got.OccurredAt.Hour(), "a dated-but-untimed event is booked at noon")
 	assert.Empty(t, got.Confirm, "naming a source is not a yes")
 	assert.Nil(t, got.AmountMinor)
+}
+
+// The evening incident's follow-up: "semuanya kategori date" named a
+// category the rules can resolve, so it must settle without the router —
+// and, like any other edit, it must not read as a confirmation.
+func TestParseBareAnswerReadsCategoryClause(t *testing.T) {
+	sources := []entity.Source{{ID: uuid.New(), Name: "BRI", Type: "bank"}}
+	date := entity.Category{ID: uuid.New(), Name: "Date & Social"}
+	got := parseBareAnswer("semuanya kategori date", "yes_no", sources, []entity.Category{date})
+
+	require.NotNil(t, got, "the rules explain this message word for word")
+	require.NotNil(t, got.CategoryID)
+	assert.Equal(t, date.ID, *got.CategoryID)
+	assert.Empty(t, got.Confirm, "a category clause edits the draft; it is not a yes")
+	assert.Nil(t, got.SourceID)
 }
